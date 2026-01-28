@@ -1,0 +1,207 @@
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(gridExtra)
+library(grid)
+
+# Download the data
+url <- "https://www150.statcan.gc.ca/t1/tbl1/en/dtl!downloadDbLoadingData-nonTraduit.action?pid=1810024502&latestN=0&startDate=20170101&endDate=20251201&csvLocale=en&selectedMembers=%5B%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%5D%2C%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%2C12%2C13%2C14%2C15%2C16%2C17%2C18%2C19%2C20%2C21%2C22%2C23%2C24%2C25%2C26%2C27%2C28%2C29%2C30%2C31%2C32%2C33%2C34%2C35%2C36%2C37%2C38%2C39%2C40%2C41%2C42%2C43%2C44%2C45%2C46%2C47%2C48%2C49%2C50%2C51%2C52%2C53%2C54%2C55%2C56%2C57%2C58%2C59%2C60%2C61%2C62%2C63%2C64%2C65%2C66%2C67%2C68%2C69%2C70%2C71%2C72%2C73%2C74%2C78%2C79%2C80%2C81%2C82%2C83%2C84%2C85%2C86%2C87%2C88%2C89%2C90%2C91%2C92%2C93%2C94%2C95%2C96%2C97%2C98%2C99%2C100%2C101%2C102%2C103%2C104%2C105%2C106%2C107%2C108%2C109%5D%5D&checkedLevels="
+destination <- paste0(getwd(), "/test.csv")
+download.file(url, destination, method = "wininet", mode = "wb")
+cpi_data <- read.csv("test.csv")
+
+# Prep data: convert date
+cpi_data <- cpi_data %>%
+  mutate(date = as.Date(paste0(REF_DATE, "-01")))
+
+# Calculate month-over-month % change for each item in each province
+cpi_data <- cpi_data %>%
+  arrange(GEO, Products, date) %>%
+  group_by(GEO, Products) %>%
+  mutate(pct_change = (VALUE / lag(VALUE) - 1) * 100) %>%
+  ungroup()
+
+# Calculate monthly summary stats (mean, se, ci) across all items for each province
+monthly_stats <- cpi_data %>%
+  filter(!is.na(pct_change)) %>%
+  group_by(GEO, date) %>%
+  summarise(
+    mean_change = mean(pct_change, na.rm = TRUE),
+    sd_change = sd(pct_change, na.rm = TRUE),
+    n_items = n(),
+    se = sd_change / sqrt(n_items),
+    ci_lower = mean_change - 1.96 * se,
+    ci_upper = mean_change + 1.96 * se,
+    .groups = "drop"
+  )
+
+# Policy date
+rebate_date <- as.Date("2023-07-01")
+
+# ============================================================
+# FUNCTION: Create plot for one geography
+# ============================================================
+
+create_monthly_change_plot <- function(data, geo) {
+  
+  res <- data %>% filter(GEO == geo)
+  
+  # Get June-July and July-August 2023 values for subtitle
+  jun_jul_2023 <- res %>% filter(date == as.Date("2023-07-01")) %>% pull(mean_change)
+  jul_aug_2023 <- res %>% filter(date == as.Date("2023-08-01")) %>% pull(mean_change)
+  
+  change_diff <- jul_aug_2023 - jun_jul_2023
+  
+  # Generate yearly breaks for x-axis
+  year_breaks <- seq(from = floor_date(min(res$date), "year"),
+                     to = ceiling_date(max(res$date), "year"),
+                     by = "1 year")
+  
+  # Get y range for annotation placement
+  y_max <- max(res$ci_upper, na.rm = TRUE)
+  y_min <- min(res$ci_lower, na.rm = TRUE)
+  y_top <- y_max + (y_max - y_min) * 0.05
+  
+  # Small x offset for label
+  x_nudge <- 15
+  
+  # Build subtitle
+  subtitle_text <- sprintf(
+    "Between June 2023-July 2023 to July 2023-August 2023, there was a %.2f%% change in grocery prices on average (%.2f%% to %.2f%%)",
+    change_diff, jun_jul_2023, jul_aug_2023
+  )
+  
+  p <- ggplot(res, aes(x = date)) +
+    geom_hline(yintercept = 0, linetype = "solid", color = "gray50", linewidth = 0.5) +
+    # 95% CI ribbon
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), fill = "steelblue", alpha = 0.3) +
+    # Mean line
+    geom_line(aes(y = mean_change), color = "steelblue", linewidth = 0.8) +
+    # July 2023 rebate line
+    geom_vline(xintercept = rebate_date, linetype = "dotted", color = "black", linewidth = 0.7) +
+    annotate("text", x = rebate_date + x_nudge, y = y_top, label = "Grocery Rebate\n(July 2023)", 
+             hjust = 0, vjust = 0, size = 3, color = "black") +
+    scale_x_date(breaks = year_breaks,
+                 labels = function(x) paste0("Jan\n", format(x, "%Y"))) +
+    labs(
+      title = paste("Month to Month Percent Change in Average Grocery Prices:", geo),
+      subtitle = subtitle_text,
+      x = "Date",
+      y = "Average Monthly % Change in Grocery Prices",
+      caption = "Source: Statistics Canada, 2026"
+    ) +
+    coord_cartesian(clip = "off") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 9, color = "gray40"),
+      plot.caption = element_text(size = 8, color = "gray50", hjust = 1),
+      plot.margin = margin(t = 30, r = 40, b = 10, l = 10)
+    )
+  
+  return(p)
+}
+
+# ============================================================
+# FUNCTION: Create compact plot for grid
+# ============================================================
+
+create_monthly_change_plot_compact <- function(data, geo) {
+  
+  res <- data %>% filter(GEO == geo)
+  
+  # Get June-July and July-August 2023 values for subtitle
+  jun_jul_2023 <- res %>% filter(date == as.Date("2023-07-01")) %>% pull(mean_change)
+  jul_aug_2023 <- res %>% filter(date == as.Date("2023-08-01")) %>% pull(mean_change)
+  
+  change_diff <- jul_aug_2023 - jun_jul_2023
+  
+  # Generate yearly breaks for x-axis
+  year_breaks <- seq(from = floor_date(min(res$date), "year"),
+                     to = ceiling_date(max(res$date), "year"),
+                     by = "1 year")
+  
+  # Get y range for annotation placement
+  y_max <- max(res$ci_upper, na.rm = TRUE)
+  y_min <- min(res$ci_lower, na.rm = TRUE)
+  y_top <- y_max + (y_max - y_min) * 0.08
+  
+  # Small x offset for label
+  x_nudge <- 15
+  
+  # Build subtitle
+  subtitle_text <- sprintf(
+    "Between June 2023-July 2023 to July 2023-August 2023, there was a %.2f%% change\nin grocery prices on average (%.2f%% to %.2f%%)",
+    change_diff, jun_jul_2023, jul_aug_2023
+  )
+  
+  p <- ggplot(res, aes(x = date)) +
+    geom_hline(yintercept = 0, linetype = "solid", color = "gray50", linewidth = 0.3) +
+    # 95% CI ribbon
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), fill = "steelblue", alpha = 0.3) +
+    # Mean line
+    geom_line(aes(y = mean_change), color = "steelblue", linewidth = 0.6) +
+    # July 2023 rebate line
+    geom_vline(xintercept = rebate_date, linetype = "dotted", color = "black", linewidth = 0.5) +
+    annotate("text", x = rebate_date + x_nudge, y = y_top, label = "Grocery Rebate\n(July 2023)", 
+             hjust = 0, vjust = 0, size = 2, color = "black") +
+    scale_x_date(breaks = year_breaks,
+                 labels = function(x) paste0("Jan\n", format(x, "%Y"))) +
+    labs(
+      title = paste("Month to Month Percent Change in Average Grocery Prices:", geo),
+      subtitle = subtitle_text,
+      x = NULL,
+      y = "Average Monthly % Change in Grocery Prices",
+      caption = "Source: Statistics Canada, 2026"
+    ) +
+    coord_cartesian(clip = "off") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 8, face = "bold"),
+      plot.subtitle = element_text(size = 6, color = "gray40"),
+      plot.caption = element_text(size = 5, color = "gray50", hjust = 1),
+      axis.title = element_text(size = 6),
+      axis.text = element_text(size = 5),
+      plot.margin = margin(t = 20, r = 25, b = 5, l = 5)
+    )
+  
+  return(p)
+}
+
+# ============================================================
+# CREATE PLOTS FOR ALL PROVINCES
+# ============================================================
+
+# Get unique geographies
+geos <- unique(monthly_stats$GEO)
+geos <- c("Canada", sort(geos[geos != "Canada"]))
+
+# Create named list of full plots
+plots <- list()
+for (geo in geos) {
+  geo_clean <- tolower(gsub("[^A-Za-z0-9]", "_", geo))
+  plots[[geo_clean]] <- create_monthly_change_plot(monthly_stats, geo)
+}
+
+# Create named list of compact plots for grid
+plots_compact <- list()
+for (geo in geos) {
+  geo_clean <- tolower(gsub("[^A-Za-z0-9]", "_", geo))
+  plots_compact[[geo_clean]] <- create_monthly_change_plot_compact(monthly_stats, geo)
+}
+
+# ============================================================
+# ACCESS PLOTS
+# ============================================================
+
+# Individual full plots:
+plots$canada
+plots$ontario
+plots$quebec
+
+# All provinces in a grid (compact version):
+grid.arrange(
+  grobs = plots_compact, 
+  ncol = 3
+)
