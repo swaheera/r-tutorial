@@ -1,0 +1,247 @@
+library(shiny)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(forecast)
+library(lubridate)
+
+# Download the data - expanded to include all provinces
+# GEO codes: 1=Canada, 2=NL, 3=PEI, 4=NS, 5=NB, 6=QC, 7=ON, 8=MB, 9=SK, 10=AB, 11=BC
+url <- "https://www150.statcan.gc.ca/t1/tbl1/en/dtl!downloadDbLoadingData-nonTraduit.action?pid=1810024502&latestN=0&startDate=20170101&endDate=20251201&csvLocale=en&selectedMembers=%5B%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%5D%2C%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%2C12%2C13%2C14%2C15%2C16%2C17%2C18%2C19%2C20%2C21%2C22%2C23%2C24%2C25%2C26%2C27%2C28%2C29%2C30%2C31%2C32%2C33%2C34%2C35%2C36%2C37%2C38%2C39%2C40%2C41%2C42%2C43%2C44%2C45%2C46%2C47%2C48%2C49%2C50%2C51%2C52%2C53%2C54%2C55%2C56%2C57%2C58%2C59%2C60%2C61%2C62%2C63%2C64%2C65%2C66%2C67%2C68%2C69%2C70%2C71%2C72%2C73%2C74%2C78%2C79%2C80%2C81%2C82%2C83%2C84%2C85%2C86%2C87%2C88%2C89%2C90%2C91%2C92%2C93%2C94%2C95%2C96%2C97%2C98%2C99%2C100%2C101%2C102%2C103%2C104%2C105%2C106%2C107%2C108%2C109%5D%5D&checkedLevels="
+destination <- paste0(getwd(), "/test.csv")
+download.file(url, destination, method = "wininet", mode = "wb")
+cpi_data <- read.csv("test.csv")
+
+# Prep data: convert date
+cpi_data <- cpi_data %>%
+  mutate(date = as.Date(paste0(REF_DATE, "-01")))
+
+# Get product and geography choices
+product_choices <- sort(unique(cpi_data$Products))
+geo_choices <- unique(cpi_data$GEO)
+
+# Reorder so Canada is first
+geo_choices <- c("Canada", sort(geo_choices[geo_choices != "Canada"]))
+
+min_date <- min(cpi_data$date)
+max_date <- max(cpi_data$date)
+
+# Policy date
+rebate_date <- as.Date("2023-07-01")
+
+# Function to fit ARIMA and return forecast data
+fit_and_forecast <- function(df, start_date, end_date, h = 6) {
+  df <- df %>% arrange(date) %>% filter(!is.na(VALUE))
+  
+  # Filter to training window
+  train <- df %>% filter(date >= start_date & date <= end_date)
+  
+  if (nrow(train) < 12) return(NULL)
+  
+  # Test is 6 months after training end
+  test_start <- end_date %m+% months(1)
+  test_end <- end_date %m+% months(h)
+  test <- df %>% filter(date >= test_start & date <= test_end)
+  
+  if (nrow(test) < h) return(NULL)
+  
+  # Create ts object
+  start_year <- as.numeric(format(min(train$date), "%Y"))
+  start_month <- as.numeric(format(min(train$date), "%m"))
+  ts_train <- ts(train$VALUE, start = c(start_year, start_month), frequency = 12)
+  
+  # Fit auto.arima and forecast
+  fit <- auto.arima(ts_train)
+  fc <- forecast(fit, h = h)
+  
+  # Get last training point for padding
+  last_train_date <- max(train$date)
+  last_train_value <- train$VALUE[nrow(train)]
+  
+  # Build forecast dataframe with padding
+  forecast_dates <- seq(last_train_date, by = "month", length.out = h + 1)
+  
+  forecast_df <- data.frame(
+    date = forecast_dates,
+    forecast = c(last_train_value, as.numeric(fc$mean)),
+    lo80 = c(last_train_value, as.numeric(fc$lower[, 1])),
+    hi80 = c(last_train_value, as.numeric(fc$upper[, 1]))
+  )
+  
+  # Actual data for plotting (train + test period)
+  actual_df <- df %>%
+    filter(date >= start_date & date <= test_end) %>%
+    select(date, VALUE) %>%
+    rename(actual = VALUE)
+  
+  # Calculate MAPE on test set
+  test_actual <- test$VALUE
+  test_forecast <- as.numeric(fc$mean)
+  mape <- mean(abs((test_actual - test_forecast) / test_actual)) * 100
+  
+  list(forecast = forecast_df, actual = actual_df, cutoff = last_train_date, 
+       mape = mape, train_start = start_date, train_end = end_date,
+       forecast_start = test_start, forecast_end = test_end,
+       test_actual = test_actual, test_forecast = test_forecast, test_dates = test$date)
+}
+
+# UI
+ui <- fluidPage(
+  titlePanel("Canadian Food Prices - ARIMA Forecast vs Actual"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("geo", "Select Province/Territory:",
+                  choices = geo_choices,
+                  selected = "Canada"),
+      selectInput("product", "Select Product:",
+                  choices = product_choices,
+                  selected = product_choices[1]),
+      dateInput("start_date", "Training Start Date:",
+                value = as.Date("2017-01-01"),
+                min = min_date,
+                max = max_date %m-% months(18)),
+      dateInput("end_date", "Training End Date:",
+                value = max_date %m-% months(6),
+                min = min_date %m+% months(12),
+                max = max_date %m-% months(6)),
+      helpText("Forecast horizon is fixed at 6 months after training end."),
+      actionButton("go", "Go", class = "btn-primary")
+    ),
+    mainPanel(
+      plotOutput("timeseries", height = "500px"),
+      tags$p("A statistical time series forecasting model (auto.arima) is used to make forecasts.",
+             style = "font-size: 11px; color: gray; margin-top: 5px;")
+    )
+  )
+)
+
+# Server
+server <- function(input, output) {
+  
+  result <- eventReactive(input$go, {
+    start_date <- as.Date(format(input$start_date, "%Y-%m-01"))
+    end_date <- as.Date(format(input$end_date, "%Y-%m-01"))
+    
+    df <- cpi_data %>% filter(Products == input$product, GEO == input$geo)
+    fit_and_forecast(df, start_date = start_date, end_date = end_date, h = 6)
+  })
+  
+  output$timeseries <- renderPlot({
+    req(result())
+    
+    res <- result()
+    if (is.null(res)) {
+      return(NULL)
+    }
+    
+    # Get y range for annotation placement
+    y_max <- max(c(res$actual$actual, res$forecast$hi80), na.rm = TRUE)
+    y_min <- min(c(res$actual$actual, res$forecast$lo80), na.rm = TRUE)
+    y_top <- y_max + (y_max - y_min) * 0.05
+    
+    # Small x offset for labels
+    x_nudge <- 15
+    
+    # Generate yearly breaks for x-axis
+    year_breaks <- seq(from = floor_date(min(res$actual$date), "year"),
+                       to = ceiling_date(max(res$forecast$date), "year"),
+                       by = "1 year")
+    
+    ggplot() +
+      geom_line(data = res$actual, aes(x = date, y = actual), color = "steelblue", linewidth = 0.8) +
+      geom_line(data = res$forecast, aes(x = date, y = forecast), 
+                color = "firebrick", linetype = "dashed", linewidth = 0.8) +
+      geom_ribbon(data = res$forecast, aes(x = date, ymin = lo80, ymax = hi80), 
+                  fill = "firebrick", alpha = 0.2) +
+      # Grocery rebate line
+      geom_vline(xintercept = rebate_date, linetype = "dotted", color = "black") +
+      annotate("text", x = rebate_date + x_nudge, y = y_top, label = "Grocery Rebate\n(July 2023)", 
+               hjust = 0, vjust = 0, size = 3, color = "black") +
+      scale_x_date(breaks = year_breaks,
+                   labels = function(x) paste0("Jan\n", format(x, "%Y"))) +
+      labs(x = "Date", y = "Price (Dollars)", 
+           title = paste("Historical Data and Forecasts for", input$product),
+           subtitle = sprintf("%s | MAPE: %.1f%% | Training: %s to %s | Forecast: %s to %s", 
+                              input$geo,
+                              res$mape, 
+                              format(res$train_start, "%b %Y"),
+                              format(res$train_end, "%b %Y"),
+                              format(res$forecast_start, "%b %Y"),
+                              format(res$forecast_end, "%b %Y")),
+           caption = "Source: Statistics Canada, 2026") +
+      coord_cartesian(clip = "off") +
+      theme_minimal() +
+      theme(plot.title = element_text(size = 14, face = "bold"),
+            plot.subtitle = element_text(size = 10, color = "gray40"),
+            plot.caption = element_text(size = 9, color = "gray50", hjust = 0),
+            plot.margin = margin(t = 30, r = 40, b = 10, l = 10))
+  })
+}
+
+shinyApp(ui, server)
+
+
+# ============================================================
+# OFFLINE VERSION: Function to generate forecast comparison table
+# ============================================================
+
+run_all_forecasts <- function(data, start_date, end_date, h = 6, geo = NULL) {
+  
+  start_date <- as.Date(format(start_date, "%Y-%m-01"))
+  end_date <- as.Date(format(end_date, "%Y-%m-01"))
+  
+  # If geo is specified, filter to that geography; otherwise do all
+  if (!is.null(geo)) {
+    data <- data %>% filter(GEO %in% geo)
+  }
+  
+  # Get unique combinations of product and geography
+  combos <- data %>% 
+    select(Products, GEO) %>% 
+    distinct()
+  
+  results_list <- list()
+  
+  for (i in 1:nrow(combos)) {
+    prod <- combos$Products[i]
+    geography <- combos$GEO[i]
+    
+    df <- data %>% filter(Products == prod, GEO == geography)
+    res <- fit_and_forecast(df, start_date = start_date, end_date = end_date, h = h)
+    
+    if (!is.null(res)) {
+      # Build a row with item, geography, forecast/actual pairs, and MAPE
+      row <- data.frame(item = prod, geography = geography, stringsAsFactors = FALSE)
+      
+      for (j in 1:length(res$test_dates)) {
+        month_label <- format(res$test_dates[j], "%B_%Y")
+        row[[paste0(month_label, "_forecast")]] <- round(res$test_forecast[j], 2)
+        row[[paste0(month_label, "_actual")]] <- round(res$test_actual[j], 2)
+      }
+      
+      row$MAPE <- round(res$mape, 2)
+      
+      results_list[[paste(prod, geography, sep = "_")]] <- row
+    }
+  }
+  
+  # Combine all rows
+  results_df <- bind_rows(results_list)
+  
+  return(results_df)
+}
+
+# Example usage:
+# All provinces and products:
+# forecast_table <- run_all_forecasts(cpi_data, 
+#                                     start_date = as.Date("2017-01-01"), 
+#                                     end_date = as.Date("2025-05-01"))
+
+# Specific province(s):
+# forecast_table <- run_all_forecasts(cpi_data, 
+#                                     start_date = as.Date("2017-01-01"), 
+#                                     end_date = as.Date("2025-05-01"),
+#                                     geo = c("Canada", "Ontario", "Quebec"))
+
+# print(forecast_table)
+# write.csv(forecast_table, "forecast_results.csv", row.names = FALSE)
