@@ -1,0 +1,286 @@
+library(shiny)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(zoo)
+
+# Download the data - expanded to include all provinces
+url <- "https://www150.statcan.gc.ca/t1/tbl1/en/dtl!downloadDbLoadingData-nonTraduit.action?pid=1810024502&latestN=0&startDate=20170101&endDate=20251201&csvLocale=en&selectedMembers=%5B%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%5D%2C%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%2C12%2C13%2C14%2C15%2C16%2C17%2C18%2C19%2C20%2C21%2C22%2C23%2C24%2C25%2C26%2C27%2C28%2C29%2C30%2C31%2C32%2C33%2C34%2C35%2C36%2C37%2C38%2C39%2C40%2C41%2C42%2C43%2C44%2C45%2C46%2C47%2C48%2C49%2C50%2C51%2C52%2C53%2C54%2C55%2C56%2C57%2C58%2C59%2C60%2C61%2C62%2C63%2C64%2C65%2C66%2C67%2C68%2C69%2C70%2C71%2C72%2C73%2C74%2C78%2C79%2C80%2C81%2C82%2C83%2C84%2C85%2C86%2C87%2C88%2C89%2C90%2C91%2C92%2C93%2C94%2C95%2C96%2C97%2C98%2C99%2C100%2C101%2C102%2C103%2C104%2C105%2C106%2C107%2C108%2C109%5D%5D&checkedLevels="
+destination <- paste0(getwd(), "/test.csv")
+download.file(url, destination, method = "wininet", mode = "wb")
+cpi_data <- read.csv("test.csv")
+
+# Prep data: convert date
+cpi_data <- cpi_data %>%
+    mutate(date = as.Date(paste0(REF_DATE, "-01")))
+
+# Get product and geography choices
+product_choices <- sort(unique(cpi_data$Products))
+geo_choices <- unique(cpi_data$GEO)
+
+# Reorder so Canada is first
+geo_choices <- c("Canada", sort(geo_choices[geo_choices != "Canada"]))
+
+min_date <- min(cpi_data$date)
+max_date <- max(cpi_data$date)
+
+# Policy date
+rebate_date_2023 <- as.Date("2023-07-01")
+
+# Function to calculate non-overlapping % change
+calc_pct_change <- function(df, window = 1) {
+    df <- df %>% arrange(date) %>% filter(!is.na(VALUE))
+    
+    if (window == 1) {
+        # Simple month-over-month % change
+        df <- df %>%
+            mutate(pct_change = (VALUE / lag(VALUE) - 1) * 100)
+    } else {
+        # Non-overlapping: % change between consecutive window averages
+        df <- df %>%
+            mutate(
+                roll_avg = rollmean(VALUE, k = window, fill = NA, align = "right"),
+                roll_avg_lag = lag(roll_avg, n = window),
+                pct_change = (roll_avg / roll_avg_lag - 1) * 100
+            )
+    }
+    
+    return(df)
+}
+
+# Function to calculate rolling smoothed series
+calc_smoothed <- function(df, window = 3) {
+    df <- df %>% arrange(date) %>% filter(!is.na(VALUE))
+    
+    df <- df %>%
+        mutate(smoothed = rollmean(VALUE, k = window, fill = NA, align = "right"))
+    
+    return(df)
+}
+
+# UI
+ui <- fluidPage(
+    titlePanel("Canadian Food Prices - Trends and Changes"),
+    sidebarLayout(
+        sidebarPanel(
+            selectInput("geo", "Select Province/Territory:",
+                        choices = geo_choices,
+                        selected = "Canada"),
+            selectInput("product", "Select Product:",
+                        choices = product_choices,
+                        selected = product_choices[1]),
+            radioButtons("analysis_type", "Analysis Type:",
+                         choices = c("Percent Change" = "pct_change",
+                                     "Smoothed Trend" = "smoothed"),
+                         selected = "pct_change"),
+            sliderInput("window", "Window Size (months):",
+                        min = 1, max = 12, value = 1, step = 1),
+            helpText("For % Change: compares non-overlapping window averages."),
+            helpText("For Smoothed: shows rolling average over the window."),
+            hr(),
+            h5("Policy Markers"),
+            checkboxInput("show_custom_date", "Show custom policy date", value = FALSE),
+            conditionalPanel(
+                condition = "input.show_custom_date == true",
+                dateInput("custom_date", "Select Date:",
+                          value = as.Date("2026-07-01"),
+                          min = min_date,
+                          max = as.Date("2030-12-01")),
+                textInput("custom_label", "Label for custom date:", value = "New Policy")
+            ),
+            actionButton("go", "Go", class = "btn-primary")
+        ),
+        mainPanel(
+            plotOutput("timeseries", height = "500px"),
+            tags$p("Source: Statistics Canada, 2026",
+                   style = "font-size: 11px; color: gray; margin-top: 5px;")
+        )
+    )
+)
+
+# Server
+server <- function(input, output) {
+    
+    result <- eventReactive(input$go, {
+        df <- cpi_data %>% filter(Products == input$product, GEO == input$geo)
+        
+        if (input$analysis_type == "pct_change") {
+            calc_pct_change(df, window = input$window)
+        } else {
+            calc_smoothed(df, window = input$window)
+        }
+    })
+    
+    output$timeseries <- renderPlot({
+        req(result())
+        
+        res <- result()
+        
+        # Generate yearly breaks for x-axis
+        year_breaks <- seq(from = floor_date(min(res$date), "year"),
+                           to = ceiling_date(max(res$date), "year"),
+                           by = "1 year")
+        
+        # Build policy lines data for legend
+        policy_lines <- data.frame(
+            xintercept = rebate_date_2023,
+            Policy = "Grocery Rebate (July 2023)"
+        )
+        
+        if (input$show_custom_date) {
+            custom_line <- data.frame(
+                xintercept = as.Date(format(input$custom_date, "%Y-%m-01")),
+                Policy = input$custom_label
+            )
+            policy_lines <- rbind(policy_lines, custom_line)
+        }
+        
+        if (input$analysis_type == "pct_change") {
+            # Percent change plot
+            plot_data <- res %>% filter(!is.na(pct_change))
+            
+            # Determine subtitle text based on window
+            if (input$window == 1) {
+                subtitle_text <- sprintf("%s | Month-over-Month Percent Change", input$geo)
+            } else {
+                subtitle_text <- sprintf("%s | Percent Change: %d-Month Avg vs Previous %d-Month Avg (Non-Overlapping)", 
+                                         input$geo, input$window, input$window)
+            }
+            
+            p <- ggplot(plot_data, aes(x = date, y = pct_change)) +
+                geom_hline(yintercept = 0, linetype = "solid", color = "gray50", linewidth = 0.5) +
+                geom_line(color = "steelblue", linewidth = 0.8) +
+                geom_area(alpha = 0.2, fill = "steelblue") +
+                # Policy lines with legend
+                geom_vline(data = policy_lines, 
+                           aes(xintercept = xintercept, color = Policy), 
+                           linetype = "dotted", linewidth = 0.8) +
+                scale_color_manual(values = c("Grocery Rebate (July 2023)" = "darkgreen", 
+                                              setNames("firebrick", input$custom_label))) +
+                scale_x_date(breaks = year_breaks,
+                             labels = function(x) paste0("Jan\n", format(x, "%Y"))) +
+                labs(x = "Date", y = "Percent Change (%)", 
+                     title = paste("Price Changes for", input$product),
+                     subtitle = subtitle_text) +
+                theme_minimal() +
+                theme(plot.title = element_text(size = 14, face = "bold"),
+                      plot.subtitle = element_text(size = 10, color = "gray40"),
+                      legend.position = "bottom",
+                      legend.title = element_blank())
+            
+        } else {
+            # Smoothed trend plot
+            plot_data <- res %>% filter(!is.na(smoothed))
+            
+            p <- ggplot() +
+                # Raw data
+                geom_line(data = res, aes(x = date, y = VALUE), color = "gray70", linewidth = 0.5, alpha = 0.7) +
+                # Smoothed line
+                geom_line(data = plot_data, aes(x = date, y = smoothed), color = "steelblue", linewidth = 1) +
+                # Policy lines with legend
+                geom_vline(data = policy_lines, 
+                           aes(xintercept = xintercept, color = Policy), 
+                           linetype = "dotted", linewidth = 0.8) +
+                scale_color_manual(values = c("Grocery Rebate (July 2023)" = "darkgreen", 
+                                              setNames("firebrick", input$custom_label))) +
+                scale_x_date(breaks = year_breaks,
+                             labels = function(x) paste0("Jan\n", format(x, "%Y"))) +
+                labs(x = "Date", y = "Price (Dollars)", 
+                     title = paste("Smoothed Price Trend for", input$product),
+                     subtitle = sprintf("%s | %d-Month Rolling Average (raw data in gray)", 
+                                        input$geo, input$window)) +
+                theme_minimal() +
+                theme(plot.title = element_text(size = 14, face = "bold"),
+                      plot.subtitle = element_text(size = 10, color = "gray40"),
+                      legend.position = "bottom",
+                      legend.title = element_blank())
+        }
+        
+        p
+    })
+}
+
+shinyApp(ui, server)
+
+
+# ============================================================
+# OFFLINE VERSION: Functions for percent change and smoothing
+# ============================================================
+
+# Calculate percent change for all products/geographies
+run_all_pct_change <- function(data, window = 1, geo = NULL) {
+    
+    if (!is.null(geo)) {
+        data <- data %>% filter(GEO %in% geo)
+    }
+    
+    combos <- data %>% 
+        select(Products, GEO) %>% 
+        distinct()
+    
+    results_list <- list()
+    
+    for (i in 1:nrow(combos)) {
+        prod <- combos$Products[i]
+        geography <- combos$GEO[i]
+        
+        df <- data %>% filter(Products == prod, GEO == geography)
+        res <- calc_pct_change(df, window = window)
+        
+        res <- res %>%
+            filter(!is.na(pct_change)) %>%
+            select(date, Products, GEO, VALUE, pct_change)
+        
+        results_list[[paste(prod, geography, sep = "_")]] <- res
+    }
+    
+    results_df <- bind_rows(results_list)
+    return(results_df)
+}
+
+# Calculate smoothed values for all products/geographies
+run_all_smoothed <- function(data, window = 3, geo = NULL) {
+    
+    if (!is.null(geo)) {
+        data <- data %>% filter(GEO %in% geo)
+    }
+    
+    combos <- data %>% 
+        select(Products, GEO) %>% 
+        distinct()
+    
+    results_list <- list()
+    
+    for (i in 1:nrow(combos)) {
+        prod <- combos$Products[i]
+        geography <- combos$GEO[i]
+        
+        df <- data %>% filter(Products == prod, GEO == geography)
+        res <- calc_smoothed(df, window = window)
+        
+        res <- res %>%
+            filter(!is.na(smoothed)) %>%
+            select(date, Products, GEO, VALUE, smoothed)
+        
+        results_list[[paste(prod, geography, sep = "_")]] <- res
+    }
+    
+    results_df <- bind_rows(results_list)
+    return(results_df)
+}
+
+# Example usage:
+
+# Percent change (month-over-month):
+# pct_change_table <- run_all_pct_change(cpi_data, window = 1, geo = "Canada")
+
+# Percent change (3-month avg vs previous 3-month avg, non-overlapping):
+# pct_change_table <- run_all_pct_change(cpi_data, window = 3, geo = c("Canada", "Ontario"))
+
+# Smoothed (3-month rolling average):
+# smoothed_table <- run_all_smoothed(cpi_data, window = 3, geo = "Canada")
+
+# print(head(pct_change_table))
+# write.csv(pct_change_table, "pct_change_results.csv", row.names = FALSE)
+# write.csv(smoothed_table, "smoothed_results.csv", row.names = FALSE)
