@@ -1,0 +1,237 @@
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(gridExtra)
+library(grid)
+
+# Download the data
+url <- "https://www150.statcan.gc.ca/t1/tbl1/en/dtl!downloadDbLoadingData-nonTraduit.action?pid=1810024502&latestN=0&startDate=20170101&endDate=20251201&csvLocale=en&selectedMembers=%5B%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%5D%2C%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%2C12%2C13%2C14%2C15%2C16%2C17%2C18%2C19%2C20%2C21%2C22%2C23%2C24%2C25%2C26%2C27%2C28%2C29%2C30%2C31%2C32%2C33%2C34%2C35%2C36%2C37%2C38%2C39%2C40%2C41%2C42%2C43%2C44%2C45%2C46%2C47%2C48%2C49%2C50%2C51%2C52%2C53%2C54%2C55%2C56%2C57%2C58%2C59%2C60%2C61%2C62%2C63%2C64%2C65%2C66%2C67%2C68%2C69%2C70%2C71%2C72%2C73%2C74%2C78%2C79%2C80%2C81%2C82%2C83%2C84%2C85%2C86%2C87%2C88%2C89%2C90%2C91%2C92%2C93%2C94%2C95%2C96%2C97%2C98%2C99%2C100%2C101%2C102%2C103%2C104%2C105%2C106%2C107%2C108%2C109%5D%5D&checkedLevels="
+destination <- paste0(getwd(), "/test.csv")
+download.file(url, destination, method = "wininet", mode = "wb")
+cpi_data <- read.csv("test.csv")
+
+# Prep data: convert date
+cpi_data <- cpi_data %>%
+    mutate(date = as.Date(paste0(REF_DATE, "-01")))
+
+
+# ============================================================
+# FUNCTION: Calculate % change between two windows
+# ============================================================
+
+calc_window_pct_change <- function(data, window1_start, window1_end, window2_start, window2_end) {
+    
+    window1_start <- as.Date(window1_start)
+    window1_end <- as.Date(window1_end)
+    window2_start <- as.Date(window2_start)
+    window2_end <- as.Date(window2_end)
+    
+    window1_avg <- data %>%
+        filter(date >= window1_start & date <= window1_end) %>%
+        group_by(Products, GEO) %>%
+        summarise(avg_price_w1 = mean(VALUE, na.rm = TRUE), .groups = "drop")
+    
+    window2_avg <- data %>%
+        filter(date >= window2_start & date <= window2_end) %>%
+        group_by(Products, GEO) %>%
+        summarise(avg_price_w2 = mean(VALUE, na.rm = TRUE), .groups = "drop")
+    
+    result <- window1_avg %>%
+        inner_join(window2_avg, by = c("Products", "GEO")) %>%
+        mutate(pct_change = (avg_price_w2 / avg_price_w1 - 1) * 100) %>%
+        filter(!is.na(pct_change) & is.finite(pct_change))
+    
+    return(result)
+}
+
+
+# ============================================================
+# FUNCTION: Create distribution plot for one geography
+# ============================================================
+
+create_dist_plot <- function(pct_data, geo, window1_start, window1_end, window2_start, window2_end) {
+    
+    geo_data <- pct_data %>% filter(GEO == geo)
+    
+    avg_change <- mean(geo_data$pct_change, na.rm = TRUE)
+    median_change <- median(geo_data$pct_change, na.rm = TRUE)
+    sd_change <- sd(geo_data$pct_change, na.rm = TRUE)
+    n_items <- nrow(geo_data)
+    
+    p <- ggplot(geo_data, aes(x = pct_change)) +
+        geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "steelblue", color = "white", alpha = 0.7) +
+        geom_density(color = "firebrick", linewidth = 1) +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+        geom_vline(xintercept = avg_change, linetype = "solid", color = "darkgreen", linewidth = 0.8) +
+        labs(
+            title = paste("Distribution of Price Changes:", geo),
+            subtitle = sprintf("Window 1: %s to %s | Window 2: %s to %s\nMean: %.1f%% | Median: %.1f%% | SD: %.1f%% | n=%d items",
+                               format(as.Date(window1_start), "%b %Y"),
+                               format(as.Date(window1_end), "%b %Y"),
+                               format(as.Date(window2_start), "%b %Y"),
+                               format(as.Date(window2_end), "%b %Y"),
+                               avg_change, median_change, sd_change, n_items),
+            x = "% Change",
+            y = "Density",
+            caption = "Source: Statistics Canada, 2026"
+        ) +
+        theme_minimal() +
+        theme(
+            plot.title = element_text(size = 14, face = "bold"),
+            plot.subtitle = element_text(size = 10, color = "gray40"),
+            plot.caption = element_text(size = 9, color = "gray50", hjust = 0)
+        )
+    
+    return(p)
+}
+
+
+# ============================================================
+# FUNCTION: Create lollipop plot for one geography
+# ============================================================
+
+create_lollipop_plot <- function(pct_data, geo, window1_start, window1_end, window2_start, window2_end, n_items = 5) {
+    
+    geo_data <- pct_data %>% filter(GEO == geo)
+    
+    avg_change <- mean(geo_data$pct_change, na.rm = TRUE)
+    median_change <- median(geo_data$pct_change, na.rm = TRUE)
+    sd_change <- sd(geo_data$pct_change, na.rm = TRUE)
+    
+    # Get top positive, top negative, and smallest change
+    top_positive <- geo_data %>%
+        arrange(desc(pct_change)) %>%
+        head(n_items) %>%
+        mutate(category = "Biggest Increase")
+    
+    top_negative <- geo_data %>%
+        arrange(pct_change) %>%
+        head(n_items) %>%
+        mutate(category = "Biggest Decrease")
+    
+    smallest_change <- geo_data %>%
+        arrange(abs(pct_change)) %>%
+        head(n_items) %>%
+        mutate(category = "Smallest Change")
+    
+    plot_data <- bind_rows(top_positive, smallest_change, top_negative)
+    
+    # Shorten product names
+    plot_data <- plot_data %>%
+        mutate(Products_short = substr(Products, 1, 35))
+    
+    # Create ordering factor
+    plot_data <- plot_data %>%
+        mutate(
+            category = factor(category, levels = c("Biggest Increase", "Smallest Change", "Biggest Decrease")),
+            Products_short = factor(Products_short, levels = unique(Products_short[order(category, -pct_change)]))
+        )
+    
+    p <- ggplot(plot_data, aes(x = pct_change, y = reorder(Products_short, pct_change), color = category)) +
+        geom_segment(aes(x = 0, xend = pct_change, yend = reorder(Products_short, pct_change)), linewidth = 0.8) +
+        geom_point(size = 3) +
+        geom_vline(xintercept = 0, linetype = "solid", color = "gray40", linewidth = 0.5) +
+        scale_color_manual(values = c("Biggest Increase" = "firebrick", 
+                                      "Smallest Change" = "gray50", 
+                                      "Biggest Decrease" = "darkgreen")) +
+        labs(
+            title = paste("Top Price Changes:", geo),
+            subtitle = sprintf("Window 1: %s to %s | Window 2: %s to %s\nOverall Mean: %.1f%% | Median: %.1f%% | SD: %.1f%%",
+                               format(as.Date(window1_start), "%b %Y"),
+                               format(as.Date(window1_end), "%b %Y"),
+                               format(as.Date(window2_start), "%b %Y"),
+                               format(as.Date(window2_end), "%b %Y"),
+                               avg_change, median_change, sd_change),
+            x = "% Change",
+            y = NULL,
+            color = "Category",
+            caption = "Source: Statistics Canada, 2026"
+        ) +
+        theme_minimal() +
+        theme(
+            plot.title = element_text(size = 14, face = "bold"),
+            plot.subtitle = element_text(size = 10, color = "gray40"),
+            plot.caption = element_text(size = 9, color = "gray50", hjust = 0),
+            legend.position = "bottom"
+        )
+    
+    return(p)
+}
+
+
+# ============================================================
+# MAIN ANALYSIS FUNCTION
+# ============================================================
+
+run_price_change_analysis <- function(data, 
+                                      window1_start, window1_end, 
+                                      window2_start, window2_end,
+                                      n_top_items = 5) {
+    
+    # Calculate % changes
+    pct_data <- calc_window_pct_change(data, window1_start, window1_end, window2_start, window2_end)
+    
+    # Get unique geographies
+    geos <- unique(pct_data$GEO)
+    geos <- c("Canada", sort(geos[geos != "Canada"]))
+    geos <- geos[geos %in% unique(pct_data$GEO)]
+    
+    # Create named lists for plots
+    dist_plots <- list()
+    lollipop_plots <- list()
+    
+    for (geo in geos) {
+        # Create clean name for variable
+        geo_clean <- tolower(gsub("[^A-Za-z0-9]", "_", geo))
+        
+        # Create distribution plot
+        dist_plots[[geo_clean]] <- create_dist_plot(pct_data, geo, window1_start, window1_end, window2_start, window2_end)
+        
+        # Create lollipop plot
+        lollipop_plots[[geo_clean]] <- create_lollipop_plot(pct_data, geo, window1_start, window1_end, window2_start, window2_end, n_items = n_top_items)
+    }
+    
+    # Return everything
+    return(list(
+        data = pct_data,
+        dist_plots = dist_plots,
+        lollipop_plots = lollipop_plots,
+        geos = geos
+    ))
+}
+
+
+# ============================================================
+# EXAMPLE USAGE
+# ============================================================
+
+# Run analysis comparing pre-rebate to post-rebate
+result <- run_price_change_analysis(
+    data = cpi_data,
+    window1_start = "2023-01-01",
+    window1_end = "2023-06-01",
+    window2_start = "2023-08-01",
+    window2_end = "2024-01-01",
+    n_top_items = 5
+)
+
+# Access individual plots:
+# result$dist_plots$canada
+# result$dist_plots$ontario
+# result$dist_plots$quebec
+# result$lollipop_plots$canada
+# result$lollipop_plots$ontario
+
+# Display distribution plots
+print(result$dist_plots$canada)
+print(result$lollipop_plots$canada)
+
+# Display all distributions using grid.arrange
+grid.arrange(grobs = result$dist_plots, ncol = 3)
+
+# Display all lollipops using grid.arrange
+grid.arrange(grobs = result$lollipop_plots, ncol = 2)
+
+# Access underlying data
+head(result$data)
