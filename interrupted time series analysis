@@ -1,0 +1,320 @@
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(gridExtra)
+library(grid)
+library(forecast)
+
+# Load pre-processed data
+cpi_data <- readRDS("sample.RDS")
+
+# Calculate monthly median % change across all items for each province
+monthly_stats <- cpi_data %>%
+  filter(!is.na(pct_change)) %>%
+  group_by(GEO, date) %>%
+  summarise(
+    median_change = median(pct_change, na.rm = TRUE),
+    n_items = n(),
+    .groups = "drop"
+  )
+
+# Policy date
+rebate_date <- as.Date("2023-07-01")
+
+# ============================================================
+# FUNCTION: Fit ARIMA, do rolling forecasts, and estimate policy effect
+# ============================================================
+
+analyze_policy_effect <- function(data, geo) {
+  
+  res <- data %>% filter(GEO == geo) %>% arrange(date)
+  
+  # Define key dates
+  train_end <- as.Date("2023-01-01")
+  validation_months <- c("2023-02-01", "2023-03-01", "2023-04-01", 
+                         "2023-05-01", "2023-06-01", "2023-07-01")
+  policy_month <- as.Date("2023-08-01")
+  
+  # Get training data
+  train_data <- res %>% filter(date <= train_end)
+  
+  # Create ts object
+  start_year <- as.numeric(format(min(train_data$date), "%Y"))
+  start_month <- as.numeric(format(min(train_data$date), "%m"))
+  
+  # Rolling 1-month forecasts for validation - store forecasts
+  ae_values <- c()
+  forecast_values <- data.frame(date = as.Date(character()), forecast = numeric())
+  current_data <- train_data
+  
+  for (val_month in validation_months) {
+    val_date <- as.Date(val_month)
+    
+    # Fit model on current data
+    ts_data <- ts(current_data$median_change, 
+                  start = c(start_year, start_month), 
+                  frequency = 12)
+    fit <- auto.arima(ts_data)
+    
+    # Forecast 1 month
+    fc <- forecast(fit, h = 1)
+    forecast_val <- as.numeric(fc$mean)
+    
+    # Store forecast
+    forecast_values <- rbind(forecast_values, data.frame(date = val_date, forecast = forecast_val))
+    
+    # Get actual
+    actual_val <- res %>% filter(date == val_date) %>% pull(median_change)
+    
+    # Calculate absolute error
+    if (length(actual_val) > 0) {
+      ae <- abs(actual_val - forecast_val)
+      ae_values <- c(ae_values, ae)
+    }
+    
+    # Add actual to current data for next iteration
+    current_data <- res %>% filter(date <= val_date)
+  }
+  
+  avg_mae <- mean(ae_values, na.rm = TRUE)
+  
+  # Now forecast July-August (policy month)
+  pre_policy_data <- res %>% filter(date <= as.Date("2023-07-01"))
+  ts_pre_policy <- ts(pre_policy_data$median_change, 
+                      start = c(start_year, start_month), 
+                      frequency = 12)
+  fit_final <- auto.arima(ts_pre_policy)
+  fc_policy <- forecast(fit_final, h = 1)
+  
+  forecast_policy <- as.numeric(fc_policy$mean)
+  forecast_lower <- as.numeric(fc_policy$lower[1, 2])
+  forecast_upper <- as.numeric(fc_policy$upper[1, 2])
+  
+  # Add policy forecast to forecast_values
+  forecast_values <- rbind(forecast_values, data.frame(date = policy_month, forecast = forecast_policy))
+  
+  # Get actual July-August change
+  actual_policy <- res %>% filter(date == policy_month) %>% pull(median_change)
+  
+  # Calculate policy effect
+  policy_effect <- actual_policy - forecast_policy
+  policy_effect_lower <- actual_policy - forecast_upper
+  policy_effect_upper <- actual_policy - forecast_lower
+  
+  # Filter data to stop at policy month
+  res_truncated <- res %>% filter(date <= policy_month)
+  
+  return(list(
+    geo = geo,
+    data = res_truncated,
+    forecast_values = forecast_values,
+    train_end = train_end,
+    avg_mae = avg_mae,
+    forecast_policy = forecast_policy,
+    forecast_lower = forecast_lower,
+    forecast_upper = forecast_upper,
+    actual_policy = actual_policy,
+    policy_effect = policy_effect,
+    policy_effect_lower = policy_effect_lower,
+    policy_effect_upper = policy_effect_upper,
+    policy_month = policy_month
+  ))
+}
+
+# ============================================================
+# FUNCTION: Create plot for one geography
+# ============================================================
+
+create_policy_effect_plot <- function(analysis_result) {
+  
+  res <- analysis_result$data
+  forecast_vals <- analysis_result$forecast_values
+  geo <- analysis_result$geo
+  
+  # Generate yearly breaks for x-axis
+  year_breaks <- seq(from = floor_date(min(res$date), "year"),
+                     to = ceiling_date(max(res$date), "year"),
+                     by = "1 year")
+  
+  # Create policy forecast point data (just the last one for error bar)
+  policy_point <- data.frame(
+    date = analysis_result$policy_month,
+    forecast = analysis_result$forecast_policy,
+    lower = analysis_result$forecast_lower,
+    upper = analysis_result$forecast_upper
+  )
+  
+  # Get y range for annotation placement
+  y_max <- max(c(res$median_change, forecast_vals$forecast, policy_point$upper), na.rm = TRUE)
+  y_min <- min(c(res$median_change, forecast_vals$forecast, policy_point$lower), na.rm = TRUE)
+  y_top <- y_max + (y_max - y_min) * 0.05
+  
+  # Small x offset for label
+  x_nudge <- 15
+  
+  # Build subtitle
+  subtitle_text <- sprintf(
+    "Avg MAE (Jan-Jul 2023): %.2f pp. Estimated policy effect: %.2f pp (range: %.2f to %.2f pp)",
+    analysis_result$avg_mae,
+    analysis_result$policy_effect,
+    analysis_result$policy_effect_lower,
+    analysis_result$policy_effect_upper
+  )
+  
+  p <- ggplot() +
+    geom_hline(yintercept = 0, linetype = "solid", color = "gray50", linewidth = 0.5) +
+    # Historical actual line
+    geom_line(data = res, aes(x = date, y = median_change), color = "steelblue", linewidth = 0.8) +
+    # Forecast line (validation + policy)
+    geom_line(data = forecast_vals, aes(x = date, y = forecast), color = "firebrick", linewidth = 0.8, linetype = "dashed") +
+    # Forecast points
+    geom_point(data = forecast_vals, aes(x = date, y = forecast), color = "firebrick", size = 2, shape = 17) +
+    # Policy forecast prediction interval
+    geom_errorbar(data = policy_point, aes(x = date, ymin = lower, ymax = upper), 
+                  width = 20, color = "firebrick", linewidth = 0.8) +
+    # July 2023 rebate line
+    geom_vline(xintercept = rebate_date, linetype = "dotted", color = "black", linewidth = 0.7) +
+    annotate("text", x = rebate_date + x_nudge, y = y_top, label = "Grocery Rebate\n(July 2023)", 
+             hjust = 0, vjust = 0, size = 3, color = "black") +
+    scale_x_date(breaks = year_breaks,
+                 labels = function(x) paste0("Jan\n", format(x, "%Y"))) +
+    labs(
+      title = paste("Month to Month Percent Change in Median Grocery Prices:", geo),
+      subtitle = subtitle_text,
+      x = "Date",
+      y = "Median Monthly % Change in Grocery Prices",
+      caption = "Source: Statistics Canada, 2026. Blue = actual, Red dashed = forecast, error bar = 95% PI. pp = percentage points."
+    ) +
+    coord_cartesian(clip = "off") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 9, color = "gray40"),
+      plot.caption = element_text(size = 8, color = "gray50", hjust = 1),
+      plot.margin = margin(t = 30, r = 40, b = 10, l = 10)
+    )
+  
+  return(p)
+}
+
+# ============================================================
+# FUNCTION: Create compact plot for grid
+# ============================================================
+
+create_policy_effect_plot_compact <- function(analysis_result) {
+  
+  res <- analysis_result$data
+  forecast_vals <- analysis_result$forecast_values
+  geo <- analysis_result$geo
+  
+  # Generate yearly breaks for x-axis
+  year_breaks <- seq(from = floor_date(min(res$date), "year"),
+                     to = ceiling_date(max(res$date), "year"),
+                     by = "1 year")
+  
+  # Create policy forecast point data
+  policy_point <- data.frame(
+    date = analysis_result$policy_month,
+    forecast = analysis_result$forecast_policy,
+    lower = analysis_result$forecast_lower,
+    upper = analysis_result$forecast_upper
+  )
+  
+  # Get y range for annotation placement
+  y_max <- max(c(res$median_change, forecast_vals$forecast, policy_point$upper), na.rm = TRUE)
+  y_min <- min(c(res$median_change, forecast_vals$forecast, policy_point$lower), na.rm = TRUE)
+  y_top <- y_max + (y_max - y_min) * 0.08
+  
+  # Small x offset for label
+  x_nudge <- 15
+  
+  # Build subtitle
+  subtitle_text <- sprintf(
+    "MAE: %.2f pp. Policy effect: %.2f pp (range: %.2f to %.2f pp)",
+    analysis_result$avg_mae,
+    analysis_result$policy_effect,
+    analysis_result$policy_effect_lower,
+    analysis_result$policy_effect_upper
+  )
+  
+  p <- ggplot() +
+    geom_hline(yintercept = 0, linetype = "solid", color = "gray50", linewidth = 0.3) +
+    # Historical actual line
+    geom_line(data = res, aes(x = date, y = median_change), color = "steelblue", linewidth = 0.6) +
+    # Forecast line
+    geom_line(data = forecast_vals, aes(x = date, y = forecast), color = "firebrick", linewidth = 0.6, linetype = "dashed") +
+    # Forecast points
+    geom_point(data = forecast_vals, aes(x = date, y = forecast), color = "firebrick", size = 1.5, shape = 17) +
+    # Policy forecast prediction interval
+    geom_errorbar(data = policy_point, aes(x = date, ymin = lower, ymax = upper), 
+                  width = 15, color = "firebrick", linewidth = 0.6) +
+    # July 2023 rebate line
+    geom_vline(xintercept = rebate_date, linetype = "dotted", color = "black", linewidth = 0.5) +
+    annotate("text", x = rebate_date + x_nudge, y = y_top, label = "Grocery Rebate\n(July 2023)", 
+             hjust = 0, vjust = 0, size = 2, color = "black") +
+    scale_x_date(breaks = year_breaks,
+                 labels = function(x) paste0("Jan\n", format(x, "%Y"))) +
+    labs(
+      title = paste("Month to Month Percent Change in Median Grocery Prices:", geo),
+      subtitle = subtitle_text,
+      x = NULL,
+      y = "Median Monthly % Change",
+      caption = "Blue = actual, Red = forecast"
+    ) +
+    coord_cartesian(clip = "off") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 8, face = "bold"),
+      plot.subtitle = element_text(size = 6, color = "gray40"),
+      plot.caption = element_text(size = 5, color = "gray50", hjust = 1),
+      axis.title = element_text(size = 6),
+      axis.text = element_text(size = 5),
+      plot.margin = margin(t = 20, r = 25, b = 5, l = 5)
+    )
+  
+  return(p)
+}
+
+# ============================================================
+# RUN ANALYSIS FOR ALL PROVINCES
+# ============================================================
+
+cat("Running policy effect analysis for all provinces...\n")
+
+# Get unique geographies
+geos <- unique(monthly_stats$GEO)
+geos <- c("Canada", sort(geos[geos != "Canada"]))
+
+# Run analysis and create plots
+analysis_results <- list()
+plots <- list()
+plots_compact <- list()
+
+for (geo in geos) {
+  cat("  Processing:", geo, "\n")
+  geo_clean <- tolower(gsub("[^A-Za-z0-9]", "_", geo))
+  
+  # Run analysis
+  analysis_results[[geo_clean]] <- analyze_policy_effect(monthly_stats, geo)
+  
+  # Create plots
+  plots[[geo_clean]] <- create_policy_effect_plot(analysis_results[[geo_clean]])
+  plots_compact[[geo_clean]] <- create_policy_effect_plot_compact(analysis_results[[geo_clean]])
+}
+
+cat("Done!\n")
+
+# ============================================================
+# ACCESS PLOTS
+# ============================================================
+
+# Individual full plots:
+plots$canada
+plots$ontario
+plots$quebec
+
+# All provinces in a grid (compact version):
+grid.arrange(
+  grobs = plots_compact, 
+  ncol = 3
+)
