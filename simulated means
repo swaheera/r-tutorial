@@ -1,0 +1,676 @@
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(gridExtra)
+library(grid)
+library(forecast)
+library(tseries)
+library(MASS)
+
+set.seed(123)
+
+# ============================================================
+# USER CONFIGURATION - MODIFY THESE AS NEEDED
+# ============================================================
+
+# Plotting parameters
+PLOT_START_DATE <- as.Date("2018-01-01")
+PLOT_END_DATE <- as.Date("2023-09-01")
+
+# Intervention period
+INTERVENTION_START <- as.Date("2023-07-01")
+INTERVENTION_END <- as.Date("2023-09-01")
+
+# Vertical line options
+SHOW_INTERVENTION_START_LINE <- TRUE
+SHOW_INTERVENTION_END_LINE <- FALSE
+
+# Number of simulations
+N_SIMS <- 10000
+
+# Data source
+DATA_SOURCE <- "Statistics Canada (2026)\nhttps://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810024501"
+
+# ============================================================
+# HELPER FUNCTION: Calculate number of months in intervention
+# ============================================================
+calculate_intervention_months <- function(start_date, end_date) {
+    n_months <- interval(start_date, end_date) %/% months(1) + 1
+    return(n_months)
+}
+
+N_INTERVENTION_MONTHS <- calculate_intervention_months(INTERVENTION_START, INTERVENTION_END)
+
+cat(paste0("Intervention period: ", N_INTERVENTION_MONTHS, " months\n"))
+cat(paste0("From ", format(INTERVENTION_START, "%B %Y"), " to ", format(INTERVENTION_END, "%B %Y"), "\n\n"))
+
+# ============================================================
+# DATA DOWNLOAD AND PREPARATION
+# ============================================================
+
+# Download the data
+url <- "https://www150.statcan.gc.ca/t1/tbl1/en/dtl!downloadDbLoadingData-nonTraduit.action?pid=1810024502&latestN=0&startDate=20170101&endDate=20251201&csvLocale=en&selectedMembers=%5B%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%5D%2C%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%2C12%2C13%2C14%2C15%2C16%2C17%2C18%2C19%2C20%2C21%2C22%2C23%2C24%2C25%2C26%2C27%2C28%2C29%2C30%2C31%2C32%2C33%2C34%2C35%2C36%2C37%2C38%2C39%2C40%2C41%2C42%2C43%2C44%2C45%2C46%2C47%2C48%2C49%2C50%2C51%2C52%2C53%2C54%2C55%2C56%2C57%2C58%2C59%2C60%2C61%2C62%2C63%2C64%2C65%2C66%2C67%2C68%2C69%2C70%2C71%2C72%2C73%2C74%2C78%2C79%2C80%2C81%2C82%2C83%2C84%2C85%2C86%2C87%2C88%2C89%2C90%2C91%2C92%2C93%2C94%2C95%2C96%2C97%2C98%2C99%2C100%2C101%2C102%2C103%2C104%2C105%2C106%2C107%2C108%2C109%5D%5D&checkedLevels="
+destination <- paste0(getwd(), "/test.csv")
+download.file(url, destination, method = "wininet", mode = "wb")
+cpi_data <- read.csv("test.csv")
+
+# Prep data: convert date
+cpi_data <- cpi_data %>%
+    dplyr::mutate(date = as.Date(paste0(REF_DATE, "-01")))
+
+# Calculate month-over-month % change for each item in each province
+cpi_data <- cpi_data %>%
+    dplyr::arrange(GEO, Products, date) %>%
+    dplyr::group_by(GEO, Products) %>%
+    dplyr::mutate(pct_change = (VALUE / lag(VALUE) - 1) * 100) %>%
+    dplyr::ungroup()
+
+# Calculate monthly summary stats by province
+monthly_stats <- cpi_data %>%
+    dplyr::filter(!is.na(pct_change)) %>%
+    dplyr::group_by(GEO, date) %>%
+    dplyr::summarise(
+        median_change = median(pct_change, na.rm = TRUE),
+        mean_change = mean(pct_change, na.rm = TRUE),
+        n_items = n(),
+        .groups = "drop"
+    ) %>%
+    dplyr::arrange(GEO, date)
+
+# Get list of provinces
+provinces <- unique(monthly_stats$GEO)
+
+# ============================================================
+# STATIONARITY CHECKS
+# ============================================================
+cat("\n=== STATIONARITY CHECKS ===\n")
+cat("Using Augmented Dickey-Fuller (ADF) and KPSS tests\n")
+cat("ADF: H0 = non-stationary (p < 0.05 suggests stationary)\n")
+cat("KPSS: H0 = stationary (p > 0.05 suggests stationary)\n\n")
+
+stationarity_results <- data.frame()
+
+for (prov in provinces) {
+    prov_data <- monthly_stats %>% dplyr::filter(GEO == prov)
+    
+    for (measure in c("median_change", "mean_change")) {
+        series <- prov_data[[measure]]
+        
+        # ADF test
+        adf_result <- tryCatch({
+            adf.test(series, alternative = "stationary")
+        }, error = function(e) list(p.value = NA))
+        
+        # KPSS test
+        kpss_result <- tryCatch({
+            kpss.test(series, null = "Level")
+        }, error = function(e) list(p.value = NA))
+        
+        stationarity_results <- rbind(stationarity_results, data.frame(
+            GEO = prov,
+            measure = measure,
+            adf_pvalue = adf_result$p.value,
+            kpss_pvalue = kpss_result$p.value,
+            adf_stationary = ifelse(adf_result$p.value < 0.05, "Yes", "No"),
+            kpss_stationary = ifelse(kpss_result$p.value > 0.05, "Yes", "No")
+        ))
+    }
+}
+
+# Print stationarity results
+print(stationarity_results %>% dplyr::arrange(measure, GEO))
+
+# Check if any series are non-stationary
+non_stationary <- stationarity_results %>%
+    dplyr::filter(adf_stationary == "No" | kpss_stationary == "No")
+
+if (nrow(non_stationary) > 0) {
+    cat("\n WARNING: Some series may be non-stationary:\n")
+    print(non_stationary)
+    cat("\nProceeding with auto.arima which handles differencing automatically.\n")
+} else {
+    cat("\nAll series appear stationary. Proceeding with analysis.\n")
+}
+
+# ============================================================
+# SIMULATION-BASED INTERVENTION EFFECT ESTIMATION
+# ============================================================
+cat("\n=== FITTING MODELS AND ESTIMATING INTERVENTION EFFECTS ===\n")
+cat(paste0("Using simulation-based approach with ", N_SIMS, " draws\n"))
+cat("Two sources of uncertainty captured:\n")
+cat("  1. Parameter uncertainty (drawing from coefficient distribution)\n")
+cat("  2. Forecast uncertainty (simulating counterfactual paths)\n\n")
+cat("Effect calculation: mean[(actual - counterfactual) for each intervention month]\n\n")
+
+# Function to estimate intervention effect using simulation
+estimate_intervention_effect <- function(data, value_col, n_sims = N_SIMS) {
+    
+    # Split into pre-intervention and intervention periods
+    pre_data <- data %>% dplyr::filter(date < INTERVENTION_START)
+    intervention_data <- data %>% dplyr::filter(date >= INTERVENTION_START & date <= INTERVENTION_END)
+    
+    # Create time series for pre-intervention period
+    ts_pre <- ts(pre_data[[value_col]], 
+                 start = c(year(min(pre_data$date)), month(min(pre_data$date))), 
+                 frequency = 12)
+    
+    # Fit model on pre-intervention data
+    model <- auto.arima(ts_pre, seasonal = TRUE)
+    
+    # Get actual intervention period values
+    post_actuals <- intervention_data[[value_col]]
+    
+    # Extract model parameters
+    coef_est <- coef(model)
+    vcov_mat <- vcov(model)
+    sigma_est <- sqrt(model$sigma2)
+    
+    # Get model order
+    order <- arimaorder(model)
+    p <- order[1]
+    d <- order[2]
+    q <- order[3]
+    P <- order[4]
+    D <- order[5]
+    Q <- order[6]
+    
+    # Simulation: captures BOTH parameter uncertainty AND forecast uncertainty
+    mean_diffs <- numeric(n_sims)
+    sim_paths_all <- matrix(NA, nrow = n_sims, ncol = length(post_actuals))
+    n_intervention <- length(post_actuals)
+    
+    for (sim in 1:n_sims) {
+        if (sim %% 2000 == 0) cat(paste0("  Simulation ", sim, "/", n_sims, "\n"))
+        
+        # PARAMETER UNCERTAINTY: Draw parameters from multivariate normal
+        coef_draw <- mvrnorm(n = 1, mu = coef_est, Sigma = vcov_mat)
+        
+        # Extract AR and MA coefficients
+        ar_coefs <- if (p > 0) coef_draw[paste0("ar", 1:p)] else numeric(0)
+        ma_coefs <- if (q > 0) coef_draw[paste0("ma", 1:q)] else numeric(0)
+        
+        # Handle intercept/mean
+        intercept <- 0
+        if ("intercept" %in% names(coef_draw)) {
+            intercept <- coef_draw["intercept"]
+        } else if ("mean" %in% names(coef_draw)) {
+            intercept <- coef_draw["mean"]
+        }
+        
+        # FORECAST UNCERTAINTY: Simulate counterfactual path with noise
+        if (p == 0 && q == 0) {
+            sim_path <- rnorm(n_intervention, mean = intercept, sd = sigma_est)
+        } else {
+            model_spec <- list()
+            if (p > 0) model_spec$ar <- ar_coefs
+            if (q > 0) model_spec$ma <- ma_coefs
+            
+            sim_path <- tryCatch(
+                arima.sim(n = n_intervention, model = model_spec, sd = sigma_est) + intercept,
+                error = function(e) rnorm(n_intervention, mean = intercept, sd = sigma_est)
+            )
+        }
+        
+        sim_paths_all[sim, ] <- sim_path
+        
+        # EFFECT CALCULATION: mean of (actual - counterfactual) for each month
+        mean_diffs[sim] <- mean(post_actuals - sim_path)
+    }
+    
+    # Calculate prediction intervals for each intervention time point
+    pred_lower <- apply(sim_paths_all, 2, quantile, probs = 0.025)
+    pred_upper <- apply(sim_paths_all, 2, quantile, probs = 0.975)
+    pred_mean <- apply(sim_paths_all, 2, mean)
+    
+    # Calculate summary statistics for effect
+    estimate <- mean(mean_diffs)
+    ci_lower <- quantile(mean_diffs, 0.025)
+    ci_upper <- quantile(mean_diffs, 0.975)
+    
+    # Get fitted values for the pre-intervention period (for plotting)
+    fitted_pre <- as.numeric(fitted(model))
+    
+    # Get the last fitted value (for padding/connecting to counterfactual)
+    last_fitted <- tail(fitted_pre, 1)
+    
+    return(list(
+        results = data.frame(
+            estimate = estimate,
+            ci_lower = ci_lower,
+            ci_upper = ci_upper,
+            model_order = paste0("ARIMA(", p, ",", d, ",", q, ")(", P, ",", D, ",", Q, ")[12]")
+        ),
+        fitted_pre = fitted_pre,
+        last_fitted = last_fitted,
+        pred_mean = pred_mean,
+        pred_lower = pred_lower,
+        pred_upper = pred_upper,
+        mean_diffs = mean_diffs,
+        pre_dates = pre_data$date,
+        intervention_dates = intervention_data$date
+    ))
+}
+
+# Fit models for each province and store results
+all_models <- list()
+median_results <- data.frame()
+mean_results <- data.frame()
+
+for (prov in provinces) {
+    cat(paste0("\nProcessing: ", prov, "\n"))
+    prov_data <- monthly_stats %>% dplyr::filter(GEO == prov)
+    
+    # Median model
+    cat("  Fitting MEDIAN model...\n")
+    median_fit <- estimate_intervention_effect(prov_data, "median_change", N_SIMS)
+    result_med <- median_fit$results
+    result_med$GEO <- prov
+    result_med$measure <- "Median"
+    median_results <- rbind(median_results, result_med)
+    
+    # Mean model
+    cat("  Fitting MEAN model...\n")
+    mean_fit <- estimate_intervention_effect(prov_data, "mean_change", N_SIMS)
+    result_mean <- mean_fit$results
+    result_mean$GEO <- prov
+    result_mean$measure <- "Mean"
+    mean_results <- rbind(mean_results, result_mean)
+    
+    # Store fitted values and simulation distributions
+    all_models[[prov]] <- list(
+        data = prov_data,
+        median_fit = median_fit,
+        mean_fit = mean_fit
+    )
+}
+
+# Combine results
+all_results <- rbind(median_results, mean_results)
+
+# ============================================================
+# HELPER FUNCTION: Create subtitle text
+# ============================================================
+create_subtitle <- function(measure_label, effect_est, ci_lower, ci_upper) {
+    
+    # Determine direction
+    direction <- ifelse(effect_est < 0, "lower", "higher")
+    
+    # Format the effect estimate
+    effect_abs <- abs(round(effect_est, 2))
+    
+    # Format CI
+    ci_lower_fmt <- round(ci_lower, 2)
+    ci_upper_fmt <- round(ci_upper, 2)
+    
+    # Build subtitle
+    subtitle_text <- paste0(
+        "A model controlling for seasonality and existing trends was fit on pre-rebate data (",
+        format(PLOT_START_DATE, "%b %Y"), " - ", format(INTERVENTION_START - months(1), "%b %Y"), ").\n",
+        "During the ", N_INTERVENTION_MONTHS, "-month rebate window (",
+        format(INTERVENTION_START, "%b %Y"), " - ", format(INTERVENTION_END, "%b %Y"),
+        "), actual ", tolower(measure_label), " price changes were ", effect_abs, 
+        " percentage points ", direction, " than predicted,\n",
+        "with a 95% interval of [", ci_lower_fmt, ", ", ci_upper_fmt, 
+        "]. This suggests the rebate was associated with a change of ~", effect_abs,
+        " pp, assuming pre-rebate dynamics would have continued."
+    )
+    
+    return(subtitle_text)
+}
+
+# ============================================================
+# HELPER FUNCTION: Create individual province time series plot
+# ============================================================
+create_province_plot <- function(prov, measure_type = "mean") {
+    
+    prov_model <- all_models[[prov]]
+    prov_data <- prov_model$data
+    
+    if (measure_type == "mean") {
+        fit_data <- prov_model$mean_fit
+        value_col <- "mean_change"
+        measure_label <- "Average"
+        effect_est <- mean_results$estimate[mean_results$GEO == prov]
+        ci_lower <- mean_results$ci_lower[mean_results$GEO == prov]
+        ci_upper <- mean_results$ci_upper[mean_results$GEO == prov]
+    } else {
+        fit_data <- prov_model$median_fit
+        value_col <- "median_change"
+        measure_label <- "Median"
+        effect_est <- median_results$estimate[median_results$GEO == prov]
+        ci_lower <- median_results$ci_lower[median_results$GEO == prov]
+        ci_upper <- median_results$ci_upper[median_results$GEO == prov]
+    }
+    
+    # Filter to plot date range
+    prov_data <- prov_data %>% 
+        dplyr::filter(date >= PLOT_START_DATE & date <= PLOT_END_DATE)
+    
+    # Pre-intervention fitted values
+    pre_dates <- fit_data$pre_dates
+    fitted_pre <- fit_data$fitted_pre
+    last_fitted <- fit_data$last_fitted
+    last_pre_date <- max(pre_dates)
+    
+    # Intervention predictions
+    intervention_dates <- fit_data$intervention_dates
+    pred_mean <- fit_data$pred_mean
+    pred_lower <- fit_data$pred_lower
+    pred_upper <- fit_data$pred_upper
+    
+    # Create plot data frame
+    plot_df <- prov_data
+    plot_df$actual <- plot_df[[value_col]]
+    plot_df$fitted <- NA_real_
+    plot_df$counterfactual <- NA_real_
+    plot_df$cf_lower <- NA_real_
+    plot_df$cf_upper <- NA_real_
+    
+    # Add fitted values for pre-intervention period (within plot range)
+    pre_idx <- which(plot_df$date %in% pre_dates)
+    fitted_df <- data.frame(date = pre_dates, fitted_val = fitted_pre)
+    for (i in pre_idx) {
+        d <- plot_df$date[i]
+        match_idx <- which(fitted_df$date == d)
+        if (length(match_idx) > 0) {
+            plot_df$fitted[i] <- fitted_df$fitted_val[match_idx]
+        }
+    }
+    
+    # Find the index of the last pre-intervention date
+    last_pre_idx <- which(plot_df$date == last_pre_date)
+    
+    # Add counterfactual for intervention period
+    int_idx <- which(plot_df$date %in% intervention_dates)
+    for (i in seq_along(int_idx)) {
+        idx <- int_idx[i]
+        plot_df$counterfactual[idx] <- pred_mean[i]
+        plot_df$cf_lower[idx] <- pred_lower[i]
+        plot_df$cf_upper[idx] <- pred_upper[i]
+    }
+    
+    # PADDING: Add the last fitted value as the first point of counterfactual
+    if (length(last_pre_idx) > 0) {
+        plot_df$counterfactual[last_pre_idx] <- last_fitted
+    }
+    
+    # Create date breaks: January of each year within plot range + intervention dates
+    year_start <- year(PLOT_START_DATE)
+    year_end <- year(PLOT_END_DATE)
+    year_breaks <- seq(as.Date(paste0(year_start, "-01-01")), 
+                       as.Date(paste0(year_end, "-01-01")), 
+                       by = "year")
+    
+    # Add intervention date breaks
+    intervention_breaks <- c()
+    if (SHOW_INTERVENTION_START_LINE) {
+        intervention_breaks <- c(intervention_breaks, INTERVENTION_START)
+    }
+    if (SHOW_INTERVENTION_END_LINE) {
+        intervention_breaks <- c(intervention_breaks, INTERVENTION_END)
+    }
+    
+    all_breaks <- sort(unique(c(year_breaks, intervention_breaks)))
+    
+    # Custom labels
+    date_labels <- sapply(all_breaks, function(d) {
+        if ((d == INTERVENTION_START && SHOW_INTERVENTION_START_LINE) ||
+            (d == INTERVENTION_END && SHOW_INTERVENTION_END_LINE)) {
+            return(paste0(format(d, "%b"), "\n", year(d)))
+        } else {
+            return(paste0("Jan\n", year(d)))
+        }
+    })
+    
+    # Create subtitle
+    subtitle_text <- create_subtitle(measure_label, effect_est, ci_lower, ci_upper)
+    
+    # Build the plot
+    p <- ggplot(plot_df, aes(x = date)) +
+        # Prediction interval ribbon (light pink)
+        geom_ribbon(aes(ymin = cf_lower, ymax = cf_upper, fill = "95% Prediction Interval"), 
+                    alpha = 0.4, na.rm = TRUE) +
+        # Actual data (black solid)
+        geom_line(aes(y = actual, color = "Actual Data"), linewidth = 0.7) +
+        # Fitted model (red solid)
+        geom_line(aes(y = fitted, color = "Fitted Model"), linewidth = 0.8, na.rm = TRUE) +
+        # Counterfactual (red dotted)
+        geom_line(aes(y = counterfactual, color = "Model Forecast (No Rebate)"), 
+                  linetype = "dotted", linewidth = 1, na.rm = TRUE)
+    
+    # Add intervention line(s) - using geom_vline directly without aes for linetype
+    # We'll add a dummy segment for the legend
+    if (SHOW_INTERVENTION_START_LINE) {
+        p <- p + geom_vline(xintercept = INTERVENTION_START,
+                            linetype = "dotted", color = "black", linewidth = 0.8)
+    }
+    if (SHOW_INTERVENTION_END_LINE) {
+        p <- p + geom_vline(xintercept = INTERVENTION_END,
+                            linetype = "dotted", color = "black", linewidth = 0.8)
+    }
+    
+    # Add a dummy horizontal segment for the legend (invisible but creates legend entry)
+    # This creates a horizontal line in the legend instead of vertical
+    dummy_y <- mean(plot_df$actual, na.rm = TRUE)
+    p <- p + geom_segment(aes(x = PLOT_START_DATE, xend = PLOT_START_DATE,
+                               y = dummy_y, yend = dummy_y,
+                               linetype = "2023 Grocery Rebate"),
+                          color = "black", linewidth = 0.8)
+    
+    # Add scales
+    p <- p +
+        # Color scale
+        scale_color_manual(
+            name = "",
+            values = c("Actual Data" = "black", 
+                       "Fitted Model" = "red", 
+                       "Model Forecast (No Rebate)" = "red"),
+            guide = guide_legend(
+                order = 1,
+                override.aes = list(
+                    linetype = c("solid", "solid", "dotted"),
+                    linewidth = c(0.7, 0.8, 1)
+                )
+            )
+        ) +
+        # Fill scale for ribbon
+        scale_fill_manual(
+            name = "",
+            values = c("95% Prediction Interval" = "lightpink"),
+            guide = guide_legend(order = 2)
+        ) +
+        # Linetype scale for rebate line (horizontal in legend)
+        scale_linetype_manual(
+            name = "",
+            values = c("2023 Grocery Rebate" = "dotted"),
+            guide = guide_legend(
+                order = 3,
+                override.aes = list(color = "black", linewidth = 0.8)
+            )
+        ) +
+        # X-axis
+        scale_x_date(
+            breaks = all_breaks,
+            labels = date_labels,
+            limits = c(PLOT_START_DATE, PLOT_END_DATE)
+        ) +
+        # Labels
+        labs(
+            title = paste0(prov, ": ", measure_label, " Month-to-Month % Change in Grocery Prices"),
+            subtitle = subtitle_text,
+            x = "",
+            y = paste0(measure_label, " Month-to-Month\n% Change in Grocery Prices"),
+            caption = DATA_SOURCE
+        ) +
+        # Theme
+        theme_minimal() +
+        theme(
+            plot.title = element_text(face = "bold", size = 12),
+            plot.subtitle = element_text(size = 9),
+            plot.caption = element_text(hjust = 0, size = 8),
+            legend.position = "bottom",
+            legend.box = "horizontal",
+            legend.text = element_text(size = 8),
+            axis.text.x = element_text(size = 8),
+            axis.title.y = element_text(size = 9)
+        )
+    
+    return(p)
+}
+
+# ============================================================
+# PLOT 1: Coefficient plot for MEDIAN only
+# ============================================================
+p_median_coef <- ggplot(median_results, aes(x = reorder(GEO, estimate), y = estimate)) +
+    geom_point(size = 3, color = "#0072B2") +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), 
+                  width = 0.3, color = "#0072B2") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    coord_flip() +
+    labs(
+        title = "Estimated Association Between Grocery Rebate and Month-to-Month CPI Change",
+        subtitle = paste0("MEDIAN - Simulation-based estimates with 95% credible intervals\n",
+                          "Intervention period: ", N_INTERVENTION_MONTHS, " months, from ",
+                          format(INTERVENTION_START, "%B %Y"), " to ", 
+                          format(INTERVENTION_END, "%B %Y")),
+        x = "Province",
+        y = "Estimated Difference from Expected\n(percentage points)",
+        caption = DATA_SOURCE
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold"))
+
+print(p_median_coef)
+
+# ============================================================
+# PLOT 2: Coefficient plot for MEAN only
+# ============================================================
+p_mean_coef <- ggplot(mean_results, aes(x = reorder(GEO, estimate), y = estimate)) +
+    geom_point(size = 3, color = "#E69F00") +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), 
+                  width = 0.3, color = "#E69F00") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    coord_flip() +
+    labs(
+        title = "Estimated Association Between Grocery Rebate and Month-to-Month CPI Change",
+        subtitle = paste0("MEAN - Simulation-based estimates with 95% credible intervals\n",
+                          "Intervention period: ", N_INTERVENTION_MONTHS, " months, from ",
+                          format(INTERVENTION_START, "%B %Y"), " to ", 
+                          format(INTERVENTION_END, "%B %Y")),
+        x = "Province",
+        y = "Estimated Difference from Expected\n(percentage points)",
+        caption = DATA_SOURCE
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold"))
+
+print(p_mean_coef)
+
+# ============================================================
+# PLOT 3: MEAN time series plots using grid.arrange
+# ============================================================
+cat("\nCreating MEAN time series plots...\n")
+
+mean_plots <- list()
+for (prov in provinces) {
+    mean_plots[[prov]] <- create_province_plot(prov, "mean")
+}
+
+# Arrange in grid
+n_cols <- 3
+n_rows <- ceiling(length(provinces) / n_cols)
+
+mean_grid <- do.call(grid.arrange, c(mean_plots, ncol = n_cols))
+
+# Print individual plots
+for (prov in provinces) {
+    print(mean_plots[[prov]])
+}
+
+# ============================================================
+# PLOT 4: MEDIAN time series plots using grid.arrange
+# ============================================================
+cat("\nCreating MEDIAN time series plots...\n")
+
+median_plots <- list()
+for (prov in provinces) {
+    median_plots[[prov]] <- create_province_plot(prov, "median")
+}
+
+# Arrange in grid
+median_grid <- do.call(grid.arrange, c(median_plots, ncol = n_cols))
+
+# Print individual plots
+for (prov in provinces) {
+    print(median_plots[[prov]])
+}
+
+# ============================================================
+# PLOT 5: Distribution of simulated effects
+# ============================================================
+sample_prov <- "Canada"
+dist_data <- data.frame(
+    median_diff = all_models[[sample_prov]]$median_fit$mean_diffs,
+    mean_diff = all_models[[sample_prov]]$mean_fit$mean_diffs
+)
+
+p_dist_median <- ggplot(dist_data, aes(x = median_diff)) +
+    geom_histogram(fill = "#0072B2", alpha = 0.7, bins = 50) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = median_results$estimate[median_results$GEO == sample_prov], 
+               color = "black", linewidth = 1) +
+    labs(
+        title = paste0(sample_prov, " - Distribution of Simulated Differences (MEDIAN)"),
+        subtitle = "Black line = observed difference, Red dashed = no difference",
+        x = "Difference from Expected\n(percentage points)",
+        y = "Count",
+        caption = DATA_SOURCE
+    ) +
+    theme_minimal()
+
+p_dist_mean <- ggplot(dist_data, aes(x = mean_diff)) +
+    geom_histogram(fill = "#E69F00", alpha = 0.7, bins = 50) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = mean_results$estimate[mean_results$GEO == sample_prov], 
+               color = "black", linewidth = 1) +
+    labs(
+        title = paste0(sample_prov, " - Distribution of Simulated Differences (MEAN)"),
+        subtitle = "Black line = observed difference, Red dashed = no difference",
+        x = "Difference from Expected\n(percentage points)",
+        y = "Count",
+        caption = DATA_SOURCE
+    ) +
+    theme_minimal()
+
+combined_dist <- grid.arrange(p_dist_median, p_dist_mean, ncol = 1)
+print(combined_dist)
+
+# ============================================================
+# SUMMARY TABLE
+# ============================================================
+cat("\n=== SUMMARY OF ESTIMATED ASSOCIATIONS ===\n\n")
+summary_table <- all_results
+summary_table$significant <- ifelse(summary_table$ci_lower > 0 | summary_table$ci_upper < 0, "Yes", "No")
+summary_table$estimate <- round(summary_table$estimate, 4)
+summary_table$ci_lower <- round(summary_table$ci_lower, 4)
+summary_table$ci_upper <- round(summary_table$ci_upper, 4)
+summary_table <- summary_table[order(summary_table$measure, summary_table$estimate), ]
+
+print(summary_table)
+
+# Save summary to CSV
+write.csv(summary_table, "intervention_effects_summary.csv", row.names = FALSE)
+write.csv(stationarity_results, "stationarity_results.csv", row.names = FALSE)
+
+cat("\n=== CONFIGURATION USED ===\n")
+cat(paste0("Plot start date: ", PLOT_START_DATE, "\n"))
+cat(paste0("Plot end date: ", PLOT_END_DATE, "\n"))
+cat(paste0("Intervention start: ", INTERVENTION_START, "\n"))
+cat(paste0("Intervention end: ", INTERVENTION_END, "\n"))
+cat(paste0("Intervention duration: ", N_INTERVENTION_MONTHS, " months\n"))
+cat(paste0("Show intervention start line: ", SHOW_INTERVENTION_START_LINE, "\n"))
+cat(paste0("Show intervention end line: ", SHOW_INTERVENTION_END_LINE, "\n"))
+cat(paste0("Number of simulations: ", N_SIMS, "\n"))
+
+cat("\n=== DONE ===\n")
