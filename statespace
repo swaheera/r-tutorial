@@ -1,0 +1,1534 @@
+options(scipen = 999)
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(gridExtra)
+library(grid)
+library(dlm)       # For Dynamic Linear Models
+library(tseries)
+library(MASS)
+library(ggtext)
+library(gt)
+
+set.seed(123)
+
+# ============================================================
+# USER CONFIGURATION - MODIFY THESE AS NEEDED
+# ============================================================
+
+# Plotting parameters
+PLOT_START_DATE <- as.Date("2018-01-01")
+PLOT_END_DATE <- as.Date("2023-09-01")
+
+# Intervention period
+INTERVENTION_START <- as.Date("2023-07-01")
+INTERVENTION_END <- as.Date("2023-09-01")
+
+# Vertical line options
+SHOW_INTERVENTION_START_LINE <- TRUE
+SHOW_INTERVENTION_END_LINE <- TRUE
+
+# Number of simulations
+N_SIMS <- 10000
+
+# Data source
+DATA_SOURCE <- "Statistics Canada (2026)\nhttps://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810024501"
+
+# ============================================================
+# HELPER FUNCTION: Calculate number of months in intervention
+# ============================================================
+calculate_intervention_months <- function(start_date, end_date) {
+    n_months <- interval(start_date, end_date) %/% months(1) + 1
+    return(n_months)
+}
+
+N_INTERVENTION_MONTHS <- calculate_intervention_months(INTERVENTION_START, INTERVENTION_END)
+
+cat(paste0("Intervention period: ", N_INTERVENTION_MONTHS, " months\n"))
+cat(paste0("From ", format(INTERVENTION_START, "%B %Y"), " to ", format(INTERVENTION_END, "%B %Y"), "\n\n"))
+
+# ============================================================
+# DATA DOWNLOAD AND PREPARATION
+# ============================================================
+
+# Download the data
+url <- "https://www150.statcan.gc.ca/t1/tbl1/en/dtl!downloadDbLoadingData-nonTraduit.action?pid=1810024502&latestN=0&startDate=20170101&endDate=20251201&csvLocale=en&selectedMembers=%5B%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%5D%2C%5B1%2C2%2C3%2C4%2C5%2C6%2C7%2C8%2C9%2C10%2C11%2C12%2C13%2C14%2C15%2C16%2C17%2C18%2C19%2C20%2C21%2C22%2C23%2C24%2C25%2C26%2C27%2C28%2C29%2C30%2C31%2C32%2C33%2C34%2C35%2C36%2C37%2C38%2C39%2C40%2C41%2C42%2C43%2C44%2C45%2C46%2C47%2C48%2C49%2C50%2C51%2C52%2C53%2C54%2C55%2C56%2C57%2C58%2C59%2C60%2C61%2C62%2C63%2C64%2C65%2C66%2C67%2C68%2C69%2C70%2C71%2C72%2C73%2C74%2C78%2C79%2C80%2C81%2C82%2C83%2C84%2C85%2C86%2C87%2C88%2C89%2C90%2C91%2C92%2C93%2C94%2C95%2C96%2C97%2C98%2C99%2C100%2C101%2C102%2C103%2C104%2C105%2C106%2C107%2C108%2C109%5D%5D&checkedLevels="
+destination <- paste0(getwd(), "/test.csv")
+#download.file(url, destination, method = "auto", mode = "wb")
+cpi_data <- read.csv("test.csv")
+
+# Prep data: convert date
+cpi_data <- cpi_data %>%
+    dplyr::mutate(date = as.Date(paste0(REF_DATE, "-01")))
+
+# Calculate monthly summary stats by province using dollar values (VALUE column directly)
+monthly_stats <- cpi_data %>%
+    dplyr::filter(!is.na(VALUE)) %>%
+    dplyr::group_by(GEO, date) %>%
+    dplyr::summarise(
+        median_value = median(VALUE, na.rm = TRUE),
+        mean_value = mean(VALUE, na.rm = TRUE),
+        n_items = n(),
+        .groups = "drop"
+    ) %>%
+    dplyr::arrange(GEO, date)
+
+# Get list of provinces
+provinces <- unique(monthly_stats$GEO)
+
+# ============================================================
+# DLM MODEL SPECIFICATION FUNCTIONS
+# ============================================================
+
+# Build a DLM with local linear trend + seasonal component
+# State vector: [level, slope, seasonal_1, seasonal_2, ..., seasonal_11]
+# Total state dimension: 2 + 11 = 13 for monthly data
+
+build_dlm <- function(parm) {
+    # parm[1] = log(V) - observation variance
+    # parm[2] = log(W_level) - level state variance
+    # parm[3] = log(W_slope) - slope state variance  
+    # parm[4] = log(W_seasonal) - seasonal state variance
+   
+    V <- exp(parm[1])
+    W_level <- exp(parm[2])
+    W_slope <- exp(parm[3])
+    W_seasonal <- exp(parm[4])
+   
+    # Local linear trend component
+    mod_trend <- dlmModPoly(order = 2, dV = V, dW = c(W_level, W_slope))
+   
+    # Seasonal component (monthly, period = 12)
+    mod_seasonal <- dlmModSeas(frequency = 12, dV = 0, dW = c(W_seasonal, rep(0, 10)))
+   
+    # Combine: trend + seasonal
+    mod <- mod_trend + mod_seasonal
+   
+    return(mod)
+}
+
+# ============================================================
+# PRE-MODEL STATIONARITY CHECKS (RAW SERIES)
+# ============================================================
+cat("\n=== PRE-MODEL STATIONARITY CHECKS (RAW SERIES) ===\n")
+cat("Using Augmented Dickey-Fuller (ADF) and KPSS tests\n")
+cat("ADF: H0 = non-stationary (p < 0.05 suggests stationary)\n")
+cat("KPSS: H0 = stationary (p > 0.05 suggests stationary)\n\n")
+
+stationarity_results <- data.frame()
+
+for (prov in provinces) {
+    prov_data <- monthly_stats %>% dplyr::filter(GEO == prov)
+   
+    for (measure in c("median_value", "mean_value")) {
+        series <- prov_data[[measure]]
+       
+        # ADF test
+        adf_result <- tryCatch({
+            adf.test(series, alternative = "stationary")
+        }, error = function(e) list(p.value = NA))
+       
+        # KPSS test
+        kpss_result <- tryCatch({
+            kpss.test(series, null = "Level")
+        }, error = function(e) list(p.value = NA))
+       
+        stationarity_results <- rbind(stationarity_results, data.frame(
+            GEO = prov,
+            measure = measure,
+            adf_pvalue = adf_result$p.value,
+            kpss_pvalue = kpss_result$p.value,
+            adf_stationary = ifelse(adf_result$p.value < 0.05, "Yes", "No"),
+            kpss_stationary = ifelse(kpss_result$p.value > 0.05, "Yes", "No")
+        ))
+    }
+}
+
+# Print stationarity results
+print(stationarity_results %>% dplyr::arrange(measure, GEO))
+
+cat("\nNote: DLM does not require stationarity - it explicitly models trend and seasonality as latent states.\n")
+
+# ============================================================
+# SIMULATION-BASED INTERVENTION EFFECT ESTIMATION USING DLM
+# ============================================================
+cat("\n=== FITTING DLM MODELS AND ESTIMATING INTERVENTION EFFECTS ===\n")
+cat(paste0("Using simulation-based approach with ", N_SIMS, " draws\n"))
+cat("DLM Model Structure:\n")
+cat("  - Local linear trend (level + slope)\n")
+cat("  - Monthly seasonal component (12 periods)\n")
+cat("  - State variances estimated via MLE\n\n")
+
+# Function to estimate intervention effect using DLM
+estimate_intervention_effect_dlm <- function(data, value_col, n_sims = N_SIMS) {
+   
+    # Split into pre-intervention and intervention periods
+    pre_data <- data %>% dplyr::filter(date < INTERVENTION_START)
+    intervention_data <- data %>% dplyr::filter(date >= INTERVENTION_START & date <= INTERVENTION_END)
+   
+    # Get the series
+    y_pre <- pre_data[[value_col]]
+    n_pre <- length(y_pre)
+    n_intervention <- nrow(intervention_data)
+   
+    # Get actual intervention period values
+    post_actuals <- intervention_data[[value_col]]
+   
+    # Initial parameter values (on log scale)
+    init_parm <- c(log(var(y_pre) * 0.1),   # V
+                   log(var(y_pre) * 0.01),   # W_level
+                   log(var(y_pre) * 0.001),  # W_slope
+                   log(var(y_pre) * 0.01))   # W_seasonal
+   
+    # Fit the DLM using MLE
+    fit <- tryCatch({
+        dlmMLE(y_pre, parm = init_parm, build = build_dlm, hessian = TRUE)
+    }, error = function(e) {
+        cat(paste0("    Warning: MLE optimization had issues, using default parameters\n"))
+        list(par = init_parm, convergence = 1)
+    })
+   
+    # Build the fitted model
+    mod_fitted <- build_dlm(fit$par)
+   
+    # Run Kalman filter and smoother
+    filtered <- dlmFilter(y_pre, mod_fitted)
+    smoothed <- dlmSmooth(filtered)
+   
+    # Extract smoothed states
+    # State order: [level, slope, seasonal_1, ..., seasonal_11]
+    smoothed_states <- smoothed$s
+   
+    # Get fitted values (level + seasonal)
+    # F matrix selects level (position 1) and first seasonal (position 3)
+    fitted_pre <- numeric(n_pre)
+    for (t in 1:n_pre) {
+        # Level is state 1, seasonal effect is state 3
+        fitted_pre[t] <- smoothed_states[t + 1, 1] + smoothed_states[t + 1, 3]
+    }
+   
+    # ============================================================
+    # POST-MODEL RESIDUAL DIAGNOSTICS
+    # ============================================================
+    residuals_model <- y_pre - fitted_pre
+   
+    # ADF test on residuals
+    adf_resid <- tryCatch({
+        adf.test(residuals_model, alternative = "stationary")
+    }, error = function(e) list(p.value = NA, statistic = NA))
+   
+    # KPSS test on residuals
+    kpss_resid <- tryCatch({
+        kpss.test(residuals_model, null = "Level")
+    }, error = function(e) list(p.value = NA, statistic = NA))
+   
+    # Ljung-Box test for autocorrelation in residuals
+    ljung_box <- tryCatch({
+        Box.test(residuals_model, lag = 12, type = "Ljung-Box")
+    }, error = function(e) list(p.value = NA, statistic = NA))
+   
+    residual_diagnostics <- list(
+        adf_pvalue = adf_resid$p.value,
+        adf_stationary = ifelse(!is.na(adf_resid$p.value) && adf_resid$p.value < 0.05, "Yes", "No"),
+        kpss_pvalue = kpss_resid$p.value,
+        kpss_stationary = ifelse(!is.na(kpss_resid$p.value) && kpss_resid$p.value > 0.05, "Yes", "No"),
+        ljung_box_pvalue = ljung_box$p.value,
+        no_autocorrelation = ifelse(!is.na(ljung_box$p.value) && ljung_box$p.value > 0.05, "Yes", "No")
+    )
+   
+    # ============================================================
+    # FORECASTING AND SIMULATION
+    # ============================================================
+   
+    # Get the final state estimates and covariance
+    final_state <- smoothed_states[n_pre + 1, ]
+   
+    # Get state covariance from the filter
+    # Use the filtered covariance at the last time point
+    state_cov <- dlmSvd2var(filtered$U.C, filtered$D.C)[[n_pre]]
+   
+    # Extract variance components
+    V <- mod_fitted$V[1, 1]  # Observation variance
+    W <- mod_fitted$W        # State variance matrix
+    G <- mod_fitted$GG       # State transition matrix
+   
+    # Generate counterfactual forecasts via simulation
+    mean_diffs <- numeric(n_sims)
+    sim_paths_all <- matrix(NA, nrow = n_sims, ncol = n_intervention)
+   
+    for (sim in 1:n_sims) {
+        if (sim %% 2000 == 0) cat(paste0("  Simulation ", sim, "/", n_sims, "\n"))
+       
+        # Draw initial state from the posterior
+        state_draw <- mvrnorm(n = 1, mu = final_state, Sigma = state_cov)
+       
+        # Forward simulate states and observations
+        sim_path <- numeric(n_intervention)
+        current_state <- state_draw
+       
+        for (h in 1:n_intervention) {
+            # Evolve state
+            state_noise <- mvrnorm(n = 1, mu = rep(0, length(current_state)), Sigma = W)
+            current_state <- as.numeric(G %*% current_state) + state_noise
+           
+            # Generate observation (level + seasonal + noise)
+            obs_mean <- current_state[1] + current_state[3]  # level + seasonal
+            obs_noise <- rnorm(1, mean = 0, sd = sqrt(V))
+            sim_path[h] <- obs_mean + obs_noise
+        }
+       
+        sim_paths_all[sim, ] <- sim_path
+       
+        # Calculate effect: mean of (actual - counterfactual)
+        mean_diffs[sim] <- mean(post_actuals - sim_path)
+    }
+   
+    # Calculate prediction intervals
+    pred_lower <- apply(sim_paths_all, 2, quantile, probs = 0.025)
+    pred_upper <- apply(sim_paths_all, 2, quantile, probs = 0.975)
+    pred_mean <- apply(sim_paths_all, 2, mean)
+   
+    # Calculate summary statistics for effect
+    estimate <- mean(mean_diffs)
+    ci_lower <- quantile(mean_diffs, 0.025)
+    ci_upper <- quantile(mean_diffs, 0.975)
+   
+    # Calculate p-value
+    if (estimate >= 0) {
+        p_value <- mean(mean_diffs < 0) * 2
+    } else {
+        p_value <- mean(mean_diffs > 0) * 2
+    }
+    p_value <- min(p_value, 1)
+   
+    # Extract variance estimates for reporting
+    var_obs <- V
+    var_level <- W[1, 1]
+    var_slope <- W[2, 2]
+    var_seasonal <- W[3, 3]
+   
+    # ============================================================
+    # EXTRACT DECOMPOSED COMPONENTS
+    # ============================================================
+   
+    # Trend = level component
+    trend_component <- smoothed_states[2:(n_pre + 1), 1]
+   
+    # Slope (rate of change in trend)
+    slope_component <- smoothed_states[2:(n_pre + 1), 2]
+   
+    # Seasonal component
+    seasonal_component <- smoothed_states[2:(n_pre + 1), 3]
+   
+    return(list(
+        results = data.frame(
+            estimate = estimate,
+            ci_lower = ci_lower,
+            ci_upper = ci_upper,
+            p_value = p_value,
+            model_order = "DLM(trend+seasonal)",
+            var_obs = var_obs,
+            var_level = var_level,
+            var_slope = var_slope,
+            var_seasonal = var_seasonal
+        ),
+        fitted_pre = fitted_pre,
+        last_fitted = tail(fitted_pre, 1),
+        pred_mean = pred_mean,
+        pred_lower = pred_lower,
+        pred_upper = pred_upper,
+        mean_diffs = mean_diffs,
+        pre_dates = pre_data$date,
+        intervention_dates = intervention_data$date,
+        residual_diagnostics = residual_diagnostics,
+        trend_component = trend_component,
+        slope_component = slope_component,
+        seasonal_component = seasonal_component,
+        residuals = residuals_model,
+        mod_fitted = mod_fitted,
+        smoothed_states = smoothed_states
+    ))
+}
+
+# Fit models for each province and store results
+all_models <- list()
+median_results <- data.frame()
+mean_results <- data.frame()
+residual_diagnostics_all <- data.frame()
+
+for (prov in provinces) {
+    cat(paste0("\nProcessing: ", prov, "\n"))
+    prov_data <- monthly_stats %>% dplyr::filter(GEO == prov)
+   
+    # Median model
+    cat("  Fitting MEDIAN DLM model...\n")
+    median_fit <- estimate_intervention_effect_dlm(prov_data, "median_value", N_SIMS)
+    result_med <- median_fit$results
+    result_med$GEO <- prov
+    result_med$measure <- "Median"
+    median_results <- rbind(median_results, result_med)
+   
+    # Store residual diagnostics for median
+    residual_diagnostics_all <- rbind(residual_diagnostics_all, data.frame(
+        GEO = prov,
+        measure = "Median",
+        model_order = result_med$model_order,
+        adf_pvalue = median_fit$residual_diagnostics$adf_pvalue,
+        adf_stationary = median_fit$residual_diagnostics$adf_stationary,
+        kpss_pvalue = median_fit$residual_diagnostics$kpss_pvalue,
+        kpss_stationary = median_fit$residual_diagnostics$kpss_stationary,
+        ljung_box_pvalue = median_fit$residual_diagnostics$ljung_box_pvalue,
+        no_autocorrelation = median_fit$residual_diagnostics$no_autocorrelation
+    ))
+   
+    # Mean model
+    cat("  Fitting MEAN DLM model...\n")
+    mean_fit <- estimate_intervention_effect_dlm(prov_data, "mean_value", N_SIMS)
+    result_mean <- mean_fit$results
+    result_mean$GEO <- prov
+    result_mean$measure <- "Mean"
+    mean_results <- rbind(mean_results, result_mean)
+   
+    # Store residual diagnostics for mean
+    residual_diagnostics_all <- rbind(residual_diagnostics_all, data.frame(
+        GEO = prov,
+        measure = "Mean",
+        model_order = result_mean$model_order,
+        adf_pvalue = mean_fit$residual_diagnostics$adf_pvalue,
+        adf_stationary = mean_fit$residual_diagnostics$adf_stationary,
+        kpss_pvalue = mean_fit$residual_diagnostics$kpss_pvalue,
+        kpss_stationary = mean_fit$residual_diagnostics$kpss_stationary,
+        ljung_box_pvalue = mean_fit$residual_diagnostics$ljung_box_pvalue,
+        no_autocorrelation = mean_fit$residual_diagnostics$no_autocorrelation
+    ))
+   
+    # Store fitted values and simulation distributions
+    all_models[[prov]] <- list(
+        data = prov_data,
+        median_fit = median_fit,
+        mean_fit = mean_fit
+    )
+}
+
+# Combine results
+all_results <- rbind(median_results, mean_results)
+
+# ============================================================
+# POST-DLM RESIDUAL STATIONARITY RESULTS
+# ============================================================
+cat("\n=== POST-DLM RESIDUAL STATIONARITY DIAGNOSTICS ===\n")
+cat("Testing whether model residuals are stationary (white noise)\n")
+cat("ADF: H0 = non-stationary (p < 0.05 suggests residuals are stationary - GOOD)\n")
+cat("KPSS: H0 = stationary (p > 0.05 suggests residuals are stationary - GOOD)\n")
+cat("Ljung-Box: H0 = no autocorrelation (p > 0.05 suggests no autocorrelation - GOOD)\n\n")
+
+print(residual_diagnostics_all %>% dplyr::arrange(measure, GEO))
+
+# ============================================================
+# VARIANCE COMPONENT SUMMARY TABLE
+# ============================================================
+cat("\n=== DLM VARIANCE COMPONENTS ===\n")
+cat("Estimated variance components from each model:\n")
+cat("  - var_obs: Observation noise variance\n")
+cat("  - var_level: Level state variance (trend flexibility)\n")
+cat("  - var_slope: Slope state variance (trend curvature)\n")
+cat("  - var_seasonal: Seasonal state variance\n\n")
+
+variance_summary <- all_results %>%
+    dplyr::select(GEO, measure, var_obs, var_level, var_slope, var_seasonal) %>%
+    dplyr::arrange(measure, GEO)
+
+print(variance_summary)
+
+# ============================================================
+# RESIDUAL DIAGNOSTICS TABLE USING GT
+# ============================================================
+residual_gt <- residual_diagnostics_all %>%
+    gt() %>%
+    tab_header(
+        title = md("**Post-DLM Residual Diagnostics**"),
+        subtitle = "Testing whether model residuals are stationary white noise"
+    ) %>%
+    cols_label(
+        GEO = "Province",
+        measure = "Measure",
+        model_order = "Model",
+        adf_pvalue = "ADF p-value",
+        adf_stationary = "ADF Stationary?",
+        kpss_pvalue = "KPSS p-value",
+        kpss_stationary = "KPSS Stationary?",
+        ljung_box_pvalue = "Ljung-Box p-value",
+        no_autocorrelation = "No Autocorr.?"
+    ) %>%
+    fmt_number(
+        columns = c(adf_pvalue, kpss_pvalue, ljung_box_pvalue),
+        decimals = 4
+    ) %>%
+    tab_footnote(
+        footnote = "ADF: p < 0.05 indicates stationary residuals (desirable)",
+        locations = cells_column_labels(columns = adf_pvalue)
+    ) %>%
+    tab_footnote(
+        footnote = "KPSS: p > 0.05 indicates stationary residuals (desirable)",
+        locations = cells_column_labels(columns = kpss_pvalue)
+    ) %>%
+    tab_footnote(
+        footnote = "Ljung-Box: p > 0.05 indicates no significant autocorrelation (desirable)",
+        locations = cells_column_labels(columns = ljung_box_pvalue)
+    ) %>%
+    tab_source_note(
+        source_note = DATA_SOURCE
+    )
+
+# Save the residual diagnostics table
+gtsave(residual_gt, "residual_diagnostics_table.html")
+
+# ============================================================
+# SUMMARY TABLE USING GT LIBRARY
+# ============================================================
+
+# Create summary table data
+summary_table_data <- data.frame(
+    Province = median_results$GEO,
+    Mean_Estimate = mean_results$estimate,
+    Mean_CI_Lower = mean_results$ci_lower,
+    Mean_CI_Upper = mean_results$ci_upper,
+    Mean_P_Value = mean_results$p_value,
+    Median_Estimate = median_results$estimate,
+    Median_CI_Lower = median_results$ci_lower,
+    Median_CI_Upper = median_results$ci_upper,
+    Median_P_Value = median_results$p_value
+)
+
+# Create GT table
+summary_gt <- summary_table_data %>%
+    gt() %>%
+    tab_header(
+        title = md("**Estimated Association Between Grocery Rebate and Average Grocery Price Index**"),
+        subtitle = paste0("DLM Analysis - Intervention period: ", N_INTERVENTION_MONTHS, " months (",
+                          format(INTERVENTION_START, "%B %Y"), " to ",
+                          format(INTERVENTION_END, "%B %Y"), ")")
+    ) %>%
+    tab_spanner(
+        label = "Mean Analysis",
+        columns = c(Mean_Estimate, Mean_CI_Lower, Mean_CI_Upper, Mean_P_Value)
+    ) %>%
+    tab_spanner(
+        label = "Median Analysis",
+        columns = c(Median_Estimate, Median_CI_Lower, Median_CI_Upper, Median_P_Value)
+    ) %>%
+    cols_label(
+        Province = "Province",
+        Mean_Estimate = "Estimate",
+        Mean_CI_Lower = "95% CI Lower",
+        Mean_CI_Upper = "95% CI Upper",
+        Mean_P_Value = "P-Value",
+        Median_Estimate = "Estimate",
+        Median_CI_Lower = "95% CI Lower",
+        Median_CI_Upper = "95% CI Upper",
+        Median_P_Value = "P-Value"
+    ) %>%
+    fmt_number(
+        columns = c(Mean_Estimate, Mean_CI_Lower, Mean_CI_Upper,
+                    Median_Estimate, Median_CI_Lower, Median_CI_Upper),
+        decimals = 2
+    ) %>%
+    fmt_number(
+        columns = c(Mean_P_Value, Median_P_Value),
+        decimals = 4
+    ) %>%
+    tab_footnote(
+        footnote = "Estimates represent difference in grocery price index points from expected values",
+        locations = cells_column_labels(columns = Mean_Estimate)
+    ) %>%
+    tab_footnote(
+        footnote = "DLM with local linear trend + seasonal components; p-values from simulation",
+        locations = cells_column_labels(columns = Mean_P_Value)
+    ) %>%
+    tab_source_note(
+        source_note = DATA_SOURCE
+    ) %>%
+    cols_width(
+        Province ~ px(120),
+        Mean_Estimate ~ px(80),
+        Mean_CI_Lower ~ px(90),
+        Mean_CI_Upper ~ px(90),
+        Mean_P_Value ~ px(80),
+        Median_Estimate ~ px(80),
+        Median_CI_Lower ~ px(90),
+        Median_CI_Upper ~ px(90),
+        Median_P_Value ~ px(80)
+    )
+
+# Save the table as HTML
+gtsave(summary_gt, "summary_table.html")
+
+# ============================================================
+# HELPER FUNCTION: Create subtitle text
+# ============================================================
+create_subtitle <- function(measure_label, effect_est, ci_lower, ci_upper) {
+   
+    direction <- ifelse(effect_est < 0, "lower", "higher")
+    effect_abs <- abs(round(effect_est, 2))
+    effect_with_sign <- ifelse(effect_est >= 0,
+                               paste0("+", round(effect_est, 2)),
+                               paste0(round(effect_est, 2)))
+    ci_lower_fmt <- round(ci_lower, 2)
+    ci_upper_fmt <- round(ci_upper, 2)
+   
+    subtitle_text <- paste0(
+        "A DLM with trend and seasonal components was fit on pre-rebate data (",
+        format(PLOT_START_DATE, "%b %Y"), " - ", format(INTERVENTION_START - months(1), "%b %Y"), ").\n",
+        "During the ", N_INTERVENTION_MONTHS, "-month rebate window (",
+        format(INTERVENTION_START, "%b %Y"), " - ", format(INTERVENTION_END, "%b %Y"),
+        "), actual ", tolower(measure_label), " grocery price index values were ", effect_abs,
+        " points ", direction, " than predicted,\n",
+        "with a 95% interval of [", ci_lower_fmt, ", ", ci_upper_fmt,
+        "]. This suggests the rebate was associated with a change of ", effect_with_sign,
+        " points."
+    )
+   
+    return(subtitle_text)
+}
+
+# ============================================================
+# HELPER FUNCTION: Create individual province time series plot
+# ============================================================
+create_province_plot <- function(prov, measure_type = "mean") {
+   
+    prov_model <- all_models[[prov]]
+    prov_data <- prov_model$data
+   
+    if (measure_type == "mean") {
+        fit_data <- prov_model$mean_fit
+        value_col <- "mean_value"
+        measure_label <- "Average"
+        effect_est <- mean_results$estimate[mean_results$GEO == prov]
+        ci_lower <- mean_results$ci_lower[mean_results$GEO == prov]
+        ci_upper <- mean_results$ci_upper[mean_results$GEO == prov]
+    } else {
+        fit_data <- prov_model$median_fit
+        value_col <- "median_value"
+        measure_label <- "Median"
+        effect_est <- median_results$estimate[median_results$GEO == prov]
+        ci_lower <- median_results$ci_lower[median_results$GEO == prov]
+        ci_upper <- median_results$ci_upper[median_results$GEO == prov]
+    }
+   
+    # Filter to plot date range
+    prov_data <- prov_data %>%
+        dplyr::filter(date >= PLOT_START_DATE & date <= PLOT_END_DATE)
+   
+    # Pre-intervention fitted values
+    pre_dates <- fit_data$pre_dates
+    fitted_pre <- fit_data$fitted_pre
+    last_fitted <- fit_data$last_fitted
+    last_pre_date <- max(pre_dates)
+   
+    # Intervention predictions
+    intervention_dates <- fit_data$intervention_dates
+    pred_mean <- fit_data$pred_mean
+    pred_lower <- fit_data$pred_lower
+    pred_upper <- fit_data$pred_upper
+   
+    # Create plot data frame
+    plot_df <- prov_data
+    plot_df$actual <- plot_df[[value_col]]
+    plot_df$fitted_solid <- NA_real_
+    plot_df$fitted_dotted <- NA_real_
+    plot_df$cf_lower <- NA_real_
+    plot_df$cf_upper <- NA_real_
+   
+    # Add fitted values for pre-intervention period
+    pre_idx <- which(plot_df$date %in% pre_dates)
+    fitted_df <- data.frame(date = pre_dates, fitted_val = fitted_pre)
+    for (i in pre_idx) {
+        d <- plot_df$date[i]
+        match_idx <- which(fitted_df$date == d)
+        if (length(match_idx) > 0) {
+            plot_df$fitted_solid[i] <- fitted_df$fitted_val[match_idx]
+        }
+    }
+   
+    # Find indices
+    first_intervention_idx <- which(plot_df$date == INTERVENTION_START)
+    int_idx <- which(plot_df$date %in% intervention_dates)
+   
+    # Extend solid red line to include first forecast point
+    if (length(first_intervention_idx) > 0 && length(pred_mean) > 0) {
+        plot_df$fitted_solid[first_intervention_idx] <- pred_mean[1]
+    }
+   
+    # Add counterfactual (dotted) for intervention period
+    for (i in seq_along(int_idx)) {
+        idx <- int_idx[i]
+        plot_df$fitted_dotted[idx] <- pred_mean[i]
+        plot_df$cf_lower[idx] <- pred_lower[i]
+        plot_df$cf_upper[idx] <- pred_upper[i]
+    }
+   
+    # Create date breaks
+    year_start <- year(PLOT_START_DATE)
+    year_end <- year(PLOT_END_DATE)
+    year_breaks <- seq(as.Date(paste0(year_start, "-01-01")),
+                       as.Date(paste0(year_end, "-01-01")),
+                       by = "year")
+    all_breaks <- sort(unique(c(year_breaks, INTERVENTION_START)))
+    if (SHOW_INTERVENTION_END_LINE) {
+        all_breaks <- sort(unique(c(all_breaks, INTERVENTION_END)))
+    }
+   
+    date_labels <- sapply(all_breaks, function(d) {
+        if (d == INTERVENTION_START) {
+            return(paste0("Jul\n", year(d)))
+        } else if (d == INTERVENTION_END && SHOW_INTERVENTION_END_LINE) {
+            return(paste0("Sep\n", year(d)))
+        } else {
+            return(paste0("Jan\n", year(d)))
+        }
+    })
+   
+    intervention_breaks <- c()
+    intervention_labels <- c()
+    if (SHOW_INTERVENTION_START_LINE) {
+        intervention_breaks <- c(intervention_breaks, as.numeric(INTERVENTION_START))
+        intervention_labels <- c(intervention_labels, "2023 Grocery<br>Rebate Begins")
+    }
+   
+    subtitle_text <- create_subtitle(measure_label, effect_est, ci_lower, ci_upper)
+   
+    p <- ggplot(plot_df, aes(x = date)) +
+        geom_ribbon(aes(ymin = cf_lower, ymax = cf_upper, fill = "95% Prediction Interval"),
+                    alpha = 0.4, na.rm = TRUE) +
+        geom_line(aes(y = actual, color = "Actual Data"), linewidth = 0.7) +
+        geom_line(aes(y = fitted_solid, color = "Fitted Model"), linewidth = 0.8, na.rm = TRUE) +
+        geom_line(aes(y = fitted_dotted, color = "Model Forecast (No Rebate)"),
+                  linetype = "dotted", linewidth = 1, na.rm = TRUE)
+   
+    if (SHOW_INTERVENTION_START_LINE) {
+        p <- p + geom_vline(xintercept = INTERVENTION_START,
+                            linetype = "dotted", color = "black", linewidth = 0.8)
+    }
+    if (SHOW_INTERVENTION_END_LINE) {
+        p <- p + geom_vline(xintercept = INTERVENTION_END,
+                            linetype = "dotted", color = "black", linewidth = 0.8)
+    }
+   
+    y_mid <- mean(range(plot_df$actual, na.rm = TRUE))
+    p <- p + geom_segment(aes(x = PLOT_START_DATE, xend = PLOT_START_DATE + 1,
+                              y = y_mid, yend = y_mid,
+                              linetype = "2023 Grocery Rebate"),
+                          color = "black", linewidth = 0.8, alpha = 0)
+   
+    p <- p +
+        scale_color_manual(
+            name = "",
+            values = c("Actual Data" = "black",
+                       "Fitted Model" = "red",
+                       "Model Forecast (No Rebate)" = "red"),
+            guide = guide_legend(
+                order = 1,
+                override.aes = list(
+                    linetype = c("solid", "solid", "dotted"),
+                    linewidth = c(0.7, 0.8, 1)
+                )
+            )
+        ) +
+        scale_fill_manual(
+            name = "",
+            values = c("95% Prediction Interval" = "lightpink"),
+            guide = guide_legend(order = 2)
+        ) +
+        scale_linetype_manual(
+            name = "",
+            values = c("2023 Grocery Rebate" = "dotted"),
+            guide = guide_legend(
+                order = 3,
+                override.aes = list(color = "black", linewidth = 0.8, alpha = 1)
+            )
+        )
+   
+    if (length(intervention_breaks) > 0) {
+        p <- p + scale_x_date(
+            breaks = all_breaks,
+            labels = date_labels,
+            limits = c(PLOT_START_DATE, PLOT_END_DATE),
+            sec.axis = dup_axis(
+                name = NULL,
+                breaks = as.Date(intervention_breaks, origin = "1970-01-01"),
+                labels = intervention_labels
+            )
+        )
+    } else {
+        p <- p + scale_x_date(
+            breaks = all_breaks,
+            labels = date_labels,
+            limits = c(PLOT_START_DATE, PLOT_END_DATE)
+        )
+    }
+   
+    p <- p + labs(
+        title = paste0(prov, ": ", measure_label, " Grocery Price Index (DLM)"),
+        subtitle = subtitle_text,
+        x = "",
+        y = paste0(measure_label, " Grocery Price Index\n(Index Points)"),
+        caption = DATA_SOURCE
+    ) +
+        theme_minimal() +
+        theme(
+            plot.title = element_text(face = "bold", size = 12),
+            plot.subtitle = element_text(size = 9),
+            plot.caption = element_text(hjust = 0, size = 8),
+            legend.position = "bottom",
+            legend.box = "horizontal",
+            legend.text = element_text(size = 8),
+            axis.text.x = element_text(size = 8),
+            axis.text.x.top = ggtext::element_markdown(size = 8, hjust = 0.5),
+            axis.title.y = element_text(size = 9)
+        )
+   
+    return(p)
+}
+
+# ============================================================
+# PLOT: Decomposition for sample province
+# ============================================================
+cat("\nCreating decomposition plots...\n")
+
+create_decomposition_plot <- function(prov, measure_type = "mean") {
+   
+    prov_model <- all_models[[prov]]
+   
+    if (measure_type == "mean") {
+        fit_data <- prov_model$mean_fit
+        measure_label <- "Mean"
+        value_col <- "mean_value"
+    } else {
+        fit_data <- prov_model$median_fit
+        measure_label <- "Median"
+        value_col <- "median_value"
+    }
+   
+    pre_dates <- fit_data$pre_dates
+    trend <- fit_data$trend_component
+    seasonal <- fit_data$seasonal_component
+    residuals <- fit_data$residuals
+    actual <- prov_model$data %>%
+        dplyr::filter(date %in% pre_dates) %>%
+        dplyr::pull(!!sym(value_col))
+   
+    decomp_df <- data.frame(
+        date = pre_dates,
+        actual = actual,
+        trend = trend,
+        seasonal = seasonal,
+        residuals = residuals
+    )
+   
+    p1 <- ggplot(decomp_df, aes(x = date, y = actual)) +
+        geom_line() +
+        labs(title = "Original Series", y = "Value") +
+        theme_minimal()
+   
+    p2 <- ggplot(decomp_df, aes(x = date, y = trend)) +
+        geom_line(color = "blue") +
+        labs(title = "Trend Component (Level)", y = "Value") +
+        theme_minimal()
+   
+    p3 <- ggplot(decomp_df, aes(x = date, y = seasonal)) +
+        geom_line(color = "green") +
+        labs(title = "Seasonal Component", y = "Value") +
+        theme_minimal()
+   
+    p4 <- ggplot(decomp_df, aes(x = date, y = residuals)) +
+        geom_line(color = "red") +
+        geom_hline(yintercept = 0, linetype = "dashed") +
+        labs(title = "Residuals", y = "Value") +
+        theme_minimal()
+   
+    grid.arrange(p1, p2, p3, p4, ncol = 1,
+                 top = paste0(prov, " - ", measure_label, " DLM Decomposition"))
+}
+
+# Create decomposition for Canada
+sample_prov <- "Canada"
+create_decomposition_plot(sample_prov, "mean")
+create_decomposition_plot(sample_prov, "median")
+
+# ============================================================
+# PLOT 1: Coefficient plot for MEDIAN only
+# ============================================================
+p_median_coef <- ggplot(median_results, aes(x = reorder(GEO, estimate), y = estimate)) +
+    geom_point(size = 3, color = "#0072B2") +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                  width = 0.3, color = "#0072B2") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    coord_flip() +
+    labs(
+        title = "Estimated Association Between Grocery Rebate and Average Grocery Price Index",
+        subtitle = paste0("MEDIAN (DLM) - Simulation-based estimates with 95% credible intervals\n",
+                          "Intervention period: ", N_INTERVENTION_MONTHS, " months, from ",
+                          format(INTERVENTION_START, "%B %Y"), " to ",
+                          format(INTERVENTION_END, "%B %Y")),
+        x = "Province",
+        y = "Estimated Change in Grocery Prices\n(Index Points)",
+        caption = DATA_SOURCE
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold"))
+
+print(p_median_coef)
+
+# ============================================================
+# PLOT 2: Coefficient plot for MEAN only
+# ============================================================
+p_mean_coef <- ggplot(mean_results, aes(x = reorder(GEO, estimate), y = estimate)) +
+    geom_point(size = 3, color = "#E69F00") +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                  width = 0.3, color = "#E69F00") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    coord_flip() +
+    labs(
+        title = "Estimated Association Between Grocery Rebate and Average Grocery Price Index",
+        subtitle = paste0("MEAN (DLM) - Simulation-based estimates with 95% credible intervals\n",
+                          "Intervention period: ", N_INTERVENTION_MONTHS, " months, from ",
+                          format(INTERVENTION_START, "%B %Y"), " to ",
+                          format(INTERVENTION_END, "%B %Y")),
+        x = "Province",
+        y = "Estimated Change in Grocery Prices\n(Index Points)",
+        caption = DATA_SOURCE
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold"))
+
+print(p_mean_coef)
+
+# ============================================================
+# PLOT 3: MEAN time series plots
+# ============================================================
+cat("\nCreating MEAN time series plots...\n")
+
+mean_plots <- list()
+for (prov in provinces) {
+    mean_plots[[prov]] <- create_province_plot(prov, "mean")
+}
+
+n_cols <- 3
+n_rows <- ceiling(length(provinces) / n_cols)
+mean_grid <- do.call(grid.arrange, c(mean_plots, ncol = n_cols))
+
+for (prov in provinces) {
+    print(mean_plots[[prov]])
+}
+
+# ============================================================
+# PLOT 4: MEDIAN time series plots
+# ============================================================
+cat("\nCreating MEDIAN time series plots...\n")
+
+median_plots <- list()
+for (prov in provinces) {
+    median_plots[[prov]] <- create_province_plot(prov, "median")
+}
+
+median_grid <- do.call(grid.arrange, c(median_plots, ncol = n_cols))
+
+for (prov in provinces) {
+    print(median_plots[[prov]])
+}
+
+# ============================================================
+# PLOT 5: Distribution of simulated effects
+# ============================================================
+dist_data <- data.frame(
+    median_diff = all_models[[sample_prov]]$median_fit$mean_diffs,
+    mean_diff = all_models[[sample_prov]]$mean_fit$mean_diffs
+)
+
+p_dist_median <- ggplot(dist_data, aes(x = median_diff)) +
+    geom_histogram(fill = "#0072B2", alpha = 0.7, bins = 50) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = median_results$estimate[median_results$GEO == sample_prov],
+               color = "black", linewidth = 1) +
+    labs(
+        title = paste0(sample_prov, " - Distribution of Simulated Differences (MEDIAN, DLM)"),
+        subtitle = "Black line = observed difference, Red dashed = no difference",
+        x = "Change in Grocery Prices\n(Index Points)",
+        y = "Count",
+        caption = DATA_SOURCE
+    ) +
+    theme_minimal()
+
+p_dist_mean <- ggplot(dist_data, aes(x = mean_diff)) +
+    geom_histogram(fill = "#E69F00", alpha = 0.7, bins = 50) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = mean_results$estimate[mean_results$GEO == sample_prov],
+               color = "black", linewidth = 1) +
+    labs(
+        title = paste0(sample_prov, " - Distribution of Simulated Differences (MEAN, DLM)"),
+        subtitle = "Black line = observed difference, Red dashed = no difference",
+        x = "Change in Grocery Prices\n(Index Points)",
+        y = "Count",
+        caption = DATA_SOURCE
+    ) +
+    theme_minimal()
+
+combined_dist <- grid.arrange(p_dist_median, p_dist_mean, ncol = 1)
+print(combined_dist)
+
+# ============================================================
+# PLOT 6: Residual Diagnostic Plots
+# ============================================================
+cat("\nCreating residual diagnostic plots for sample province...\n")
+
+create_residual_plots <- function(prov, measure_type = "mean") {
+   
+    prov_model <- all_models[[prov]]
+   
+    if (measure_type == "mean") {
+        fit_data <- prov_model$mean_fit
+        measure_label <- "Mean"
+        color <- "#E69F00"
+    } else {
+        fit_data <- prov_model$median_fit
+        measure_label <- "Median"
+        color <- "#0072B2"
+    }
+   
+    residuals_model <- fit_data$residuals
+   
+    resid_df <- data.frame(
+        index = 1:length(residuals_model),
+        residual = as.numeric(residuals_model)
+    )
+   
+    p1 <- ggplot(resid_df, aes(x = index, y = residual)) +
+        geom_line(color = color) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+        labs(
+            title = paste0(prov, " - ", measure_label, " DLM Residuals Over Time"),
+            x = "Time Index",
+            y = "Residual"
+        ) +
+        theme_minimal()
+   
+    p2 <- ggplot(resid_df, aes(x = residual)) +
+        geom_histogram(fill = color, alpha = 0.7, bins = 30) +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+        labs(
+            title = paste0(prov, " - ", measure_label, " Residual Distribution"),
+            x = "Residual",
+            y = "Count"
+        ) +
+        theme_minimal()
+   
+    acf_vals <- acf(residuals_model, lag.max = 24, plot = FALSE)
+    acf_df <- data.frame(
+        lag = acf_vals$lag[-1],
+        acf = acf_vals$acf[-1]
+    )
+    ci <- qnorm(0.975) / sqrt(length(residuals_model))
+   
+    p3 <- ggplot(acf_df, aes(x = lag, y = acf)) +
+        geom_hline(yintercept = 0, color = "gray50") +
+        geom_hline(yintercept = c(-ci, ci), linetype = "dashed", color = "blue") +
+        geom_segment(aes(xend = lag, yend = 0), color = color) +
+        geom_point(color = color) +
+        labs(
+            title = paste0(prov, " - ", measure_label, " Residual ACF"),
+            subtitle = "Blue dashed lines = 95% confidence bounds",
+            x = "Lag",
+            y = "ACF"
+        ) +
+        theme_minimal()
+   
+    p4 <- ggplot(resid_df, aes(sample = residual)) +
+        stat_qq(color = color) +
+        stat_qq_line(color = "red") +
+        labs(
+            title = paste0(prov, " - ", measure_label, " Residual Q-Q Plot"),
+            x = "Theoretical Quantiles",
+            y = "Sample Quantiles"
+        ) +
+        theme_minimal()
+   
+    return(list(p1 = p1, p2 = p2, p3 = p3, p4 = p4))
+}
+
+mean_resid_plots <- create_residual_plots(sample_prov, "mean")
+median_resid_plots <- create_residual_plots(sample_prov, "median")
+
+cat("\nMean model residual diagnostics:\n")
+mean_resid_grid <- grid.arrange(
+    mean_resid_plots$p1, mean_resid_plots$p2,
+    mean_resid_plots$p3, mean_resid_plots$p4,
+    ncol = 2,
+    top = paste0(sample_prov, " - Mean DLM Residual Diagnostics")
+)
+
+cat("\nMedian model residual diagnostics:\n")
+median_resid_grid <- grid.arrange(
+    median_resid_plots$p1, median_resid_plots$p2,
+    median_resid_plots$p3, median_resid_plots$p4,
+    ncol = 2,
+    top = paste0(sample_prov, " - Median DLM Residual Diagnostics")
+)
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+cat("\n=== ANALYSIS COMPLETE ===\n")
+cat("Files created:\n")
+cat("  - summary_table.html (main results)\n")
+cat("  - residual_diagnostics_table.html (post-DLM stationarity checks)\n")
+cat("\nKey features of the DLM approach:\n")
+cat("  - Explicit decomposition into trend (level + slope) and seasonal components\n")
+cat("  - No stationarity requirement - handles non-stationary series naturally\n")
+cat("  - Variance components estimated via MLE\n")
+cat("  - Uncertainty captured via state space simulation\n")
+cat("  - Interpretable decomposition: trend, seasonal, and residuals\n")
+######################## MODEL PEROFMRANCE #####################
+# ============================================================
+# MODEL PERFORMANCE METRICS
+# ============================================================
+
+calculate_performance_metrics <- function(actual, fitted) {
+    # Remove any NAs
+    valid_idx <- !is.na(actual) & !is.na(fitted)
+    actual <- actual[valid_idx]
+    fitted <- fitted[valid_idx]
+   
+    n <- length(actual)
+    residuals <- actual - fitted
+   
+    # Mean Absolute Error (MAE)
+    mae <- mean(abs(residuals))
+   
+    # Mean Squared Error (MSE)
+    mse <- mean(residuals^2)
+   
+    # Root Mean Squared Error (RMSE)
+    rmse <- sqrt(mse)
+   
+    # Mean Absolute Percentage Error (MAPE)
+    # Avoid division by zero
+    mape <- mean(abs(residuals / actual)) * 100
+   
+    # Symmetric MAPE (handles zeros better)
+    smape <- mean(2 * abs(residuals) / (abs(actual) + abs(fitted))) * 100
+   
+    # R-squared
+    ss_res <- sum(residuals^2)
+    ss_tot <- sum((actual - mean(actual))^2)
+    r_squared <- 1 - (ss_res / ss_tot)
+   
+    return(data.frame(
+        MAE = mae,
+        RMSE = rmse,
+        MAPE = mape,
+        sMAPE = smape,
+        R_squared = r_squared,
+        n = n
+    ))
+}
+
+# Calculate performance for all models
+performance_results <- data.frame()
+
+for (prov in provinces) {
+    prov_model <- all_models[[prov]]
+    prov_data <- prov_model$data %>% dplyr::filter(date < INTERVENTION_START)
+   
+    # Median model performance
+    median_fit <- prov_model$median_fit
+    actual_median <- prov_data$median_value
+    fitted_median <- median_fit$fitted_pre
+   
+    perf_median <- calculate_performance_metrics(actual_median, fitted_median)
+    perf_median$GEO <- prov
+    perf_median$measure <- "Median"
+   
+    # Mean model performance
+    mean_fit <- prov_model$mean_fit
+    actual_mean <- prov_data$mean_value
+    fitted_mean <- mean_fit$fitted_pre
+   
+    perf_mean <- calculate_performance_metrics(actual_mean, fitted_mean)
+    perf_mean$GEO <- prov
+    perf_mean$measure <- "Mean"
+   
+    performance_results <- rbind(performance_results, perf_median, perf_mean)
+}
+
+# Reorder columns
+performance_results <- performance_results %>%
+    dplyr::select(GEO, measure, MAE, RMSE, MAPE, sMAPE, R_squared, n)
+
+# Print results
+cat("\n=== MODEL PERFORMANCE METRICS (In-Sample) ===\n")
+cat("Calculated on pre-intervention fitted values\n\n")
+
+print(performance_results %>% dplyr::arrange(measure, GEO))
+
+# Summary by measure
+cat("\n=== AVERAGE PERFORMANCE BY MEASURE ===\n")
+performance_summary <- performance_results %>%
+    dplyr::group_by(measure) %>%
+    dplyr::summarise(
+        Mean_MAE = mean(MAE),
+        Mean_RMSE = mean(RMSE),
+        Mean_MAPE = mean(MAPE),
+        Mean_sMAPE = mean(sMAPE),
+        Mean_R_squared = mean(R_squared),
+        .groups = "drop"
+    )
+
+print(performance_summary)
+
+#######################################
+
+
+# ============================================================
+# OUT-OF-SAMPLE FORECAST EXPERIMENT - CLEAN VERSION
+# ============================================================
+
+cat("\n=== OUT-OF-SAMPLE FORECAST EXPERIMENT ===\n")
+cat("Training period: January 2018 to December 2022\n")
+cat("Forecast period: January 2023 - June 2023 (6 months)\n\n")
+
+PLOT_START <- as.Date("2018-01-01")
+PLOT_END <- as.Date("2023-06-01")
+TRAIN_END <- as.Date("2022-12-01")
+FORECAST_START <- as.Date("2023-01-01")
+FORECAST_END <- as.Date("2023-06-01")
+FORECAST_HORIZON <- 6
+
+# Function to run the experiment
+run_forecast_experiment <- function(data, value_col, train_end, h) {
+   
+    # Split data
+    train_data <- data %>% dplyr::filter(date <= train_end)
+    test_data <- data %>% dplyr::filter(date > train_end) %>% head(h)
+   
+    if (nrow(test_data) < h) {
+        return(NULL)
+    }
+   
+    y_train <- train_data[[value_col]]
+    y_test <- test_data[[value_col]]
+    n_train <- length(y_train)
+   
+    # Initial parameters
+    init_parm <- c(log(var(y_train) * 0.1),
+                   log(var(y_train) * 0.01),
+                   log(var(y_train) * 0.001),
+                   log(var(y_train) * 0.01))
+   
+    # Fit DLM
+    fit <- tryCatch({
+        dlmMLE(y_train, parm = init_parm, build = build_dlm, hessian = TRUE)
+    }, error = function(e) {
+        list(par = init_parm, convergence = 1)
+    })
+   
+    mod_fitted <- build_dlm(fit$par)
+   
+    # Filter and smooth
+    filtered <- dlmFilter(y_train, mod_fitted)
+    smoothed <- dlmSmooth(filtered)
+   
+    # Get fitted values for training period
+    smoothed_states <- smoothed$s
+    fitted_train <- numeric(n_train)
+    for (t in 1:n_train) {
+        fitted_train[t] <- smoothed_states[t + 1, 1] + smoothed_states[t + 1, 3]
+    }
+   
+    # Get final state and covariance
+    final_state <- smoothed$s[n_train + 1, ]
+    state_cov <- dlmSvd2var(filtered$U.C, filtered$D.C)[[n_train]]
+   
+    # Extract matrices
+    V <- mod_fitted$V[1, 1]
+    W <- mod_fitted$W
+    G <- mod_fitted$GG
+   
+    # Generate point forecasts (mean path)
+    forecast_mean <- numeric(h)
+    current_state <- final_state
+   
+    for (step in 1:h) {
+        current_state <- as.numeric(G %*% current_state)
+        forecast_mean[step] <- current_state[1] + current_state[3]
+    }
+   
+    # Generate prediction intervals via simulation
+    n_sims <- 5000
+    sim_paths <- matrix(NA, nrow = n_sims, ncol = h)
+   
+    for (sim in 1:n_sims) {
+        state_draw <- mvrnorm(n = 1, mu = final_state, Sigma = state_cov)
+        current_state <- state_draw
+       
+        for (step in 1:h) {
+            state_noise <- mvrnorm(n = 1, mu = rep(0, length(current_state)), Sigma = W)
+            current_state <- as.numeric(G %*% current_state) + state_noise
+            obs_noise <- rnorm(1, mean = 0, sd = sqrt(V))
+            sim_paths[sim, step] <- current_state[1] + current_state[3] + obs_noise
+        }
+    }
+   
+    forecast_lower <- apply(sim_paths, 2, quantile, probs = 0.025)
+    forecast_upper <- apply(sim_paths, 2, quantile, probs = 0.975)
+   
+    # Calculate metrics
+    residuals <- y_test - forecast_mean
+    mae <- mean(abs(residuals))
+    rmse <- sqrt(mean(residuals^2))
+    mape <- mean(abs(residuals / y_test)) * 100
+   
+    # Coverage: proportion of actuals within 95% PI
+    coverage <- mean(y_test >= forecast_lower & y_test <= forecast_upper)
+   
+    return(list(
+        metrics = data.frame(
+            MAE = mae,
+            RMSE = rmse,
+            MAPE = mape,
+            Coverage_95 = coverage * 100
+        ),
+        forecast_mean = forecast_mean,
+        forecast_lower = forecast_lower,
+        forecast_upper = forecast_upper,
+        actual_test = y_test,
+        dates_test = test_data$date,
+        fitted_train = fitted_train,
+        actual_train = y_train,
+        dates_train = train_data$date
+    ))
+}
+
+# Run experiment for all provinces
+forecast_results <- data.frame()
+forecast_details <- list()
+
+for (prov in provinces) {
+    cat(paste0("Processing: ", prov, "\n"))
+    prov_data <- monthly_stats %>% dplyr::filter(GEO == prov)
+   
+    # Mean
+    mean_exp <- run_forecast_experiment(prov_data, "mean_value", TRAIN_END, FORECAST_HORIZON)
+    if (!is.null(mean_exp)) {
+        result <- mean_exp$metrics
+        result$GEO <- prov
+        result$measure <- "Mean"
+        forecast_results <- rbind(forecast_results, result)
+        forecast_details[[paste0(prov, "_mean")]] <- mean_exp
+    }
+   
+    # Median
+    median_exp <- run_forecast_experiment(prov_data, "median_value", TRAIN_END, FORECAST_HORIZON)
+    if (!is.null(median_exp)) {
+        result <- median_exp$metrics
+        result$GEO <- prov
+        result$measure <- "Median"
+        forecast_results <- rbind(forecast_results, result)
+        forecast_details[[paste0(prov, "_median")]] <- median_exp
+    }
+}
+
+# Print results
+cat("\n=== OUT-OF-SAMPLE FORECAST PERFORMANCE (6-month ahead) ===\n\n")
+print(forecast_results %>%
+    dplyr::select(GEO, measure, MAE, RMSE, MAPE, Coverage_95) %>%
+    dplyr::arrange(measure, GEO))
+
+# ============================================================
+# PLOTTING FUNCTION
+# ============================================================
+
+plot_forecast_experiment <- function(prov, measure_type = "mean") {
+   
+    key <- paste0(prov, "_", measure_type)
+    exp_data <- forecast_details[[key]]
+   
+    if (is.null(exp_data)) return(NULL)
+   
+    # Get metrics for subtitle
+    metrics <- forecast_results %>%
+        dplyr::filter(GEO == prov & measure == tools::toTitleCase(measure_type))
+   
+    measure_label <- ifelse(measure_type == "mean", "Average", "Median")
+   
+    # Get padding values
+    last_fitted_value <- tail(exp_data$fitted_train, 1)
+   
+    # Build unified data frame
+    # Training period: actual + fitted
+    train_df <- data.frame(
+        date = exp_data$dates_train,
+        actual = exp_data$actual_train,
+        fitted = exp_data$fitted_train,
+        forecast = NA_real_,
+        lower = NA_real_,
+        upper = NA_real_
+    )
+   
+    # Padding row: connect fitted to forecast
+    padding_row <- data.frame(
+        date = TRAIN_END,
+        actual = tail(exp_data$actual_train, 1),
+        fitted = last_fitted_value,
+        forecast = last_fitted_value,
+        lower = last_fitted_value,
+        upper = last_fitted_value
+    )
+   
+    # Forecast period: actual + forecast + PI
+    forecast_df <- data.frame(
+        date = exp_data$dates_test,
+        actual = exp_data$actual_test,
+        fitted = NA_real_,
+        forecast = exp_data$forecast_mean,
+        lower = exp_data$forecast_lower,
+        upper = exp_data$forecast_upper
+    )
+   
+    # Combine
+    plot_df <- rbind(train_df, padding_row, forecast_df)
+   
+    # Filter to plot range
+    plot_df <- plot_df %>% dplyr::filter(date >= PLOT_START & date <= PLOT_END)
+   
+    # Date breaks: Jan each year + Jun 2023 (NO Dec 2022)
+    year_breaks <- seq(as.Date("2018-01-01"), as.Date("2023-01-01"), by = "year")
+    all_breaks <- sort(unique(c(year_breaks, FORECAST_END)))
+   
+    # Labels
+    date_labels <- sapply(all_breaks, function(d) {
+        if (d == FORECAST_END) {
+            return("Jun\n2023")
+        } else {
+            return(paste0("Jan\n", year(d)))
+        }
+    })
+   
+    # Y-axis range
+    y_max <- max(plot_df$actual, plot_df$forecast, plot_df$upper, na.rm = TRUE)
+    y_min <- min(plot_df$actual, plot_df$forecast, plot_df$lower, na.rm = TRUE)
+   
+    # Build plot
+    p <- ggplot(plot_df, aes(x = date)) +
+        # Prediction interval ribbon
+        geom_ribbon(aes(ymin = lower, ymax = upper, fill = "95% Prediction Interval"),
+                    alpha = 0.4, na.rm = TRUE) +
+        # Actual data (black)
+        geom_line(aes(y = actual, color = "Actual Data"), linewidth = 0.7, na.rm = TRUE) +
+        # Fitted model (red solid)
+        geom_line(aes(y = fitted, color = "Fitted Model"), linewidth = 0.8, na.rm = TRUE) +
+        # Forecast (red dotted)
+        geom_line(aes(y = forecast, color = "Model Forecast"),
+                  linetype = "dotted", linewidth = 1, na.rm = TRUE) +
+        # Vertical line at training end
+        geom_vline(aes(xintercept = TRAIN_END, linetype = "Training Period"),
+                   color = "black", linewidth = 0.6) +
+        # Color scale
+        scale_color_manual(
+            name = "",
+            values = c("Actual Data" = "black",
+                       "Fitted Model" = "red",
+                       "Model Forecast" = "red"),
+            guide = guide_legend(
+                order = 1,
+                override.aes = list(
+                    linetype = c("solid", "solid", "dotted"),
+                    linewidth = c(0.7, 0.8, 1)
+                )
+            )
+        ) +
+        # Fill scale
+        scale_fill_manual(
+            name = "",
+            values = c("95% Prediction Interval" = "lightpink"),
+            guide = guide_legend(order = 2)
+        ) +
+        # Linetype scale for vertical line
+        scale_linetype_manual(
+            name = "",
+            values = c("Training Period" = "dotted"),
+            guide = guide_legend(
+                order = 3,
+                override.aes = list(color = "black", linewidth = 0.6)
+            )
+        ) +
+        # X-axis
+        scale_x_date(
+            breaks = all_breaks,
+            labels = date_labels,
+            limits = c(PLOT_START, PLOT_END + 15),
+            expand = expansion(mult = c(0.01, 0.01))
+        ) +
+        # Labels
+        labs(
+            title = paste0(prov, ": ", measure_label, " Grocery Price Index"),
+            subtitle = paste0(
+                "Model fit: Jan 2018 - Dec 2022 | Forecast evaluated: Jan 2023 - Jun 2023\n",
+                "MAPE: ", round(metrics$MAPE, 2), "% | RMSE: ", round(metrics$RMSE, 3),
+                " | 95% Coverage: ", round(metrics$Coverage_95, 1), "%"
+            ),
+            x = "",
+            y = paste0(measure_label, " Grocery Price Index\n(Index Points)"),
+            caption = DATA_SOURCE
+        ) +
+        # Theme
+        theme_minimal() +
+        theme(
+            plot.title = element_text(face = "bold", size = 12),
+            plot.subtitle = element_text(size = 9),
+            plot.caption = element_text(hjust = 0, size = 8),
+            legend.position = "bottom",
+            legend.box = "horizontal",
+            legend.text = element_text(size = 8),
+            axis.text.x = element_text(size = 8),
+            axis.title.y = element_text(size = 9)
+        )
+   
+    return(p)
+}
+
+# Create plots
+sample_prov <- "Canada"
+p_canada_mean <- plot_forecast_experiment("Canada", "mean")
+p_canada_median <- plot_forecast_experiment("Canada", "median")
+
+print(p_canada_mean)
+print(p_canada_median)
+
+# Grid of all provinces (mean)
+cat("\nCreating forecast plots for all provinces (Mean)...\n")
+forecast_plots_mean <- list()
+for (prov in provinces) {
+    forecast_plots_mean[[prov]] <- plot_forecast_experiment(prov, "mean")
+}
+
+mean_forecast_grid <- do.call(grid.arrange, c(forecast_plots_mean, ncol = 3))
+
+# Individual plots
+for (prov in provinces) {
+    print(forecast_plots_mean[[prov]])
+}
+
+# Grid of all provinces (median)
+cat("\nCreating forecast plots for all provinces (Median)...\n")
+forecast_plots_median <- list()
+for (prov in provinces) {
+    forecast_plots_median[[prov]] <- plot_forecast_experiment(prov, "median")
+}
+
+median_forecast_grid <- do.call(grid.arrange, c(forecast_plots_median, ncol = 3))
+
+for (prov in provinces) {
+    print(forecast_plots_median[[prov]])
+}
