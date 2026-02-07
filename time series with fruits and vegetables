@@ -1,0 +1,304 @@
+# ============================================
+# FULL EXAMPLE: ARIMAX SCENARIO FORECASTING
+# ALL VARIABLE COMBINATIONS + ALL SCENARIOS
+# WITH PARALLEL PROCESSING
+# 5 INPUT VARIABLES
+# ============================================
+
+library(dplyr)
+library(forecast)
+library(parallel)
+library(foreach)
+library(doParallel)
+
+# ============================================
+# 1. SIMULATE HISTORICAL DATA
+# ============================================
+
+set.seed(123)
+
+dates_hist <- seq(as.Date("2020-01-01"), as.Date("2025-03-01"), by = "month")
+n_hist <- length(dates_hist)
+
+historical_data <- data.frame(
+  date = dates_hist,
+  apple = 1000 + cumsum(rnorm(n_hist, 2, 1)),
+  banana = 100 + cumsum(rnorm(n_hist, 0.5, 0.5)),
+  grapes = 150 + cumsum(rnorm(n_hist, 0.3, 0.3)),
+  oranges = 200 + cumsum(rnorm(n_hist, 1, 0.5)),
+  cherries = 80 + cumsum(rnorm(n_hist, 0.4, 0.4))
+)
+
+historical_data$response_var <- 50 + 
+  0.02 * historical_data$apple + 
+  0.1 * historical_data$banana + 
+  0.05 * historical_data$grapes + 
+  0.03 * historical_data$oranges + 
+  0.08 * historical_data$cherries +
+  rnorm(n_hist, 0, 2)
+
+# ============================================
+# 2. SIMULATE ACTUAL DATA
+# ============================================
+
+dates_actual <- seq(as.Date("2025-04-01"), as.Date("2026-01-01"), by = "month")
+n_actual <- length(dates_actual)
+
+set.seed(456)
+actual_data <- data.frame(
+  date = dates_actual,
+  response_var = 85 + cumsum(rnorm(n_actual, -0.5, 1))
+)
+
+# ============================================
+# 3. DEFINE ALL VARIABLE COMBINATIONS
+# ============================================
+
+all_vars <- c("apple", "banana", "grapes", "oranges", "cherries")
+
+all_combinations <- list()
+combo_id <- 1
+
+for (k in 1:length(all_vars)) {
+  combos <- combn(all_vars, k, simplify = FALSE)
+  for (combo in combos) {
+    all_combinations[[combo_id]] <- combo
+    combo_id <- combo_id + 1
+  }
+}
+
+n_combinations <- length(all_combinations)
+cat("Total variable combinations:", n_combinations, "\n")
+
+for (i in 1:n_combinations) {
+  cat("Combo", i, ":", paste(all_combinations[[i]], collapse = " + "), "\n")
+}
+
+# ============================================
+# 4. DEFINE SCENARIO GRID
+# ============================================
+
+pct_values <- c(-0.5, -1, -1.5, -2, -2.5, -3, -5, -10, -20, -30, -40, -50)
+
+# ============================================
+# 5. HELPER FUNCTIONS
+# ============================================
+
+get_scenarios_for_combo <- function(combo, pct_values) {
+  grid_list <- list()
+  for (var in combo) {
+    grid_list[[paste0(var, "_pct")]] <- pct_values
+  }
+  expand.grid(grid_list)
+}
+
+project_regressors <- function(last_values, pct_changes, n_months_total, n_forecast_months, vars_used) {
+  
+  proj <- matrix(NA, nrow = n_forecast_months, ncol = length(vars_used))
+  colnames(proj) <- vars_used
+  
+  for (var in vars_used) {
+    pct_col <- paste0(var, "_pct")
+    mult <- (1 + pct_changes[[pct_col]] / 100)^(1 / n_months_total)
+    
+    for (m in 1:n_forecast_months) {
+      proj[m, var] <- last_values[[var]] * mult^m
+    }
+  }
+  
+  return(proj)
+}
+
+# ============================================
+# 6. SET UP PARAMETERS
+# ============================================
+
+last_row <- tail(historical_data, 1)
+last_values <- list(
+  apple = last_row$apple,
+  banana = last_row$banana,
+  grapes = last_row$grapes,
+  oranges = last_row$oranges,
+  cherries = last_row$cherries
+)
+
+n_months_total <- 10
+n_forecast_months <- 10
+forecast_horizon <- 10  # Full 10 months
+
+actual_10m <- head(actual_data$response_var, forecast_horizon)
+sum_actual <- sum(actual_10m)
+
+# ============================================
+# 7. MAIN LOOP: EACH VARIABLE COMBINATION
+# ============================================
+
+n_cores <- detectCores() - 1
+cat("\nUsing", n_cores, "cores\n")
+
+all_results <- data.frame()
+
+start_time_total <- Sys.time()
+
+for (combo_idx in 1:n_combinations) {
+  
+  vars_used <- all_combinations[[combo_idx]]
+  combo_name <- paste(vars_used, collapse = " + ")
+  
+  cat("\n--- Processing combo", combo_idx, "/", n_combinations, ":", combo_name, "---\n")
+  
+  expand_combo <- get_scenarios_for_combo(vars_used, pct_values)
+  n_scenarios <- nrow(expand_combo)
+  cat("Scenarios for this combo:", n_scenarios, "\n")
+  
+  xreg_hist <- as.matrix(historical_data[, vars_used, drop = FALSE])
+  
+  arimax_model <- tryCatch({
+    auto.arima(
+      historical_data$response_var,
+      xreg = xreg_hist,
+      seasonal = FALSE
+    )
+  }, error = function(e) {
+    cat("Error fitting model for combo:", combo_name, "\n")
+    return(NULL)
+  })
+  
+  if (is.null(arimax_model)) next
+  
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  
+  clusterExport(cl, c(
+    "arimax_model", 
+    "last_values", 
+    "n_months_total",
+    "n_forecast_months",
+    "forecast_horizon",
+    "sum_actual",
+    "expand_combo",
+    "vars_used",
+    "project_regressors"
+  ), envir = environment())
+  
+  clusterEvalQ(cl, library(forecast))
+  
+  start_time <- Sys.time()
+  
+  results_combo <- foreach(
+    i = 1:n_scenarios, 
+    .combine = rbind,
+    .inorder = TRUE
+  ) %dopar% {
+    
+    pct_changes <- as.list(expand_combo[i, , drop = FALSE])
+    
+    xreg_forecast <- project_regressors(
+      last_values, 
+      pct_changes, 
+      n_months_total, 
+      n_forecast_months,
+      vars_used
+    )
+    
+    fc <- forecast(arimax_model, xreg = xreg_forecast, h = n_forecast_months)
+    forecasts <- as.numeric(fc$mean)
+    
+    sum_forecast <- sum(head(forecasts, forecast_horizon))
+    
+    raw_error <- (sum_forecast - sum_actual) / sum_actual
+    abs_error <- abs(raw_error)
+    
+    result_row <- data.frame(
+      combo_id = combo_idx,
+      combo_name = paste(vars_used, collapse = " + "),
+      n_vars = length(vars_used),
+      scenario_id = i,
+      sum_forecast = sum_forecast,
+      sum_actual = sum_actual,
+      raw_error = raw_error,
+      abs_error = abs_error
+    )
+    
+    result_row$apple_pct <- ifelse("apple" %in% vars_used, 
+                                    pct_changes$apple_pct, NA)
+    result_row$banana_pct <- ifelse("banana" %in% vars_used, 
+                                     pct_changes$banana_pct, NA)
+    result_row$grapes_pct <- ifelse("grapes" %in% vars_used, 
+                                     pct_changes$grapes_pct, NA)
+    result_row$oranges_pct <- ifelse("oranges" %in% vars_used, 
+                                      pct_changes$oranges_pct, NA)
+    result_row$cherries_pct <- ifelse("cherries" %in% vars_used, 
+                                       pct_changes$cherries_pct, NA)
+    
+    result_row
+  }
+  
+  stopCluster(cl)
+  
+  end_time <- Sys.time()
+  cat("Time for this combo:", round(difftime(end_time, start_time, units = "secs"), 1), "secs\n")
+  
+  all_results <- rbind(all_results, results_combo)
+}
+
+end_time_total <- Sys.time()
+cat("\n=== TOTAL TIME:", round(difftime(end_time_total, start_time_total, units = "mins"), 2), "minutes ===\n")
+
+# ============================================
+# 8. RESULTS
+# ============================================
+
+all_results_sorted <- all_results[order(all_results$abs_error), ]
+
+cat("\n=== BEST ERROR BY VARIABLE COMBINATION ===\n")
+best_by_combo <- all_results %>%
+  group_by(combo_id, combo_name, n_vars) %>%
+  summarise(
+    best_abs_error = min(abs_error),
+    mean_abs_error = mean(abs_error),
+    mean_raw_error = mean(raw_error),
+    n_scenarios = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(best_abs_error)
+
+print(best_by_combo)
+
+cat("\n=== TOP 20 SCENARIOS (ALL COMBINATIONS) ===\n")
+print(head(all_results_sorted[, c("combo_name", "apple_pct", "banana_pct", 
+                                   "grapes_pct", "oranges_pct", "cherries_pct",
+                                   "raw_error", "abs_error")], 20))
+
+cat("\n=== BEST OVERALL SCENARIO ===\n")
+best <- all_results_sorted[1, ]
+cat("Variables:", best$combo_name, "\n")
+cat("Apple %:", best$apple_pct, "\n")
+cat("Banana %:", best$banana_pct, "\n")
+cat("Grapes %:", best$grapes_pct, "\n")
+cat("Oranges %:", best$oranges_pct, "\n")
+cat("Cherries %:", best$cherries_pct, "\n")
+cat("Raw Error:", round(best$raw_error * 100, 2), "% (positive = over-forecast)\n")
+cat("Abs Error:", round(best$abs_error * 100, 2), "%\n")
+
+# ============================================
+# 9. SAVE RESULTS
+# ============================================
+
+write.csv(all_results_sorted, "all_results_sorted.csv", row.names = FALSE)
+write.csv(best_by_combo, "best_by_combination.csv", row.names = FALSE)
+
+cat("\nResults saved to:\n")
+cat("- all_results_sorted.csv\n")
+cat("- best_by_combination.csv\n")
+
+# ============================================
+# 10. SUMMARY STATS
+# ============================================
+
+cat("\n=== SUMMARY ===\n")
+cat("Total variable combinations:", n_combinations, "\n")
+cat("Total scenarios evaluated:", nrow(all_results), "\n")
+cat("Best combination:", best$combo_name, "\n")
+cat("Best abs error:", round(best$abs_error * 100, 2), "%\n")
+cat("Best raw error:", round(best$raw_error * 100, 2), "%\n")
