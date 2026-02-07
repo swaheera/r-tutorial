@@ -1,8 +1,6 @@
 # ============================================
-# FULL EXAMPLE: ARIMAX SCENARIO FORECASTING
-# ALL VARIABLE COMBINATIONS + ALL SCENARIOS
-# WITH PARALLEL PROCESSING
-# 5 INPUT VARIABLES
+# OPTIMIZED ARIMAX SCENARIO FORECASTING
+# USING COEFFICIENT-BASED FORECASTING
 # ============================================
 
 library(dplyr)
@@ -68,11 +66,6 @@ for (k in 1:length(all_vars)) {
 }
 
 n_combinations <- length(all_combinations)
-cat("Total variable combinations:", n_combinations, "\n")
-
-for (i in 1:n_combinations) {
-  cat("Combo", i, ":", paste(all_combinations[[i]], collapse = " + "), "\n")
-}
 
 # ============================================
 # 4. DEFINE SCENARIO GRID
@@ -93,19 +86,15 @@ get_scenarios_for_combo <- function(combo, pct_values) {
 }
 
 project_regressors <- function(last_values, pct_changes, n_months_total, n_forecast_months, vars_used) {
-  
   proj <- matrix(NA, nrow = n_forecast_months, ncol = length(vars_used))
   colnames(proj) <- vars_used
-  
   for (var in vars_used) {
     pct_col <- paste0(var, "_pct")
     mult <- (1 + pct_changes[[pct_col]] / 100)^(1 / n_months_total)
-    
     for (m in 1:n_forecast_months) {
       proj[m, var] <- last_values[[var]] * mult^m
     }
   }
-  
   return(proj)
 }
 
@@ -124,135 +113,137 @@ last_values <- list(
 
 n_months_total <- 10
 n_forecast_months <- 10
-forecast_horizon <- 10  # Full 10 months
+forecast_horizon <- 10
 
 actual_10m <- head(actual_data$response_var, forecast_horizon)
 sum_actual <- sum(actual_10m)
 
-# ============================================
-# 7. MAIN LOOP: EACH VARIABLE COMBINATION
-# ============================================
-
 n_cores <- detectCores() - 1
-cat("\nUsing", n_cores, "cores\n")
 
-all_results <- data.frame()
+# ============================================
+# 7. MAIN FUNCTION: OPTIMIZED METHOD
+# ============================================
 
-start_time_total <- Sys.time()
-
-for (combo_idx in 1:n_combinations) {
+run_optimized <- function() {
   
-  vars_used <- all_combinations[[combo_idx]]
-  combo_name <- paste(vars_used, collapse = " + ")
+  all_results <- vector("list", n_combinations)
   
-  cat("\n--- Processing combo", combo_idx, "/", n_combinations, ":", combo_name, "---\n")
+  cat("Starting OPTIMIZED method...\n")
+  cat("Total combinations:", n_combinations, "\n")
+  cat("Using", n_cores, "cores\n\n")
   
-  expand_combo <- get_scenarios_for_combo(vars_used, pct_values)
-  n_scenarios <- nrow(expand_combo)
-  cat("Scenarios for this combo:", n_scenarios, "\n")
-  
-  xreg_hist <- as.matrix(historical_data[, vars_used, drop = FALSE])
-  
-  arimax_model <- tryCatch({
-    auto.arima(
-      historical_data$response_var,
-      xreg = xreg_hist,
-      seasonal = FALSE
-    )
-  }, error = function(e) {
-    cat("Error fitting model for combo:", combo_name, "\n")
-    return(NULL)
-  })
-  
-  if (is.null(arimax_model)) next
-  
-  cl <- makeCluster(n_cores)
-  registerDoParallel(cl)
-  
-  clusterExport(cl, c(
-    "arimax_model", 
-    "last_values", 
-    "n_months_total",
-    "n_forecast_months",
-    "forecast_horizon",
-    "sum_actual",
-    "expand_combo",
-    "vars_used",
-    "project_regressors"
-  ), envir = environment())
-  
-  clusterEvalQ(cl, library(forecast))
-  
-  start_time <- Sys.time()
-  
-  results_combo <- foreach(
-    i = 1:n_scenarios, 
-    .combine = rbind,
-    .inorder = TRUE
-  ) %dopar% {
+  for (combo_idx in 1:n_combinations) {
     
-    pct_changes <- as.list(expand_combo[i, , drop = FALSE])
+    vars_used <- all_combinations[[combo_idx]]
+    combo_name <- paste(vars_used, collapse = " + ")
+    expand_combo <- get_scenarios_for_combo(vars_used, pct_values)
+    n_scenarios <- nrow(expand_combo)
     
-    xreg_forecast <- project_regressors(
-      last_values, 
-      pct_changes, 
-      n_months_total, 
-      n_forecast_months,
-      vars_used
-    )
+    cat("Combo", combo_idx, "/", n_combinations, ":", combo_name, "\n")
+    cat("  Scenarios:", n_scenarios, "\n")
     
-    fc <- forecast(arimax_model, xreg = xreg_forecast, h = n_forecast_months)
-    forecasts <- as.numeric(fc$mean)
+    # Fit ARIMAX model
+    xreg_hist <- as.matrix(historical_data[, vars_used, drop = FALSE])
+    arimax_model <- auto.arima(historical_data$response_var, xreg = xreg_hist, seasonal = FALSE)
     
-    sum_forecast <- sum(head(forecasts, forecast_horizon))
+    # Extract coefficients ONCE
+    coefs <- coef(arimax_model)
+    reg_coefs <- coefs[vars_used]
+    intercept <- ifelse("intercept" %in% names(coefs), coefs["intercept"], 0)
     
-    raw_error <- (sum_forecast - sum_actual) / sum_actual
-    abs_error <- abs(raw_error)
+    cat("  Coefficients:", paste(names(reg_coefs), "=", round(reg_coefs, 4), collapse = ", "), "\n")
+    cat("  Intercept:", round(intercept, 4), "\n")
     
-    result_row <- data.frame(
-      combo_id = combo_idx,
-      combo_name = paste(vars_used, collapse = " + "),
-      n_vars = length(vars_used),
-      scenario_id = i,
-      sum_forecast = sum_forecast,
-      sum_actual = sum_actual,
-      raw_error = raw_error,
-      abs_error = abs_error
-    )
+    # Start parallel cluster
+    cl <- makeCluster(n_cores)
+    registerDoParallel(cl)
     
-    result_row$apple_pct <- ifelse("apple" %in% vars_used, 
-                                    pct_changes$apple_pct, NA)
-    result_row$banana_pct <- ifelse("banana" %in% vars_used, 
-                                     pct_changes$banana_pct, NA)
-    result_row$grapes_pct <- ifelse("grapes" %in% vars_used, 
-                                     pct_changes$grapes_pct, NA)
-    result_row$oranges_pct <- ifelse("oranges" %in% vars_used, 
-                                      pct_changes$oranges_pct, NA)
-    result_row$cherries_pct <- ifelse("cherries" %in% vars_used, 
-                                       pct_changes$cherries_pct, NA)
+    clusterExport(cl, c(
+      "reg_coefs", "intercept", "last_values", "n_months_total", "n_forecast_months",
+      "forecast_horizon", "sum_actual", "expand_combo", "vars_used", "project_regressors"
+    ), envir = environment())
     
-    result_row
+    combo_start <- Sys.time()
+    
+    results_combo <- foreach(i = 1:n_scenarios, .combine = rbind) %dopar% {
+      
+      pct_changes <- as.list(expand_combo[i, , drop = FALSE])
+      xreg_forecast <- project_regressors(last_values, pct_changes, n_months_total, n_forecast_months, vars_used)
+      
+      # FAST: Manual forecast using coefficients
+      forecasts <- as.numeric(xreg_forecast %*% reg_coefs) + intercept
+      
+      sum_forecast <- sum(head(forecasts, forecast_horizon))
+      raw_error <- (sum_forecast - sum_actual) / sum_actual
+      abs_error <- abs(raw_error)
+      
+      # Build result row
+      result_row <- data.frame(
+        combo_id = combo_idx,
+        combo_name = paste(vars_used, collapse = " + "),
+        n_vars = length(vars_used),
+        scenario_id = i,
+        sum_forecast = sum_forecast,
+        sum_actual = sum_actual,
+        raw_error = raw_error,
+        abs_error = abs_error
+      )
+      
+      # Add pct columns
+      result_row$apple_pct <- ifelse("apple" %in% vars_used, pct_changes$apple_pct, NA)
+      result_row$banana_pct <- ifelse("banana" %in% vars_used, pct_changes$banana_pct, NA)
+      result_row$grapes_pct <- ifelse("grapes" %in% vars_used, pct_changes$grapes_pct, NA)
+      result_row$oranges_pct <- ifelse("oranges" %in% vars_used, pct_changes$oranges_pct, NA)
+      result_row$cherries_pct <- ifelse("cherries" %in% vars_used, pct_changes$cherries_pct, NA)
+      
+      result_row
+    }
+    
+    stopCluster(cl)
+    
+    combo_end <- Sys.time()
+    combo_time <- round(difftime(combo_end, combo_start, units = "secs"), 2)
+    
+    cat("  Time:", combo_time, "secs\n\n")
+    
+    all_results[[combo_idx]] <- results_combo
   }
   
-  stopCluster(cl)
-  
-  end_time <- Sys.time()
-  cat("Time for this combo:", round(difftime(end_time, start_time, units = "secs"), 1), "secs\n")
-  
-  all_results <- rbind(all_results, results_combo)
+  cat("Done! Combining results...\n")
+  do.call(rbind, all_results)
 }
 
-end_time_total <- Sys.time()
-cat("\n=== TOTAL TIME:", round(difftime(end_time_total, start_time_total, units = "mins"), 2), "minutes ===\n")
-
 # ============================================
-# 8. RESULTS
+# 8. RUN IT
 # ============================================
 
-all_results_sorted <- all_results[order(all_results$abs_error), ]
+cat("============================================\n")
+cat("OPTIMIZED ARIMAX SCENARIO FORECASTING\n")
+cat("============================================\n\n")
 
+start_time <- Sys.time()
+results <- run_optimized()
+end_time <- Sys.time()
+
+total_time <- difftime(end_time, start_time, units = "secs")
+
+# ============================================
+# 9. RESULTS
+# ============================================
+
+# Sort by absolute error
+results_sorted <- results[order(results$abs_error), ]
+
+cat("\n============================================\n")
+cat("RESULTS SUMMARY\n")
+cat("============================================\n")
+cat("Total combinations:", n_combinations, "\n")
+cat("Total scenarios:", nrow(results), "\n")
+cat("Total time:", round(total_time, 2), "seconds\n")
+
+# Best by combination
 cat("\n=== BEST ERROR BY VARIABLE COMBINATION ===\n")
-best_by_combo <- all_results %>%
+best_by_combo <- results %>%
   group_by(combo_id, combo_name, n_vars) %>%
   summarise(
     best_abs_error = min(abs_error),
@@ -265,40 +256,30 @@ best_by_combo <- all_results %>%
 
 print(best_by_combo)
 
-cat("\n=== TOP 20 SCENARIOS (ALL COMBINATIONS) ===\n")
-print(head(all_results_sorted[, c("combo_name", "apple_pct", "banana_pct", 
-                                   "grapes_pct", "oranges_pct", "cherries_pct",
-                                   "raw_error", "abs_error")], 20))
+# Top 20 overall
+cat("\n=== TOP 20 SCENARIOS ===\n")
+print(head(results_sorted[, c("combo_name", "apple_pct", "banana_pct", "grapes_pct", 
+                               "oranges_pct", "cherries_pct", "raw_error", "abs_error")], 20))
 
+# Best overall
 cat("\n=== BEST OVERALL SCENARIO ===\n")
-best <- all_results_sorted[1, ]
+best <- results_sorted[1, ]
 cat("Variables:", best$combo_name, "\n")
 cat("Apple %:", best$apple_pct, "\n")
 cat("Banana %:", best$banana_pct, "\n")
 cat("Grapes %:", best$grapes_pct, "\n")
 cat("Oranges %:", best$oranges_pct, "\n")
 cat("Cherries %:", best$cherries_pct, "\n")
-cat("Raw Error:", round(best$raw_error * 100, 2), "% (positive = over-forecast)\n")
+cat("Raw Error:", round(best$raw_error * 100, 2), "%\n")
 cat("Abs Error:", round(best$abs_error * 100, 2), "%\n")
 
 # ============================================
-# 9. SAVE RESULTS
+# 10. SAVE RESULTS
 # ============================================
 
-write.csv(all_results_sorted, "all_results_sorted.csv", row.names = FALSE)
+write.csv(results_sorted, "results_optimized_sorted.csv", row.names = FALSE)
 write.csv(best_by_combo, "best_by_combination.csv", row.names = FALSE)
 
 cat("\nResults saved to:\n")
-cat("- all_results_sorted.csv\n")
+cat("- results_optimized_sorted.csv\n")
 cat("- best_by_combination.csv\n")
-
-# ============================================
-# 10. SUMMARY STATS
-# ============================================
-
-cat("\n=== SUMMARY ===\n")
-cat("Total variable combinations:", n_combinations, "\n")
-cat("Total scenarios evaluated:", nrow(all_results), "\n")
-cat("Best combination:", best$combo_name, "\n")
-cat("Best abs error:", round(best$abs_error * 100, 2), "%\n")
-cat("Best raw error:", round(best$raw_error * 100, 2), "%\n")
