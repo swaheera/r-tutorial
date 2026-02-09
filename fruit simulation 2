@@ -1,0 +1,736 @@
+# ============================================
+# COMBINED ARIMA (RATIO) + ARIMAX (TOTAL)
+# WITH 4 3D VISUALIZATIONS
+# ============================================
+
+library(dplyr)
+library(forecast)
+library(parallel)
+library(foreach)
+library(doParallel)
+library(plotly)
+
+# ============================================
+# USER SETTINGS (EDIT THIS SECTION ONLY)
+# ============================================
+
+# --- File paths ---
+fruits_file <- "fruits.csv"
+responses_file <- "responses.csv"
+
+# --- Column names in fruits file ---
+date_col <- "month"
+fruit_vars <- c("apple", "banana", "grapes", "oranges", "cherries")
+
+# --- Column names in responses file ---
+response1_col <- "response1"
+response2_col <- "response2"
+total_col <- "total_volume"
+
+# --- Seasonality settings ---
+use_seasonality <- TRUE
+seasonal_frequency <- 12
+
+# --- Data start date (first observation in your data) ---
+data_start_year <- 2021
+data_start_month <- 4
+
+# --- Forecast period ---
+forecast_start_date <- as.Date("2025-04-01")
+forecast_end_date <- as.Date("2026-01-01")
+
+# --- Scenario percentage changes to test ---
+pct_values <- c(-0.5, -1, -1.5, -2, -2.5, -3, -5, -10, -20, -30, -40, -50)
+
+# --- Plot settings ---
+color_scale <- "Viridis"
+n_plot <- 100
+
+# --- Parallel processing ---
+n_cores <- NULL
+
+# ============================================
+# END OF USER SETTINGS
+# ============================================
+
+# ============================================
+# 1. LOAD DATA
+# ============================================
+
+cat("============================================\n")
+cat("LOADING DATA\n")
+cat("============================================\n\n")
+
+# Load fruits data (predictors) - April 2021 to March 2025
+fruits_raw <- read.csv(fruits_file, stringsAsFactors = FALSE)
+fruits_raw[[date_col]] <- as.Date(fruits_raw[[date_col]])
+fruits_raw <- fruits_raw[order(fruits_raw[[date_col]]), ]
+cat("Loaded fruits data:", nrow(fruits_raw), "rows\n")
+cat("  Date range:", format(min(fruits_raw[[date_col]]), "%Y-%m-%d"), "to", 
+    format(max(fruits_raw[[date_col]]), "%Y-%m-%d"), "\n")
+
+# Load responses data - April 2021 to January 2026
+responses_raw <- read.csv(responses_file, stringsAsFactors = FALSE)
+responses_raw[[date_col]] <- as.Date(responses_raw[[date_col]])
+responses_raw <- responses_raw[order(responses_raw[[date_col]]), ]
+cat("Loaded responses data:", nrow(responses_raw), "rows\n")
+cat("  Date range:", format(min(responses_raw[[date_col]]), "%Y-%m-%d"), "to", 
+    format(max(responses_raw[[date_col]]), "%Y-%m-%d"), "\n")
+
+# Verify columns exist
+missing_fruits <- setdiff(fruit_vars, names(fruits_raw))
+if (length(missing_fruits) > 0) {
+  stop("Missing fruit columns: ", paste(missing_fruits, collapse = ", "))
+}
+
+required_cols <- c(response1_col, response2_col, total_col)
+missing_cols <- setdiff(required_cols, names(responses_raw))
+if (length(missing_cols) > 0) {
+  stop("Missing response columns: ", paste(missing_cols, collapse = ", "))
+}
+
+# ============================================
+# 2. CREATE TRAINING DATA (MERGED)
+# ============================================
+
+cat("\n============================================\n")
+cat("CREATING TRAINING DATA\n")
+cat("============================================\n\n")
+
+# Merge fruits and responses for training period only
+training_fruits <- fruits_raw  # All fruits data is training (ends March 2025)
+training_responses <- responses_raw[responses_raw[[date_col]] < forecast_start_date, ]
+
+training_data <- merge(training_fruits, training_responses, by = date_col)
+cat("Training data:", nrow(training_data), "rows\n")
+cat("  From:", format(min(training_data[[date_col]]), "%Y-%m-%d"), "\n")
+cat("  To:", format(max(training_data[[date_col]]), "%Y-%m-%d"), "\n")
+
+# ============================================
+# 3. GET ACTUAL DATA FOR FORECAST PERIOD
+# ============================================
+
+cat("\n============================================\n")
+cat("GETTING ACTUAL DATA FOR FORECAST PERIOD\n")
+cat("============================================\n\n")
+
+# Actual data comes from responses only (April 2025 to January 2026)
+actual_data <- responses_raw[responses_raw[[date_col]] >= forecast_start_date & 
+                              responses_raw[[date_col]] <= forecast_end_date, ]
+cat("Actual data:", nrow(actual_data), "rows\n")
+cat("  From:", format(min(actual_data[[date_col]]), "%Y-%m-%d"), "\n")
+cat("  To:", format(max(actual_data[[date_col]]), "%Y-%m-%d"), "\n")
+
+# Forecast parameters
+n_forecast_months <- nrow(actual_data)
+forecast_horizon <- n_forecast_months
+cat("Forecast horizon:", forecast_horizon, "months\n")
+
+# ============================================
+# 4. CALCULATE RATIO AND CREATE TIME SERIES
+# ============================================
+
+cat("\n============================================\n")
+cat("PREPARING TIME SERIES\n")
+cat("============================================\n\n")
+
+# Calculate ratio (response1 / total)
+training_data$ratio <- training_data[[response1_col]] / training_data[[total_col]]
+
+# Logit transform (with epsilon to avoid log(0) or log(inf))
+epsilon <- 1e-6
+training_data$ratio_clipped <- pmax(pmin(training_data$ratio, 1 - epsilon), epsilon)
+training_data$logit_ratio <- log(training_data$ratio_clipped / (1 - training_data$ratio_clipped))
+
+cat("Ratio range:", round(min(training_data$ratio), 4), "to", round(max(training_data$ratio), 4), "\n")
+cat("Training data rows:", nrow(training_data), "\n")
+cat("Any NA in ratio:", sum(is.na(training_data$ratio)), "\n")
+cat("Any NA in logit_ratio:", sum(is.na(training_data$logit_ratio)), "\n")
+
+# Create time series objects
+if (use_seasonality) {
+  cat("Seasonality: ENABLED (frequency =", seasonal_frequency, ")\n")
+  
+  ts_logit_ratio <- ts(training_data$logit_ratio, 
+                       start = c(data_start_year, data_start_month), 
+                       frequency = seasonal_frequency)
+  
+  ts_total <- ts(training_data[[total_col]], 
+                 start = c(data_start_year, data_start_month), 
+                 frequency = seasonal_frequency)
+} else {
+  cat("Seasonality: DISABLED\n")
+  
+  ts_logit_ratio <- training_data$logit_ratio
+  ts_total <- training_data[[total_col]]
+}
+
+# ============================================
+# 5. FIT ARIMA MODEL FOR RATIO
+# ============================================
+
+cat("\n============================================\n")
+cat("FITTING ARIMA MODEL FOR RATIO\n")
+cat("============================================\n\n")
+
+arima_ratio <- auto.arima(ts_logit_ratio, seasonal = use_seasonality)
+cat("ARIMA model:\n")
+print(arima_ratio)
+
+# Forecast ratio
+fc_logit_ratio <- forecast(arima_ratio, h = n_forecast_months)
+logit_ratio_forecast <- as.numeric(fc_logit_ratio$mean)
+
+# Back-transform from logit to probability (0-1)
+ratio_forecast <- exp(logit_ratio_forecast) / (1 + exp(logit_ratio_forecast))
+
+cat("\nRatio forecasts:\n")
+print(round(ratio_forecast, 4))
+
+# ============================================
+# 6. DEFINE VARIABLE COMBINATIONS
+# ============================================
+
+cat("\n============================================\n")
+cat("GENERATING VARIABLE COMBINATIONS\n")
+cat("============================================\n\n")
+
+all_vars <- fruit_vars
+
+all_combinations <- list()
+combo_id <- 1
+
+for (k in 1:length(all_vars)) {
+  combos <- combn(all_vars, k, simplify = FALSE)
+  for (combo in combos) {
+    all_combinations[[combo_id]] <- combo
+    combo_id <- combo_id + 1
+  }
+}
+
+n_combinations <- length(all_combinations)
+cat("Total variable combinations:", n_combinations, "\n")
+
+for (i in 1:n_combinations) {
+  cat("  Combo", i, ":", paste(all_combinations[[i]], collapse = " + "), "\n")
+}
+
+# ============================================
+# 7. HELPER FUNCTIONS
+# ============================================
+
+get_scenarios_for_combo <- function(combo, pct_values) {
+  grid_list <- list()
+  for (var in combo) {
+    grid_list[[paste0(var, "_pct")]] <- pct_values
+  }
+  expand.grid(grid_list)
+}
+
+project_regressors <- function(last_values, pct_changes, n_months_total, n_forecast_months, vars_used) {
+  proj <- matrix(NA, nrow = n_forecast_months, ncol = length(vars_used))
+  colnames(proj) <- vars_used
+  for (var in vars_used) {
+    pct_col <- paste0(var, "_pct")
+    mult <- (1 + pct_changes[[pct_col]] / 100)^(1 / n_months_total)
+    for (m in 1:n_forecast_months) {
+      proj[m, var] <- last_values[[var]] * mult^m
+    }
+  }
+  return(proj)
+}
+
+# ============================================
+# 8. SET UP PARAMETERS
+# ============================================
+
+cat("\n============================================\n")
+cat("SETTING UP PARAMETERS\n")
+cat("============================================\n\n")
+
+# Last known values from training data (March 2025)
+last_row <- tail(training_data, 1)
+last_values <- list()
+for (var in fruit_vars) {
+  last_values[[var]] <- last_row[[var]]
+}
+
+cat("Last known values (", format(last_row[[date_col]], "%Y-%m-%d"), "):\n")
+for (var in fruit_vars) {
+  cat("  ", var, ":", last_values[[var]], "\n")
+}
+
+n_months_total <- n_forecast_months
+
+# Actual sums for error calculation
+sum_actual_response1 <- sum(actual_data[[response1_col]])
+sum_actual_response2 <- sum(actual_data[[response2_col]])
+sum_actual_total <- sum(actual_data[[total_col]])
+
+cat("\nActual sums (", format(forecast_start_date, "%b %Y"), " to ", format(forecast_end_date, "%b %Y"), "):\n")
+cat("  ", response1_col, ":", round(sum_actual_response1, 2), "\n")
+cat("  ", response2_col, ":", round(sum_actual_response2, 2), "\n")
+cat("  ", total_col, ":", round(sum_actual_total, 2), "\n")
+
+# Set up parallel processing
+if (is.null(n_cores)) {
+  n_cores <- detectCores() - 1
+}
+cat("\nParallel cores:", n_cores, "\n")
+
+# ============================================
+# 9. MAIN FUNCTION
+# ============================================
+
+run_combined <- function() {
+  
+  all_results <- vector("list", n_combinations)
+  
+  cat("\n============================================\n")
+  cat("RUNNING SCENARIO ANALYSIS\n")
+  cat("============================================\n\n")
+  
+  cat("Total combinations:", n_combinations, "\n")
+  cat("Using", n_cores, "cores\n\n")
+  
+  cl <- makeCluster(n_cores)
+  registerDoParallel(cl)
+  cat("Cluster ready!\n\n")
+  
+  for (combo_idx in 1:n_combinations) {
+    
+    vars_used <- all_combinations[[combo_idx]]
+    combo_name <- paste(vars_used, collapse = " + ")
+    expand_combo <- get_scenarios_for_combo(vars_used, pct_values)
+    n_scenarios <- nrow(expand_combo)
+    
+    cat("Combo", combo_idx, "/", n_combinations, ":", combo_name, "\n")
+    cat("  Scenarios:", n_scenarios, "\n")
+    
+    # Prepare xreg for training
+    xreg_hist <- as.matrix(training_data[, vars_used, drop = FALSE])
+    
+    # Fit ARIMAX for total
+    if (use_seasonality) {
+      ts_total_combo <- ts(training_data[[total_col]], 
+                           start = c(data_start_year, data_start_month), 
+                           frequency = seasonal_frequency)
+      arimax_total <- auto.arima(ts_total_combo, xreg = xreg_hist, seasonal = use_seasonality)
+    } else {
+      arimax_total <- auto.arima(training_data[[total_col]], xreg = xreg_hist, seasonal = FALSE)
+    }
+    
+    # Extract coefficients
+    coefs <- coef(arimax_total)
+    reg_coefs <- coefs[vars_used]
+    intercept <- ifelse("intercept" %in% names(coefs), coefs["intercept"], 0)
+    
+    cat("  Coefficients:", paste(names(reg_coefs), "=", round(reg_coefs, 4), collapse = ", "), "\n")
+    cat("  Intercept:", round(intercept, 4), "\n")
+    
+    # Export to cluster
+    clusterExport(cl, c(
+      "reg_coefs", "intercept", "last_values", "n_months_total", "n_forecast_months",
+      "forecast_horizon", "ratio_forecast",
+      "sum_actual_response1", "sum_actual_response2", "sum_actual_total",
+      "expand_combo", "vars_used", "project_regressors", "fruit_vars"
+    ), envir = environment())
+    
+    combo_start <- Sys.time()
+    
+    results_combo <- foreach(i = 1:n_scenarios, .combine = rbind) %dopar% {
+      
+      pct_changes <- as.list(expand_combo[i, , drop = FALSE])
+      xreg_forecast <- project_regressors(last_values, pct_changes, n_months_total, n_forecast_months, vars_used)
+      
+      # Forecast total using coefficients
+      total_forecast <- as.numeric(xreg_forecast %*% reg_coefs) + intercept
+      
+      # Decompose using ratio forecast
+      response1_forecast <- total_forecast * ratio_forecast
+      response2_forecast <- total_forecast * (1 - ratio_forecast)
+      
+      # Sum forecasts
+      sum_forecast_total <- sum(total_forecast)
+      sum_forecast_response1 <- sum(response1_forecast)
+      sum_forecast_response2 <- sum(response2_forecast)
+      
+      # Calculate errors
+      abs_error_total <- abs(sum_forecast_total - sum_actual_total) / sum_actual_total
+      abs_error_response1 <- abs(sum_forecast_response1 - sum_actual_response1) / sum_actual_response1
+      abs_error_response2 <- abs(sum_forecast_response2 - sum_actual_response2) / sum_actual_response2
+      
+      # Convert to accuracy (0-100%)
+      accuracy_total <- pmax(0, (1 - abs_error_total)) * 100
+      accuracy_response1 <- pmax(0, (1 - abs_error_response1)) * 100
+      accuracy_response2 <- pmax(0, (1 - abs_error_response2)) * 100
+      
+      # Build result row
+      result_row <- data.frame(
+        combo_id = combo_idx,
+        combo_name = paste(vars_used, collapse = " + "),
+        n_vars = length(vars_used),
+        scenario_id = i,
+        sum_forecast_total = sum_forecast_total,
+        sum_forecast_response1 = sum_forecast_response1,
+        sum_forecast_response2 = sum_forecast_response2,
+        sum_actual_total = sum_actual_total,
+        sum_actual_response1 = sum_actual_response1,
+        sum_actual_response2 = sum_actual_response2,
+        abs_error_total = abs_error_total,
+        abs_error_response1 = abs_error_response1,
+        abs_error_response2 = abs_error_response2,
+        accuracy_total = accuracy_total,
+        accuracy_response1 = accuracy_response1,
+        accuracy_response2 = accuracy_response2
+      )
+      
+      # Add pct columns for all fruit vars
+      for (fv in fruit_vars) {
+        pct_col_name <- paste0(fv, "_pct")
+        if (fv %in% vars_used) {
+          result_row[[pct_col_name]] <- pct_changes[[pct_col_name]]
+        } else {
+          result_row[[pct_col_name]] <- NA
+        }
+      }
+      
+      result_row
+    }
+    
+    combo_end <- Sys.time()
+    combo_time <- round(difftime(combo_end, combo_start, units = "secs"), 2)
+    cat("  Time:", combo_time, "secs\n\n")
+    
+    all_results[[combo_idx]] <- results_combo
+  }
+  
+  cat("Stopping cluster...\n")
+  stopCluster(cl)
+  
+  cat("Done! Combining results...\n")
+  do.call(rbind, all_results)
+}
+
+# ============================================
+# 10. RUN IT
+# ============================================
+
+cat("============================================\n")
+cat("STARTING ANALYSIS\n")
+cat("============================================\n\n")
+
+start_time <- Sys.time()
+results <- run_combined()
+end_time <- Sys.time()
+
+total_time <- difftime(end_time, start_time, units = "secs")
+
+# ============================================
+# 11. ADD WEIGHTED ACCURACY & SORT
+# ============================================
+
+w <- 1/3
+
+results$weighted_accuracy <- w * results$accuracy_total + 
+                             w * results$accuracy_response1 + 
+                             w * results$accuracy_response2
+
+results_sorted <- results %>% arrange(desc(weighted_accuracy))
+results_sorted$rank <- 1:nrow(results_sorted)
+
+# ============================================
+# 12. RESULTS SUMMARY
+# ============================================
+
+cat("\n============================================\n")
+cat("RESULTS SUMMARY\n")
+cat("============================================\n")
+cat("Total combinations:", n_combinations, "\n")
+cat("Total scenarios:", nrow(results), "\n")
+cat("Total time:", round(as.numeric(total_time), 2), "seconds\n")
+cat("Forecast period:", format(forecast_start_date, "%Y-%m-%d"), "to", format(forecast_end_date, "%Y-%m-%d"), "\n")
+cat("Forecast horizon:", forecast_horizon, "months\n")
+cat("Seasonality:", ifelse(use_seasonality, "ENABLED", "DISABLED"), "\n")
+
+cat("\n=== TOP 20 SCENARIOS ===\n")
+print(head(results_sorted[, c("rank", "combo_name", "weighted_accuracy",
+                               "accuracy_total", "accuracy_response1", "accuracy_response2")], 20))
+
+# ============================================
+# 13. PREPARE DATA FOR PLOTS
+# ============================================
+
+cat("\n============================================\n")
+cat("PREPARING PLOTS\n")
+cat("============================================\n\n")
+
+# Top N
+top_n <- head(results_sorted, n_plot)
+
+# Random N
+set.seed(789)
+random_n <- results_sorted[sample(1:nrow(results_sorted), n_plot), ]
+
+# Helper function for hover text
+format_num <- function(x) formatC(round(x, 0), format = "f", big.mark = ",", digits = 0)
+
+create_hover_text <- function(df) {
+  
+  scenario_text <- sapply(1:nrow(df), function(i) {
+    txt <- ""
+    for (fv in fruit_vars) {
+      pct_col <- paste0(fv, "_pct")
+      if (!is.na(df[[pct_col]][i])) {
+        txt <- paste0(txt, fv, ": ", df[[pct_col]][i], "%<br>")
+      }
+    }
+    txt
+  })
+  
+  paste0(
+    "<b>Rank: ", df$rank, "</b><br>",
+    "<b>", forecast_horizon, "-Month Forecast</b><br>",
+    "<b>Period:</b> ", format(forecast_start_date, "%b %Y"), " to ", format(forecast_end_date, "%b %Y"), "<br>",
+    "<br>",
+    "<b>--- Variables ---</b><br>",
+    df$combo_name, "<br>",
+    "<br>",
+    "<b>--- Scenario Assumptions ---</b><br>",
+    scenario_text,
+    "<br>",
+    "<b>--- Accuracy (Forecast / Actual) ---</b><br>",
+    total_col, ": ", format_num(df$sum_forecast_total), " / ", format_num(df$sum_actual_total), 
+    " = ", round(df$accuracy_total, 1), "%<br>",
+    response1_col, ": ", format_num(df$sum_forecast_response1), " / ", format_num(df$sum_actual_response1), 
+    " = ", round(df$accuracy_response1, 1), "%<br>",
+    response2_col, ": ", format_num(df$sum_forecast_response2), " / ", format_num(df$sum_actual_response2), 
+    " = ", round(df$accuracy_response2, 1), "%<br>",
+    "<br>",
+    "<b>Weighted Accuracy: ", round(df$weighted_accuracy, 1), "%</b>"
+  )
+}
+
+top_n$hover_text <- create_hover_text(top_n)
+random_n$hover_text <- create_hover_text(random_n)
+
+# ============================================
+# 14. PLOT 1: TOP N SCATTER
+# ============================================
+
+cat("Creating Plot 1: Top", n_plot, "Scatter...\n")
+
+fig1 <- plot_ly(
+  data = top_n,
+  x = ~accuracy_response1,
+  y = ~accuracy_response2,
+  z = ~accuracy_total,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(
+    size = 6,
+    color = ~weighted_accuracy,
+    colorscale = color_scale,
+    showscale = TRUE,
+    colorbar = list(
+      title = list(text = "Weighted<br>Accuracy (%)"),
+      tickformat = ".1f",
+      ticksuffix = "%"
+    )
+  ),
+  text = ~hover_text,
+  hoverinfo = "text"
+) %>% layout(
+  title = list(
+    text = paste0("<b>Top ", n_plot, " Scenarios: ", forecast_horizon, "-Month Forecast Accuracy (Scatter)</b><br>",
+                  "<sup>", format(forecast_start_date, "%b %Y"), " to ", format(forecast_end_date, "%b %Y"), "</sup>"),
+    font = list(size = 16)
+  ),
+  scene = list(
+    xaxis = list(title = paste0(response1_col, " Accuracy (%)")),
+    yaxis = list(title = paste0(response2_col, " Accuracy (%)")),
+    zaxis = list(title = paste0(total_col, " Accuracy (%)"))
+  )
+)
+
+htmlwidgets::saveWidget(fig1, "plot1_top_scatter.html", selfcontained = TRUE)
+cat("  Saved: plot1_top_scatter.html\n")
+
+# ============================================
+# 15. PLOT 2: RANDOM N SCATTER
+# ============================================
+
+cat("Creating Plot 2: Random", n_plot, "Scatter...\n")
+
+fig2 <- plot_ly(
+  data = random_n,
+  x = ~accuracy_response1,
+  y = ~accuracy_response2,
+  z = ~accuracy_total,
+  type = "scatter3d",
+  mode = "markers",
+  marker = list(
+    size = 6,
+    color = ~weighted_accuracy,
+    colorscale = color_scale,
+    showscale = TRUE,
+    colorbar = list(
+      title = list(text = "Weighted<br>Accuracy (%)"),
+      tickformat = ".1f",
+      ticksuffix = "%"
+    )
+  ),
+  text = ~hover_text,
+  hoverinfo = "text"
+) %>% layout(
+  title = list(
+    text = paste0("<b>Random ", n_plot, " Scenarios: ", forecast_horizon, "-Month Forecast Accuracy (Scatter)</b><br>",
+                  "<sup>", format(forecast_start_date, "%b %Y"), " to ", format(forecast_end_date, "%b %Y"), "</sup>"),
+    font = list(size = 16)
+  ),
+  scene = list(
+    xaxis = list(title = paste0(response1_col, " Accuracy (%)")),
+    yaxis = list(title = paste0(response2_col, " Accuracy (%)")),
+    zaxis = list(title = paste0(total_col, " Accuracy (%)"))
+  )
+)
+
+htmlwidgets::saveWidget(fig2, "plot2_random_scatter.html", selfcontained = TRUE)
+cat("  Saved: plot2_random_scatter.html\n")
+
+# ============================================
+# 16. PLOT 3: TOP N SURFACE (MESH)
+# ============================================
+
+cat("Creating Plot 3: Top", n_plot, "Surface...\n")
+
+fig3 <- plot_ly(
+  data = top_n,
+  x = ~accuracy_response1,
+  y = ~accuracy_response2,
+  z = ~accuracy_total,
+  type = "mesh3d",
+  intensity = ~weighted_accuracy,
+  colorscale = color_scale,
+  showscale = TRUE,
+  colorbar = list(
+    title = list(text = "Weighted<br>Accuracy (%)"),
+    tickformat = ".1f",
+    ticksuffix = "%"
+  ),
+  text = ~hover_text,
+  hoverinfo = "text"
+) %>% layout(
+  title = list(
+    text = paste0("<b>Top ", n_plot, " Scenarios: ", forecast_horizon, "-Month Forecast Accuracy (Surface)</b><br>",
+                  "<sup>", format(forecast_start_date, "%b %Y"), " to ", format(forecast_end_date, "%b %Y"), "</sup>"),
+    font = list(size = 16)
+  ),
+  scene = list(
+    xaxis = list(title = paste0(response1_col, " Accuracy (%)")),
+    yaxis = list(title = paste0(response2_col, " Accuracy (%)")),
+    zaxis = list(title = paste0(total_col, " Accuracy (%)"))
+  )
+)
+
+htmlwidgets::saveWidget(fig3, "plot3_top_surface.html", selfcontained = TRUE)
+cat("  Saved: plot3_top_surface.html\n")
+
+# ============================================
+# 17. PLOT 4: RANDOM N SURFACE (MESH)
+# ============================================
+
+cat("Creating Plot 4: Random", n_plot, "Surface...\n")
+
+fig4 <- plot_ly(
+  data = random_n,
+  x = ~accuracy_response1,
+  y = ~accuracy_response2,
+  z = ~accuracy_total,
+  type = "mesh3d",
+  intensity = ~weighted_accuracy,
+  colorscale = color_scale,
+  showscale = TRUE,
+  colorbar = list(
+    title = list(text = "Weighted<br>Accuracy (%)"),
+    tickformat = ".1f",
+    ticksuffix = "%"
+  ),
+  text = ~hover_text,
+  hoverinfo = "text"
+) %>% layout(
+  title = list(
+    text = paste0("<b>Random ", n_plot, " Scenarios: ", forecast_horizon, "-Month Forecast Accuracy (Surface)</b><br>",
+                  "<sup>", format(forecast_start_date, "%b %Y"), " to ", format(forecast_end_date, "%b %Y"), "</sup>"),
+    font = list(size = 16)
+  ),
+  scene = list(
+    xaxis = list(title = paste0(response1_col, " Accuracy (%)")),
+    yaxis = list(title = paste0(response2_col, " Accuracy (%)")),
+    zaxis = list(title = paste0(total_col, " Accuracy (%)"))
+  )
+)
+
+htmlwidgets::saveWidget(fig4, "plot4_random_surface.html", selfcontained = TRUE)
+cat("  Saved: plot4_random_surface.html\n")
+
+# ============================================
+# 18. SAVE RESULTS
+# ============================================
+
+cat("\n============================================\n")
+cat("SAVING RESULTS\n")
+cat("============================================\n\n")
+
+write.csv(results_sorted, "results_accuracy_sorted.csv", row.names = FALSE)
+cat("Saved: results_accuracy_sorted.csv\n")
+
+best_by_combo <- results_sorted %>%
+  group_by(combo_id, combo_name, n_vars) %>%
+  summarise(
+    best_weighted_accuracy = max(weighted_accuracy),
+    best_accuracy_total = max(accuracy_total),
+    best_accuracy_response1 = max(accuracy_response1),
+    best_accuracy_response2 = max(accuracy_response2),
+    mean_weighted_accuracy = mean(weighted_accuracy),
+    n_scenarios = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(best_weighted_accuracy))
+
+write.csv(best_by_combo, "best_by_combination.csv", row.names = FALSE)
+cat("Saved: best_by_combination.csv\n")
+
+# ============================================
+# 19. FINAL SUMMARY
+# ============================================
+
+cat("\n============================================\n")
+cat("ALL DONE!\n")
+cat("============================================\n")
+cat("Total time:", round(as.numeric(total_time), 2), "seconds\n")
+cat("Seasonality:", ifelse(use_seasonality, "ENABLED", "DISABLED"), "\n")
+cat("\nFiles saved:\n")
+cat("  - results_accuracy_sorted.csv\n")
+cat("  - best_by_combination.csv\n")
+cat("  - plot1_top_scatter.html\n")
+cat("  - plot2_random_scatter.html\n")
+cat("  - plot3_top_surface.html\n")
+cat("  - plot4_random_surface.html\n")
+
+cat("\n=== BEST OVERALL SCENARIO ===\n")
+best <- results_sorted[1, ]
+cat("Rank:", best$rank, "\n")
+cat("Variables:", best$combo_name, "\n")
+cat("Weighted Accuracy:", round(best$weighted_accuracy, 2), "%\n")
+cat("\nScenario Assumptions:\n")
+for (fv in fruit_vars) {
+  pct_col <- paste0(fv, "_pct")
+  if (!is.na(best[[pct_col]])) {
+    cat("  ", fv, ":", best[[pct_col]], "%\n")
+  }
+}
+cat("\nAccuracy:\n")
+cat("  ", total_col, ":", round(best$accuracy_total, 2), "%\n")
+cat("  ", response1_col, ":", round(best$accuracy_response1, 2), "%\n")
+cat("  ", response2_col, ":", round(best$accuracy_response2, 2), "%\n")
