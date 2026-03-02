@@ -1,0 +1,100 @@
+# ============================================================
+# PROCESS FLOW DIAGRAM — Research Methodology (Snake Layout)
+# ============================================================
+# 8 uniform boxes, same snake layout as the working 7-step version
+# Requires: DiagrammeR, DiagrammeRsvg, rsvg
+# install.packages(c("DiagrammeR", "DiagrammeRsvg", "rsvg"))
+
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(rsvg)
+
+flow <- grViz("
+digraph research_flow {
+
+  graph [
+    rankdir = LR,
+    bgcolor = '#FFFFFF',
+    fontname = 'Helvetica',
+    fontsize = 16,
+    fontcolor = '#1A1A2E',
+    nodesep = 0.6,
+    ranksep = 1.2,
+    pad = 0.4,
+    label = 'Research Methodology\\nModelling the Effect of the 2023 Federal Grocery Rebate on Food CPI Across Canadian Provinces\\n\\n',
+    labelloc = t,
+    labeljust = c
+  ]
+
+  node [
+    shape = box,
+    style = 'rounded,filled',
+    fillcolor = '#FFFFFF',
+    color = '#B85C38',
+    fontname = 'Helvetica',
+    fontsize = 10,
+    fontcolor = '#1A1A2E',
+    penwidth = 1.5,
+    width = 2.8,
+    margin = '0.22,0.18'
+  ]
+
+  edge [
+    color = '#B85C38',
+    penwidth = 1.6,
+    arrowsize = 0.8
+  ]
+
+  # ============================================================
+  # NODES
+  # ============================================================
+
+  step1 [label = <<b>1. Define the Research Question</b><br/><br/><font point-size='9' color='#6B6B7B'>Establish the policy question and clarify<br/>the scope. The goal is to measure the<br/>effect of the 2023 federal grocery rebate<br/>on food prices in each Canadian province,<br/>producing evidence to support government<br/>policy evaluation.</font>>]
+
+  step2 [label = <<b>2. Review Existing Research</b><br/><br/><font point-size='9' color='#6B6B7B'>Survey academic papers, government<br/>reports, and statistical publications to<br/>understand what drives food inflation<br/>at the provincial level. Multiple articles<br/>were identified covering exchange-rate<br/>pass-through, import dependency, energy<br/>costs, and commodity price transmission.</font>>]
+
+  step3 [label = <<b>3. Identify Potential Factors</b><br/><br/><font point-size='9' color='#6B6B7B'>From the literature, assemble a set of<br/>economic indicators that could plausibly<br/>influence provincial food prices: % of food<br/>imports from the U.S., dollar value of<br/>imports, U.S. core and food inflation,<br/>USD-CAD exchange rate, Canadian core<br/>inflation, energy CPI, and the FAO global<br/>food price index.</font>>]
+
+  step4 [label = <<b>4. Choose a Modelling Approach</b><br/><br/><font point-size='9' color='#6B6B7B'>Select a time-series framework that<br/>incorporates external economic factors<br/>(ARIMAX). For each province, the model<br/>uses past food prices together with the<br/>identified factors to forecast future prices.<br/>The policy effect is estimated by comparing<br/>actual prices to a counterfactual forecast<br/>generated in the absence of the rebate.</font>>]
+
+  step5 [label = <<b>5. Build and Test Multiple Plausible Models</b><br/><br/><font point-size='9' color='#6B6B7B'>For each province, systematically create<br/>multiple candidate models by varying<br/>which factors are included and how far<br/>back each one looks (1-6 month lags).<br/>Every combination is tested with seasonal<br/>adjustments, producing thousands of<br/>province-level specifications.</font>>]
+
+  step6 [label = <<b>6. Compare to a Baseline</b><br/><br/><font point-size='9' color='#6B6B7B'>For each province, compare every candidate<br/>to a simple model using only past food<br/>prices. Evaluate on improvements in forecast<br/>accuracy (rolling cross-validation), model fit<br/>(information criteria), and whether statistical<br/>assumptions hold (stationarity, autocorrelation,<br/>variance, normality of residuals).</font>>]
+
+  step7 [label = <<b>7. Select One Defensible Model</b><br/><br/><font point-size='9' color='#6B6B7B'>Choose one model specification that works<br/>well across all provinces, passes diagnostic<br/>checks, improves on the baseline, and tells<br/>a coherent economic story grounded in the<br/>literature. A single uniform model is preferred<br/>so that results are directly comparable<br/>across provinces.</font>>]
+
+  step8 [label = <<b>8. Apply and Interpret for Policy</b><br/><br/><font point-size='9' color='#6B6B7B'>For each province, use the chosen model to<br/>forecast what food prices would have been<br/>without the rebate (a counterfactual).<br/>Compare to what actually happened after<br/>the policy took effect. The gap provides a<br/>province-level estimate of the rebates<br/>impact on food inflation.</font>>]
+
+  # ============================================================
+  # FORCE VERTICAL PAIRS — same as working 7-step version
+  # ============================================================
+  { rank = same; step1; step2 }
+  { rank = same; step3; step4 }
+  { rank = same; step5; step6 }
+  { rank = same; step7; step8 }
+
+  # ============================================================
+  # EDGES — exact same pattern as working version
+  # down, right, up (dir=back), right, down, right, down
+  # ============================================================
+  step1 -> step2
+  step2 -> step3
+  step4 -> step3 [dir = back]
+  step4 -> step5
+  step5 -> step6
+  step6 -> step7
+  step7 -> step8
+}
+")
+
+# ---- DISPLAY ----
+flow
+
+# ---- SAVE TO PNG (high-res for PowerPoint) ----
+svg_text <- export_svg(flow)
+rsvg_png(charToRaw(svg_text), file = "process_flow.png", width = 3600)
+cat("Saved: process_flow.png\n")
+
+# ---- SAVE TO SVG ----
+writeLines(svg_text, "process_flow.svg")
+cat("Saved: process_flow.svg\n")
