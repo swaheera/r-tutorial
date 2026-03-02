@@ -1,0 +1,54 @@
+library(ggplot2)
+
+# Colors
+grn <- '#66BB6A'
+red <- '#EF5350'
+nvy <- '#1B3A5C'
+gry <- '#BBBBBB'
+
+set.seed(42)
+
+var_names <- c('USD/\nCAD', 'US\nCore', 'US Food\nImp.', 'FAO\nFood', 'Energy\nCPI', 'Core\nCPI CA')
+n_vars <- length(var_names)
+n_lags <- 6
+
+# Random selection matrix
+selected <- matrix(runif(n_lags * n_vars) > 0.5, nrow = n_lags, ncol = n_vars)
+
+df <- expand.grid(var = 1:n_vars, lag = 1:n_lags)
+df$sel <- as.vector(t(selected))
+df$fill <- ifelse(df$sel, grn, red)
+df$txt <- as.character(df$lag)
+df$lag_rev <- (n_lags + 1) - df$lag
+
+p <- ggplot(df, aes(x = var, y = lag_rev)) +
+    geom_tile(aes(fill = fill), colour = 'white', linewidth = 1,
+              width = 0.88, height = 0.78, show.legend = FALSE) +
+    geom_text(aes(label = txt), colour = 'white', size = 3, fontface = 'bold') +
+    scale_fill_identity() +
+    scale_x_continuous(breaks = 1:n_vars, labels = var_names, position = 'top',
+                       expand = expansion(mult = 0.08)) +
+    scale_y_continuous(breaks = n_lags:1, expand = expansion(mult = 0.08)) +
+    labs(title = 'Model 1') +
+    theme_minimal(base_size = 10) +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = 'bold', colour = nvy),
+        axis.title = element_blank(),
+        axis.text.x.top = element_text(colour = nvy, lineheight = 0.85),
+        axis.text.y = element_blank(),
+        axis.ticks = element_blank(),
+        panel.grid = element_blank()
+    )
+
+# Add column arrows
+for (v in 1:n_vars) {
+    for (r in 1:(n_lags - 1)) {
+        y_start <- (n_lags + 1) - r - 0.42
+        y_end <- (n_lags + 1) - (r + 1) + 0.42
+        p <- p + annotate('segment', x = v, xend = v, y = y_start, yend = y_end,
+                          colour = gry, linewidth = 0.3,
+                          arrow = arrow(length = unit(0.05, 'inches'), type = 'closed'))
+    }
+}
+
+print(p)
