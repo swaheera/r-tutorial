@@ -1,0 +1,111 @@
+# USD/CAD Exchange Rate Plot
+# Assumes you have a tibble called `usd_cad` with columns: date, usd_cad
+
+library(ggplot2)
+library(dplyr)
+usd_cad <- master
+# --- Reference points ---
+latest <- usd_cad %>% slice_tail(n = 1)
+first  <- usd_cad %>% slice_head(n = 1)
+
+# 2023 boundaries
+y2023_start <- as.Date("2023-01-01")
+y2023_end   <- as.Date("2023-12-01")
+
+# --- Colors ---
+line_col <- "#1a3a4a"
+bg_col   <- "#fafaf8"
+grid_col <- "#e8e6e1"
+text_col <- "#1a1a1a"
+band_col <- "#d5e4ed"
+vline_col <- "#7f9baa"
+
+# --- Legend data ---
+band_df <- data.frame(
+    xmin = y2023_start, xmax = y2023_end,
+    ymin = -Inf, ymax = Inf,
+    label = "Intervention period"
+)
+
+# --- Plot ---
+ggplot(usd_cad, aes(x = date, y = usd_cad)) +
+    
+    # 2023 shaded band
+    geom_rect(
+        data = band_df,
+        aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = label),
+        inherit.aes = FALSE, alpha = 0.35
+    ) +
+    
+    # 2023 vertical dotted lines
+    geom_vline(xintercept = as.numeric(y2023_start),
+               linetype = "dotted", color = vline_col, linewidth = 0.5) +
+    geom_vline(xintercept = as.numeric(y2023_end),
+               linetype = "dotted", color = vline_col, linewidth = 0.5) +
+    
+    # Main line
+    geom_line(color = line_col, linewidth = 0.8) +
+    
+    # Legend fill
+    scale_fill_manual(values = c("Intervention period" = band_col)) +
+    
+    # Scales
+    scale_x_date(
+        date_labels = "%b\n%Y",
+        date_breaks = "1 year",
+        expand = expansion(mult = c(0.02, 0.04))
+    ) +
+    scale_y_continuous(
+        labels = function(x) paste0("$", format(x, nsmall = 2))
+    ) +
+    
+    # Labels
+    labs(
+        title = paste0(
+            "Monthly Average U.S. to Canadian Dollar Exchange Rate, ",
+            format(first$date, "%b %Y"), " \u2013 ",
+            format(latest$date, "%b %Y")
+        ),
+        subtitle = "In 2023, the exchange rate did not experience strong fluctuations",
+        x = NULL,
+        y = "Canadian dollars per 1 U.S. dollar",
+        fill = NULL,
+        caption = "Source: Bank of Canada (2026)\nhttps://www.bankofcanada.ca/rates/exchange/"
+    ) +
+    
+    # Theme
+    theme_minimal(base_size = 13) +
+    theme(
+        plot.background = element_rect(fill = bg_col, color = NA),
+        panel.background = element_rect(fill = bg_col, color = NA),
+        
+        plot.title = element_text(
+            face = "bold", size = 15, color = text_col,
+            margin = margin(b = 4)
+        ),
+        plot.subtitle = element_text(
+            size = 11, color = text_col,
+            margin = margin(b = 20)
+        ),
+        plot.caption = element_text(
+            size = 8, color = text_col,
+            margin = margin(t = 15), hjust = 0,
+            lineheight = 1.3
+        ),
+        plot.margin = margin(25, 30, 15, 20),
+        
+        panel.grid.major.y = element_line(color = grid_col, linewidth = 0.3),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        
+        axis.text = element_text(color = text_col, size = 10),
+        axis.text.x = element_text(lineheight = 1.1),
+        axis.title.y = element_text(color = text_col, size = 10, margin = margin(r = 10)),
+        axis.ticks = element_blank(),
+        
+        legend.position = "bottom",
+        legend.justification = "left",
+        legend.text = element_text(size = 10, color = text_col),
+        legend.key.size = unit(0.45, "cm"),
+        legend.margin = margin(t = -5)
+    )
