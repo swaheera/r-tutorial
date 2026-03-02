@@ -1,0 +1,90 @@
+# ============================================================
+# GT TABLE FOR MODEL RESULTS
+# ============================================================
+
+library(gt)
+library(dplyr)
+
+# Create the data frame from your results
+model_summary <- tibble(
+    province = c("Alberta", "British Columbia", "Canada", "Manitoba", "New Brunswick", "Newfoundland and Labrador", "Nova Scotia", "Ontario", "Prince Edward Island", "Quebec", "Saskatchewan"),
+    cv_improvement = c(31.6, 43.6, 29.4, 21.2, 25.5, 17.8, 24.6, 42.2, 19.7, 18.3, 9.8),
+    aic_improvement = c(24.2, 28.2, 36.6, 6.4, 36.8, 34.2, 24.9, 42.3, 13.5, 17.8, 8.3),
+    model_diag_pass = c(4, 3, 4, 4, 4, 3, 4, 4, 4, 4, 4),
+    sig_econ_pct = c(50, 75, 50, 25, 50, 50, 50, 75, 25, 25, 25),
+    sig_seas_pct = c(50, 50, 50, 50, 50, 100, 50, 100, 50, 50, 50)
+)
+
+# Calculate at least 1 control statistically significant
+model_summary <- model_summary %>%
+    mutate(
+        at_least_one_sig = ifelse(sig_econ_pct > 0 | sig_seas_pct > 0, "Yes", "No"),
+        diag_display = paste0(model_diag_pass, "/4"),
+        cv_display = paste0(cv_improvement, "%"),
+        aic_display = paste0(aic_improvement, "%")
+    )
+
+# Create the gt table
+gt_table <- model_summary %>%
+    select(province, cv_display, aic_display, diag_display, at_least_one_sig) %>%
+    gt() %>%
+    cols_label(
+        province = "Province",
+        cv_display = md("Forecast\nImprovement vs.\nModel Without Controls"),
+        aic_display = md("Model Fit\nImprovement vs.\nModel Without Controls"),
+        diag_display = md("Diagnostics\nPassed"),
+        at_least_one_sig = md("At Least 1\nControl\nStatistically Significant?")
+    ) %>%
+    cols_align(
+        align = "center",
+        columns = c(cv_display, aic_display, diag_display, at_least_one_sig)
+    ) %>%
+    cols_align(
+        align = "left",
+        columns = province
+    ) %>%
+    tab_header(
+        title = "Model Performance Summary: Comparison Against Model Without Controls",
+        subtitle = "Model performance was validated by comparing forecast accuracy, model fit, and diagnostic tests against a baseline model without economic or seasonal controls."
+    ) %>%
+    tab_style(
+        style = cell_text(weight = "bold"),
+        locations = cells_column_labels()
+    ) %>%
+    tab_style(
+        style = cell_text(weight = "bold"),
+        locations = cells_title()
+    ) %>%
+    tab_footnote(
+        footnote = "Rolling window cross-validation Mean Absolute Percentage Error (MAPE).",
+        locations = cells_column_labels(columns = cv_display)
+    ) %>%
+    tab_footnote(
+        footnote = "Akaike Information Criterion (AIC) improvement; higher values indicate better model fit.",
+        locations = cells_column_labels(columns = aic_display)
+    ) %>%
+    tab_footnote(
+        footnote = "ADF (stationarity), Ljung-Box (autocorrelation), Breusch-Pagan (heteroskedasticity), Shapiro-Wilk (normality).",
+        locations = cells_column_labels(columns = diag_display)
+    ) %>%
+    tab_footnote(
+        footnote = "Based on p-value < 0.05.",
+        locations = cells_column_labels(columns = at_least_one_sig)
+    ) %>%
+    tab_source_note(
+        source_note = "Training period: Jan 2017 to Jun 2023."
+    ) %>%
+    tab_options(
+        table.font.size = px(12),
+        heading.title.font.size = px(16),
+        heading.subtitle.font.size = px(13),
+        column_labels.font.size = px(11),
+        footnotes.font.size = px(10),
+        source_notes.font.size = px(10)
+    )
+
+# Display the table
+gt_table
+
+# Save as HTML
+gtsave(gt_table, "model_summary.html")
