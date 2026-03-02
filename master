@@ -1,0 +1,234 @@
+# ============================================================
+# BUILD MASTER DATASET — ALL FROM SOURCE
+#
+# Downloads everything fresh from official sources.
+# 11 geographies: 10 provinces + Canada
+#
+# Variables:
+#   food_cpi     — Canadian food CPI (provincial)
+#   nfne_cpi     — Canadian all-items ex food & energy CPI
+#   energy_cpi   — Canadian energy CPI
+#   us_food_cpi  — US Food at Home CPI (CUSR0000SAF11)
+#   us_core_cpi  — US Core CPI, all items less food & energy (CPILFESL)
+#   usd_cad      — USD/CAD exchange rate (Bank of Canada monthly)
+#   total_imports, usa_imports, non_usa_imports — trade ($000s)
+#   pct_usa, pct_non_usa — trade shares (%)
+#   log_usa_imports — log(usa_imports + 1)
+# ============================================================
+
+library(readr)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+
+DATA_START_DATE <- as.Date("2017-01-01")
+
+# ============================================================
+# 1. US CPI — Food at Home (CUSR0000SAF11)
+#    https://fred.stlouisfed.org/series/CUSR0000SAF11
+#    "Consumer Price Index for All Urban Consumers:
+#     Food at Home in U.S. City Average"
+#    Base: 1982-1984 = 100, Not Seasonally Adjusted
+# ============================================================
+cat("[1/5] Downloading US Food at Home CPI (CUSR0000SAF11)...\n")
+
+us_food <- read_csv(
+  "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CUSR0000SAF11&cosd=2017-01-01&coed=2026-01-01",
+  show_col_types = FALSE
+) %>%
+  mutate(date = floor_date(as.Date(observation_date), "month")) %>%
+  filter(date >= DATA_START_DATE) %>%
+  select(date, us_food_cpi = CUSR0000SAF11)
+
+cat(sprintf("  %d rows, Jan 2017 = %.3f (expect ~237.072)\n", nrow(us_food), us_food$us_food_cpi[1]))
+
+# ============================================================
+# 2. US Core CPI — All Items Less Food & Energy (CPILFESL)
+#    https://fred.stlouisfed.org/series/CPILFESL
+#    "Consumer Price Index for All Urban Consumers:
+#     All Items Less Food and Energy in U.S. City Average"
+#    Base: 1982-1984 = 100, Seasonally Adjusted
+# ============================================================
+cat("[2/5] Downloading US Core CPI (CPILFESL)...\n")
+
+us_core <- read_csv(
+  "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CPILFESL&cosd=2017-01-01&coed=2026-01-01",
+  show_col_types = FALSE
+) %>%
+  mutate(date = floor_date(as.Date(observation_date), "month")) %>%
+  filter(date >= DATA_START_DATE) %>%
+  select(date, us_core_cpi = CPILFESL)
+
+cat(sprintf("  %d rows, Jan 2017 = %.3f (expect ~250.467)\n", nrow(us_core), us_core$us_core_cpi[1]))
+
+# ============================================================
+# 3. USD/CAD Exchange Rate — Bank of Canada
+#    https://www.bankofcanada.ca/rates/exchange/monthly-exchange-rates/
+#    Monthly average, FXMUSDCAD
+# ============================================================
+cat("[3/5] Downloading USD/CAD exchange rate (Bank of Canada)...\n")
+
+fx_url <- "https://www.bankofcanada.ca/valet/observations/group/FX_RATES_MONTHLY/csv?start_date=2017-01-01"
+raw_lines <- read_lines(fx_url)
+header_row <- which(grepl("^\"date\"", raw_lines))
+fx_data <- read_csv(I(paste(raw_lines[header_row:length(raw_lines)], collapse = "\n")), show_col_types = FALSE)
+
+usd_cad <- fx_data %>%
+  mutate(date = as.Date(date)) %>%
+  select(date, usd_cad = FXMUSDCAD)
+
+cat(sprintf("  %d rows, Jan 2017 = %.4f\n", nrow(usd_cad), usd_cad$usd_cad[1]))
+
+# ============================================================
+# 4. Provincial Food Imports — StatCan Table 12-10-0175
+#    https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1210017501
+#    "International merchandise trade by province,
+#     commodity, and Principal Trading Partners"
+#    Product: Farm, fishing and intermediate food products [C11]
+#    Trade: Import
+#    Partners: All countries, United States
+# ============================================================
+cat("[4/5] Downloading provincial food imports (StatCan 12-10-0175)...\n")
+
+temp <- tempfile(fileext = ".zip")
+download.file("https://www150.statcan.gc.ca/n1/tbl/csv/12100175-eng.zip", temp, mode = "wb", quiet = TRUE)
+files <- unzip(temp, exdir = tempdir())
+trade_table <- read_csv(files[grep("\\.csv$", files)][1], show_col_types = FALSE)
+unlink(temp)
+
+geos <- trade_table %>% distinct(GEO) %>% pull(GEO)
+
+results <- list()
+for (geo in geos) {
+  farm <- trade_table %>%
+    filter(
+      GEO == geo,
+      `North American Product Classification System (NAPCS)` == "Farm, fishing and intermediate food products [C11]",
+      Trade == "Import",
+      `Principal trading partners` %in% c("All countries", "United States")
+    ) %>%
+    mutate(date = ym(REF_DATE)) %>%
+    filter(date >= DATA_START_DATE) %>%
+    select(date, partner = `Principal trading partners`, VALUE)
+
+  if (nrow(farm) == 0) next
+
+  farm_wide <- farm %>%
+    pivot_wider(names_from = partner, values_from = VALUE) %>%
+    rename(total_imports = `All countries`, usa_imports = `United States`) %>%
+    mutate(
+      non_usa_imports = total_imports - usa_imports,
+      pct_usa = usa_imports / total_imports * 100,
+      pct_non_usa = non_usa_imports / total_imports * 100,
+      province = geo
+    )
+
+  results[[geo]] <- farm_wide
+}
+
+all_trade <- bind_rows(results) %>%
+  select(province, date, total_imports, usa_imports, non_usa_imports, pct_usa, pct_non_usa)
+
+cat(sprintf("  %d rows, %d geographies\n", nrow(all_trade), length(unique(all_trade$province))))
+
+# ============================================================
+# 5. Canadian Provincial CPI — StatCan Table 18-10-0004
+#    https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810000401
+#    "Consumer Price Index, monthly, not seasonally adjusted"
+#    Products: Food, All-items excluding food and energy, Energy
+# ============================================================
+cat("[5/5] Downloading Canadian CPI (StatCan 18-10-0004)...\n")
+
+temp2 <- tempfile(fileext = ".zip")
+download.file("https://www150.statcan.gc.ca/n1/tbl/csv/18100004-eng.zip", temp2, mode = "wb", quiet = TRUE)
+files2 <- unzip(temp2, exdir = tempdir())
+cpi_table <- read_csv(files2[grep("18100004\\.csv$", files2)][1], show_col_types = FALSE)
+unlink(temp2)
+
+product_col <- grep("roducts", names(cpi_table), value = TRUE)[1]
+
+cpi_table <- cpi_table %>%
+  mutate(date = as.Date(paste0(REF_DATE, "-01"))) %>%
+  filter(date >= DATA_START_DATE)
+
+extract_cpi <- function(product_name, new_col_name) {
+  cpi_table %>%
+    filter(.data[[product_col]] == product_name) %>%
+    select(date, province = GEO, !!new_col_name := VALUE)
+}
+
+food_cpi <- extract_cpi("Food", "food_cpi")
+nfne     <- extract_cpi("All-items excluding food and energy", "nfne_cpi")
+energy   <- extract_cpi("Energy", "energy_cpi")
+
+ca_cpi <- food_cpi %>%
+  inner_join(nfne, by = c("date", "province")) %>%
+  inner_join(energy, by = c("date", "province"))
+
+cat(sprintf("  %d rows, %d geographies\n", nrow(ca_cpi), length(unique(ca_cpi$province))))
+
+# ============================================================
+# 6. MERGE EVERYTHING + CLEAN
+# ============================================================
+cat("\nMerging...\n")
+
+master <- all_trade %>%
+  inner_join(us_food, by = "date") %>%
+  inner_join(us_core, by = "date") %>%
+  inner_join(usd_cad, by = "date") %>%
+  inner_join(ca_cpi, by = c("date", "province")) %>%
+  mutate(
+    # Fix 0/0 division NAs in trade shares
+    pct_usa     = replace_na(pct_usa, 0),
+    pct_non_usa = replace_na(pct_non_usa, 0),
+    # Fix any NAs in trade volumes (0 imports = 0, not NA)
+    total_imports   = replace_na(total_imports, 0),
+    usa_imports     = replace_na(usa_imports, 0),
+    non_usa_imports = replace_na(non_usa_imports, 0),
+    # log transform (safe with +1)
+    log_usa_imports = log(usa_imports + 1)
+  ) %>%
+  arrange(province, date)
+
+# Final NA check — report any remaining
+na_counts <- colSums(is.na(master))
+if (any(na_counts > 0)) {
+  cat("\nWARNING — remaining NAs:\n")
+  print(na_counts[na_counts > 0])
+} else {
+  cat("No NAs in final dataset.\n")
+}
+
+# ============================================================
+# 7. SUMMARY
+# ============================================================
+cat("\n############################################################\n")
+cat("###  MASTER DATASET BUILT\n")
+cat("############################################################\n\n")
+
+cat(sprintf("Rows: %d\n", nrow(master)))
+cat(sprintf("Geographies: %d\n", length(unique(master$province))))
+cat(sprintf("Date range: %s to %s\n", min(master$date), max(master$date)))
+cat(sprintf("Obs per geography: %d\n\n", nrow(master) / length(unique(master$province))))
+
+cat("Geographies:\n")
+print(table(master$province))
+
+cat("\nVariables:\n")
+cat(sprintf("  %-16s  %s\n", "food_cpi",        "Canadian food CPI (StatCan 18-10-0004)"))
+cat(sprintf("  %-16s  %s\n", "nfne_cpi",        "Canadian all-items ex food & energy CPI"))
+cat(sprintf("  %-16s  %s\n", "energy_cpi",      "Canadian energy CPI"))
+cat(sprintf("  %-16s  %s\n", "us_food_cpi",     "US Food at Home CPI (FRED CUSR0000SAF11)"))
+cat(sprintf("  %-16s  %s\n", "us_core_cpi",     "US Core CPI ex food & energy (FRED CPILFESL)"))
+cat(sprintf("  %-16s  %s\n", "usd_cad",         "USD/CAD exchange rate (Bank of Canada)"))
+cat(sprintf("  %-16s  %s\n", "total_imports",   "Total food imports $000s (StatCan 12-10-0175)"))
+cat(sprintf("  %-16s  %s\n", "usa_imports",     "US food imports $000s"))
+cat(sprintf("  %-16s  %s\n", "non_usa_imports", "Non-US food imports $000s"))
+cat(sprintf("  %-16s  %s\n", "pct_usa",         "US share of food imports (%)"))
+cat(sprintf("  %-16s  %s\n", "pct_non_usa",     "Non-US share of food imports (%)"))
+cat(sprintf("  %-16s  %s\n", "log_usa_imports", "log(usa_imports + 1)"))
+
+cat("\nSample (Alberta, first 6 rows):\n")
+print(head(master %>% filter(province == "Alberta")))
+
+cat("\n=== DONE ===\n")
