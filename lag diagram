@@ -10,7 +10,7 @@ set.seed(42)
 
 # --- Setup ---
 pred_names <- c("NFNE CPI", "Energy CPI", "US Food CPI",
-                "US Core CPI", "USD/CAD", "Pct USA")
+                "US Core CPI", "USD/CAD", "Pct USA", "FAO Index")
 n_pred <- length(pred_names)
 
 # All subsets of {Lag 1, Lag 2, Lag 3, Lag 4} = 2^4 = 16
@@ -49,9 +49,10 @@ combos_draw <- tibble(
     o3 = sample(1:n_opts, max_draw, replace = TRUE),
     o4 = sample(1:n_opts, max_draw, replace = TRUE),
     o5 = sample(1:n_opts, max_draw, replace = TRUE),
-    o6 = sample(1:n_opts, max_draw, replace = TRUE)
+    o6 = sample(1:n_opts, max_draw, replace = TRUE),
+    o7 = sample(1:n_opts, max_draw, replace = TRUE)
 ) %>%
-    filter(!(o1 == 1 & o2 == 1 & o3 == 1 & o4 == 1 & o5 == 1 & o6 == 1))
+    filter(!(o1 == 1 & o2 == 1 & o3 == 1 & o4 == 1 & o5 == 1 & o6 == 1 & o7 == 1))
 
 max_draw <- nrow(combos_draw)
 cat(sprintf("Drawing %d paths (%d segments)...\n", max_draw, max_draw * n_pred))
@@ -68,7 +69,8 @@ ei <- 0
 
 for (i in 1:max_draw) {
     opts <- c(combos_draw$o1[i], combos_draw$o2[i], combos_draw$o3[i],
-              combos_draw$o4[i], combos_draw$o5[i], combos_draw$o6[i])
+              combos_draw$o4[i], combos_draw$o5[i], combos_draw$o6[i],
+              combos_draw$o7[i])
     my <- model_y[i]
     
     for (step in 1:n_pred) {
@@ -92,7 +94,7 @@ path_edges <- tibble(
 
 model_nodes <- tibble(x = model_x, y = model_y)
 
-n_total <- 16^6 - 1
+n_total <- 16^7 - 1
 
 # ============================================================
 # PLOT
