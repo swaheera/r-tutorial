@@ -1,0 +1,249 @@
+library(ggplot2)
+library(forecast)
+
+set.seed(101)
+
+# --- Simulate data --------------------------------------------------------
+
+n_pre  <- 60
+n_post <- 24
+
+# Use actual monthly dates
+date_start <- as.Date("2015-01-01")
+dates_all  <- seq(date_start, by = "month", length.out = n_pre + n_post)
+dates_pre  <- dates_all[1:n_pre]
+dates_post <- dates_all[(n_pre + 1):(n_pre + n_post)]
+intervention_date <- dates_all[n_pre] + 15  # midpoint of last pre month
+
+time_pre  <- 1:n_pre
+time_post <- (n_pre + 1):(n_pre + n_post)
+
+# Underlying process: clear upward trend + seasonality + AR noise
+trend_pre  <- 30 + 0.35 * time_pre + 2.5 * sin(2 * pi * time_pre / 12)
+trend_post <- 30 + 0.35 * time_post + 2.5 * sin(2 * pi * time_post / 12)
+
+noise_pre  <- as.numeric(arima.sim(model = list(ar = 0.5), n = n_pre, sd = 1.0))
+noise_post <- as.numeric(arima.sim(model = list(ar = 0.5), n = n_post, sd = 1.0))
+
+y_pre <- trend_pre + noise_pre
+
+treatment_effect <- 4 + 0.12 * (time_post - n_pre)
+y_post_actual <- trend_post + noise_post + treatment_effect
+
+# --- Fit ARIMA on pre-intervention series ---------------------------------
+
+ts_pre <- ts(y_pre, frequency = 12)
+fit    <- auto.arima(ts_pre, seasonal = TRUE, stepwise = FALSE, approximation = FALSE)
+
+y_fitted_pre <- as.numeric(fitted(fit))
+
+fc <- forecast(fit, h = n_post, level = 95)
+y_counterfactual <- as.numeric(fc$mean)
+y_lower          <- as.numeric(fc$lower[, 1])
+y_upper          <- as.numeric(fc$upper[, 1])
+
+# --- Pad lines so they connect at the intervention point -----------------
+
+bridge_obs  <- data.frame(date = dates_pre[n_pre], y = y_pre[n_pre])
+bridge_fit  <- data.frame(date = dates_pre[n_pre], y = y_fitted_pre[n_pre])
+
+df_obs_pre  <- data.frame(date = dates_pre, y = y_pre)
+df_obs_post <- rbind(bridge_obs, data.frame(date = dates_post, y = y_post_actual))
+df_fit_pre  <- data.frame(date = dates_pre, y = y_fitted_pre)
+df_cf_post  <- rbind(bridge_fit, data.frame(date = dates_post, y = y_counterfactual))
+df_ribbon   <- rbind(
+    data.frame(date = dates_pre[n_pre], ymin = y_fitted_pre[n_pre], ymax = y_fitted_pre[n_pre]),
+    data.frame(date = dates_post, ymin = y_lower, ymax = y_upper)
+)
+
+# --- Plot -----------------------------------------------------------------
+
+p <- ggplot() +
+    # 95% prediction interval
+    geom_ribbon(data = df_ribbon,
+                aes(x = date, ymin = ymin, ymax = ymax),
+                fill = "#D32F2F", alpha = 0.10) +
+    
+    # Observed pre-intervention (solid black)
+    geom_line(data = df_obs_pre,
+              aes(x = date, y = y, colour = "Observed (pre-intervention)"),
+              linewidth = 0.6) +
+    
+    # Observed post-intervention (dashed black)
+    geom_line(data = df_obs_post,
+              aes(x = date, y = y, colour = "Observed (post-intervention)"),
+              linewidth = 0.6, linetype = "dashed") +
+    
+    # Model fit pre-intervention (solid red)
+    geom_line(data = df_fit_pre,
+              aes(x = date, y = y, colour = "Model fit (pre-intervention)"),
+              linewidth = 0.7) +
+    
+    # Counterfactual forecast post-intervention (dashed red)
+    geom_line(data = df_cf_post,
+              aes(x = date, y = y, colour = "Counterfactual forecast"),
+              linewidth = 0.7, linetype = "dashed") +
+    
+    # Intervention line (green)
+    geom_vline(xintercept = intervention_date, linetype = "dotted",
+               colour = "#2E7D32", linewidth = 0.6) +
+    annotate("text", x = intervention_date + 30, y = max(y_post_actual) + 1.2,
+             label = "Intervention", hjust = 0, fontface = "plain",
+             size = 3.2, colour = "#2E7D32") +
+    
+    # Date axis with "Jan\n2020" style labels
+    scale_x_date(
+        date_breaks = "1 year",
+        date_labels = "%b\n%Y",
+        expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    
+    # Colour scale with linetype overrides
+    scale_colour_manual(
+        name = NULL,
+        values = c(
+            "Observed (pre-intervention)"  = "black",
+            "Observed (post-intervention)" = "black",
+            "Model fit (pre-intervention)" = "#D32F2F",
+            "Counterfactual forecast"      = "#D32F2F"
+        ),
+        guide = guide_legend(
+            override.aes = list(
+                linetype  = c("dashed", "solid", "solid", "dashed"),
+                linewidth = c(0.6, 0.6, 0.7, 0.7)
+            )
+        )
+    ) +
+    
+    labs(
+        title    = "Synthetic Control Method (simulated data)",
+        subtitle = "A model is fit to pre-intervention data and used to forecast how the data might have looked\nif the intervention never happened. The forecast is compared to the actual data to estimate the effect.",
+        x       = NULL,
+        y       = "Outcome"
+    ) +
+    
+    theme_minimal(base_size = 12) +
+    theme(
+        text             = element_text(colour = "black"),
+        plot.title       = element_text(face = "bold", size = 14, colour = "black",
+                                        margin = margin(b = 4)),
+        plot.subtitle    = element_text(size = 10, colour = "black",
+                                        margin = margin(b = 12)),
+        legend.position  = "bottom",
+        legend.text      = element_text(size = 9, colour = "black"),
+        legend.key.width = unit(1.8, "cm"),
+        panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(colour = "grey90"),
+        axis.title       = element_text(size = 10, colour = "black"),
+        axis.text        = element_text(size = 9, colour = "black"),
+        axis.ticks       = element_line(colour = "black"),
+        plot.margin      = margin(15, 15, 10, 10)
+    )
+
+###################
+
+# ============================================================================
+# Synthetic Control — Side-by-Side Comparison (hand-crafted data)
+# ============================================================================
+
+library(ggplot2)
+library(gridExtra)
+
+set.seed(42)
+
+# --- Helper: generate realistic-looking series -----------------------------
+
+make_panel <- function(seed, effect_size, effect_drift, panel_title) {
+    
+    set.seed(seed)
+    
+    n_pre  <- 60
+    n_post <- 24
+    dates_all  <- seq(as.Date("2015-01-01"), by = "month",
+                      length.out = n_pre + n_post)
+    dates_pre  <- dates_all[1:n_pre]
+    dates_post <- dates_all[(n_pre + 1):(n_pre + n_post)]
+    intervention_date <- dates_pre[n_pre] + 15
+    
+    t_pre  <- 1:n_pre
+    t_post <- (n_pre + 1):(n_pre + n_post)
+    
+    base <- function(t) 30 + 0.25 * t + 2 * sin(2 * pi * t / 12)
+    
+    walk_pre  <- cumsum(rnorm(n_pre, 0, 0.4))
+    walk_post <- cumsum(rnorm(n_post, 0, 0.4)) + tail(walk_pre, 1)
+    jitter_pre  <- rnorm(n_pre, 0, 0.8)
+    jitter_post <- rnorm(n_post, 0, 0.8)
+    
+    y_pre  <- base(t_pre)  + walk_pre  + jitter_pre
+    y_post <- base(t_post) + walk_post + jitter_post +
+        effect_size + effect_drift * (1:n_post)
+    
+    fit_pre <- base(t_pre) + walk_pre * 0.85
+    
+    anchor  <- tail(fit_pre, 1)
+    cf_post <- anchor + 0.25 * (1:n_post) + 2 * sin(2 * pi * t_post / 12)
+    
+    pi_width <- 1.5 + 0.12 * (1:n_post)
+    y_lower  <- cf_post - 1.96 * pi_width
+    y_upper  <- cf_post + 1.96 * pi_width
+    
+    # Bridge: prepend last pre-intervention point to post series
+    df_obs_pre  <- data.frame(date = dates_pre,  y = y_pre)
+    df_obs_post <- data.frame(date = c(tail(dates_pre, 1), dates_post),
+                              y    = c(tail(y_pre, 1),     y_post))
+    df_fit_pre  <- data.frame(date = dates_pre,  y = fit_pre)
+    df_cf_post  <- data.frame(date = c(tail(dates_pre, 1), dates_post),
+                              y    = c(tail(fit_pre, 1),   cf_post))
+    df_ribbon   <- data.frame(date = c(tail(dates_pre, 1), dates_post),
+                              ymin = c(tail(fit_pre, 1),   y_lower),
+                              ymax = c(tail(fit_pre, 1),   y_upper))
+    
+    y_all <- c(y_pre, y_post, y_lower, y_upper)
+    
+    ggplot() +
+        geom_ribbon(data = df_ribbon,
+                    aes(x = date, ymin = ymin, ymax = ymax),
+                    fill = "#D32F2F", alpha = 0.10) +
+        geom_line(data = df_obs_pre,
+                  aes(x = date, y = y), colour = "black", linewidth = 0.55) +
+        geom_line(data = df_obs_post,
+                  aes(x = date, y = y), colour = "black",
+                  linewidth = 0.55, linetype = "dashed") +
+        geom_line(data = df_fit_pre,
+                  aes(x = date, y = y), colour = "#D32F2F", linewidth = 0.65) +
+        geom_line(data = df_cf_post,
+                  aes(x = date, y = y), colour = "#D32F2F",
+                  linewidth = 0.65, linetype = "dashed") +
+        geom_vline(xintercept = intervention_date, linetype = "dotted",
+                   colour = "#2E7D32", linewidth = 0.5) +
+        annotate("text",
+                 x = intervention_date + 30,
+                 y = max(y_all) + 0.8,
+                 label = "Intervention", hjust = 0, size = 3,
+                 colour = "#2E7D32") +
+        scale_x_date(date_labels = "%b\n%Y", date_breaks = "1 year") +
+        labs(title = panel_title, x = NULL, y = "Outcome") +
+        theme_minimal(base_size = 11) +
+        theme(
+            plot.title       = element_text(face = "bold", size = 10,
+                                            margin = margin(b = 8)),
+            panel.grid.minor = element_blank(),
+            panel.grid.major = element_line(colour = "grey90"),
+            axis.title       = element_text(size = 9),
+            axis.text        = element_text(size = 8),
+            plot.margin      = margin(5, 10, 5, 5)
+        )
+}
+
+# --- Two panels ------------------------------------------------------------
+
+p1 <- make_panel(seed = 42, effect_size = 6, effect_drift = 0.18,
+                 panel_title = "Scenario 1 (Simulated Data): Model Identifies Significant Intervention Effect")
+
+p2 <- make_panel(seed = 99, effect_size = 0, effect_drift = 0,
+                 panel_title = "Scenario 2 (Simulated Data): Model Identifies Negligible Intervention Effect")
+
+# --- Display ---------------------------------------------------------------
+
+grid.arrange(p1, p2, ncol = 2)
