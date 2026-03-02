@@ -1,0 +1,191 @@
+library(DiagrammeR)
+
+grn <- '#66BB6A'
+red <- '#EF5350'
+nvy <- '#1B3A5C'
+gry <- '#BBBBBB'
+
+grViz(paste0("
+digraph lag_grid {
+
+  graph [
+    rankdir  = TB,
+    fontname = 'Arial',
+    bgcolor  = 'white',
+    nodesep  = 0.50,
+    ranksep  = 0.40,
+    margin   = 0.3,
+    splines = ortho
+  ]
+
+  node [
+    fontname = 'Arial',
+    fontsize = 9,
+    style    = 'filled,rounded',
+    shape    = box,
+    width    = 1.15,
+    height   = 0.40,
+    penwidth = 0
+  ]
+
+  # ===========================================================
+  # COLUMN HEADERS
+  # ===========================================================
+  node [shape = plaintext, fillcolor = 'white', fontsize = 10,
+        fontcolor = '", nvy, "', fontname = 'Arial Bold', width = 1.15]
+
+  hdr_a [label = 'USD/CAD\\nExchange Rate']
+  hdr_b [label = 'U.S. Core\\nCPI']
+  hdr_c [label = 'U.S. Food\\nImports (log)']
+  hdr_d [label = 'FAO Food\\nPrice Index']
+  hdr_e [label = 'Energy\\nCPI']
+  hdr_f [label = 'Core CPI\\n(Canada)']
+
+  { rank = same; hdr_a; hdr_b; hdr_c; hdr_d; hdr_e; hdr_f }
+  edge [style = invis]
+  hdr_a -> hdr_b -> hdr_c -> hdr_d -> hdr_e -> hdr_f
+
+  # ===========================================================
+  # ROW 1 (1 month ago) - all red
+  # ===========================================================
+  node [shape = box, fontsize = 9, fontcolor = 'white',
+        fontname = 'Arial', width = 1.15, height = 0.40]
+
+  r1_a [label = '1 month\\nago', fillcolor = '", red, "']
+  r1_b [label = '1 month\\nago', fillcolor = '", red, "']
+  r1_c [label = '1 month\\nago', fillcolor = '", red, "']
+  r1_d [label = '1 month\\nago', fillcolor = '", red, "']
+  r1_e [label = '1 month\\nago', fillcolor = '", red, "']
+  r1_f [label = '1 month\\nago', fillcolor = '", red, "']
+
+  { rank = same; r1_a; r1_b; r1_c; r1_d; r1_e; r1_f }
+  edge [style = invis]
+  r1_a -> r1_b -> r1_c -> r1_d -> r1_e -> r1_f
+
+  # ===========================================================
+  # ROW 2 (2 months ago) - green: usd_cad_L2, us_core_cpi_L2, log_usa_imports_L2
+  # ===========================================================
+  r2_a [label = '2 months\\nago', fillcolor = '", grn, "']
+  r2_b [label = '2 months\\nago', fillcolor = '", grn, "']
+  r2_c [label = '2 months\\nago', fillcolor = '", grn, "']
+  r2_d [label = '2 months\\nago', fillcolor = '", red, "']
+  r2_e [label = '2 months\\nago', fillcolor = '", red, "']
+  r2_f [label = '2 months\\nago', fillcolor = '", red, "']
+
+  { rank = same; r2_a; r2_b; r2_c; r2_d; r2_e; r2_f }
+  edge [style = invis]
+  r2_a -> r2_b -> r2_c -> r2_d -> r2_e -> r2_f
+
+  # ===========================================================
+  # ROW 3 (3 months ago) - green: us_core_cpi_L3
+  # ===========================================================
+  r3_a [label = '3 months\\nago', fillcolor = '", red, "']
+  r3_b [label = '3 months\\nago', fillcolor = '", grn, "']
+  r3_c [label = '3 months\\nago', fillcolor = '", red, "']
+  r3_d [label = '3 months\\nago', fillcolor = '", red, "']
+  r3_e [label = '3 months\\nago', fillcolor = '", red, "']
+  r3_f [label = '3 months\\nago', fillcolor = '", red, "']
+
+  { rank = same; r3_a; r3_b; r3_c; r3_d; r3_e; r3_f }
+  edge [style = invis]
+  r3_a -> r3_b -> r3_c -> r3_d -> r3_e -> r3_f
+
+  # ===========================================================
+  # ROW 4 (4 months ago) - green: us_core_cpi_L4
+  # ===========================================================
+  r4_a [label = '4 months\\nago', fillcolor = '", red, "']
+  r4_b [label = '4 months\\nago', fillcolor = '", grn, "']
+  r4_c [label = '4 months\\nago', fillcolor = '", red, "']
+  r4_d [label = '4 months\\nago', fillcolor = '", red, "']
+  r4_e [label = '4 months\\nago', fillcolor = '", red, "']
+  r4_f [label = '4 months\\nago', fillcolor = '", red, "']
+
+  { rank = same; r4_a; r4_b; r4_c; r4_d; r4_e; r4_f }
+  edge [style = invis]
+  r4_a -> r4_b -> r4_c -> r4_d -> r4_e -> r4_f
+
+  # ===========================================================
+  # ROW 5 (5 months ago) - all red
+  # ===========================================================
+  r5_a [label = '5 months\\nago', fillcolor = '", red, "']
+  r5_b [label = '5 months\\nago', fillcolor = '", red, "']
+  r5_c [label = '5 months\\nago', fillcolor = '", red, "']
+  r5_d [label = '5 months\\nago', fillcolor = '", red, "']
+  r5_e [label = '5 months\\nago', fillcolor = '", red, "']
+  r5_f [label = '5 months\\nago', fillcolor = '", red, "']
+
+  { rank = same; r5_a; r5_b; r5_c; r5_d; r5_e; r5_f }
+  edge [style = invis]
+  r5_a -> r5_b -> r5_c -> r5_d -> r5_e -> r5_f
+
+  # ===========================================================
+  # ROW 6 (6 months ago) - all red
+  # ===========================================================
+  r6_a [label = '6 months\\nago', fillcolor = '", red, "']
+  r6_b [label = '6 months\\nago', fillcolor = '", red, "']
+  r6_c [label = '6 months\\nago', fillcolor = '", red, "']
+  r6_d [label = '6 months\\nago', fillcolor = '", red, "']
+  r6_e [label = '6 months\\nago', fillcolor = '", red, "']
+  r6_f [label = '6 months\\nago', fillcolor = '", red, "']
+  
+  { rank = same; r6_a; r6_b; r6_c; r6_d; r6_e; r6_f}
+  edge [style = invis]
+  r6_a -> r6_b -> r6_c -> r6_d -> r6_e -> r6_f
+  
+  # ===========================================================
+  # ROW 7 (Food CPI Month 0 - target node)
+  # ===========================================================
+  r7_a [label = '', style = invis]
+  r7_b [label = 'Food CPI\\nMonth 0', fillcolor = '", nvy, "']
+  r7_c [label = '', style = invis]
+  r7_d [label = '', style = invis]
+  r7_e [label = '', style = invis]
+  r7_f [label = '', style = invis]
+  
+  { rank = same; r7_a; r7_b; r7_c; r7_d; r7_e; r7_f}
+  edge [style = invis]
+  r7_a -> r7_b -> r7_c -> r7_d -> r7_e -> r7_f
+
+  # ===========================================================
+  # CHAIN ARROWS (vertical within columns)
+  # ===========================================================
+  edge [style = solid, color = '", gry, "', arrowhead = vee,
+        arrowsize = 0.4, penwidth = 0.9]
+
+  r1_a -> r2_a -> r3_a -> r4_a -> r5_a -> r6_a
+  r1_b -> r2_b -> r3_b -> r4_b -> r5_b -> r6_b
+  r1_c -> r2_c -> r3_c -> r4_c -> r5_c -> r6_c
+  r1_d -> r2_d -> r3_d -> r4_d -> r5_d -> r6_d
+  r1_e -> r2_e -> r3_e -> r4_e -> r5_e -> r6_e
+  r1_f -> r2_f -> r3_f -> r4_f -> r5_f -> r6_f
+  
+  # add last row connection with invisible arrows
+  edge [style = invis]
+  r6_a -> r7_a
+  r6_b -> r7_b
+  r6_c -> r7_c
+  r6_d -> r7_d
+  r6_e -> r7_e
+  r6_f -> r7_f
+
+  # ===========================================================
+  # VERTICAL ORDERING
+  # ===========================================================
+  edge [style = invis]
+  hdr_a -> r1_a
+  
+  # ===========================================================
+  # Connect green nodes to Food CPI Month 0
+  # Green: usd_cad_L2, us_core_cpi_L2_4, log_usa_imports_L2
+  # ===========================================================
+  edge [style = solid, color = '", grn, "', arrowhead = vee,
+        arrowsize = 0.6, penwidth = 1.5, constraint = false]
+
+  r2_a -> r7_b
+  r2_b -> r7_b
+  r2_c -> r7_b
+  r3_b -> r7_b
+  r4_b -> r7_b
+
+}
+"))
