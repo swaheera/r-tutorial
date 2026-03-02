@@ -1,11 +1,12 @@
 library(DiagrammeR)
+library(htmlwidgets)
 
 grn <- '#66BB6A'
 red <- '#EF5350'
 nvy <- '#1B3A5C'
 gry <- '#BBBBBB'
 
-grViz(paste0("
+diagram <- grViz(paste0("
 digraph lag_grid {
 
   graph [
@@ -77,10 +78,10 @@ digraph lag_grid {
   r2_a -> r2_b -> r2_c -> r2_d -> r2_e -> r2_f
 
   # ===========================================================
-  # ROW 3 (3 months ago) - green: us_core_cpi_L3
+  # ROW 3 (3 months ago) - all red
   # ===========================================================
   r3_a [label = '3 months\\nago', fillcolor = '", red, "']
-  r3_b [label = '3 months\\nago', fillcolor = '", grn, "']
+  r3_b [label = '3 months\\nago', fillcolor = '", red, "']
   r3_c [label = '3 months\\nago', fillcolor = '", red, "']
   r3_d [label = '3 months\\nago', fillcolor = '", red, "']
   r3_e [label = '3 months\\nago', fillcolor = '", red, "']
@@ -176,7 +177,7 @@ digraph lag_grid {
   
   # ===========================================================
   # Connect green nodes to Food CPI Month 0
-  # Green: usd_cad_L2, us_core_cpi_L2_4, log_usa_imports_L2
+  # Green: usd_cad_L2, us_core_cpi_L2, us_core_cpi_L4, log_usa_imports_L2
   # ===========================================================
   edge [style = solid, color = '", grn, "', arrowhead = vee,
         arrowsize = 0.6, penwidth = 1.5, constraint = false]
@@ -184,8 +185,10 @@ digraph lag_grid {
   r2_a -> r7_b
   r2_b -> r7_b
   r2_c -> r7_b
-  r3_b -> r7_b
   r4_b -> r7_b
 
 }
 "))
+
+# Save as HTML
+saveWidget(diagram, "lag_grid_diagram.html", selfcontained = TRUE)
