@@ -1,0 +1,180 @@
+# ============================================================
+# COMBINATORIAL SEARCH NETWORK
+# 6 predictors × 16 options each (all subsets of {Lag 1,Lag 2,Lag 3,Lag 4})
+# No xreg cap (abstract illustration), 25k paths
+# ============================================================
+
+library(tidyverse)
+
+set.seed(42)
+
+# --- Setup ---
+pred_names <- c("NFNE CPI", "Energy CPI", "US Food CPI",
+                "US Core CPI", "USD/CAD", "Pct USA")
+n_pred <- length(pred_names)
+
+# All subsets of {Lag 1, Lag 2, Lag 3, Lag 4} = 2^4 = 16
+base_lags <- c("Lag 1", "Lag 2", "Lag 3", "Lag 4")
+all_subsets <- do.call(c, lapply(0:4, function(k) combn(base_lags, k, simplify = FALSE)))
+
+lag_options <- sapply(all_subsets, function(s) {
+    if (length(s) == 0) "skip" else paste(s, collapse = "+")
+})
+n_opts <- length(lag_options)  # 16
+
+# --- Layout ---
+col_x <- seq(3, 19, length.out = n_pred)
+model_x <- 22
+opt_y <- seq(n_opts, 1, length.out = n_opts) * 0.42
+
+col_main <- "#1d3557"
+
+# --- Predictor nodes ---
+pred_nodes <- expand_grid(col = 1:n_pred, opt = 1:n_opts) %>%
+    mutate(
+        x = col_x[col],
+        y = opt_y[opt],
+        label = lag_options[opt],
+        is_skip = label == "skip"
+    )
+
+# --- Sample paths (no constraint, just exclude all-skip) ---
+cat("Sampling combinations...\n")
+
+max_draw <- 25000
+
+combos_draw <- tibble(
+    o1 = sample(1:n_opts, max_draw, replace = TRUE),
+    o2 = sample(1:n_opts, max_draw, replace = TRUE),
+    o3 = sample(1:n_opts, max_draw, replace = TRUE),
+    o4 = sample(1:n_opts, max_draw, replace = TRUE),
+    o5 = sample(1:n_opts, max_draw, replace = TRUE),
+    o6 = sample(1:n_opts, max_draw, replace = TRUE)
+) %>%
+    filter(!(o1 == 1 & o2 == 1 & o3 == 1 & o4 == 1 & o5 == 1 & o6 == 1))
+
+max_draw <- nrow(combos_draw)
+cat(sprintf("Drawing %d paths (%d segments)...\n", max_draw, max_draw * n_pred))
+
+# --- Build edges (pre-allocated) ---
+model_y <- seq(max(opt_y) + 0.3, min(opt_y) - 0.3, length.out = max_draw)
+
+total_edges <- max_draw * n_pred
+edge_x    <- numeric(total_edges)
+edge_y    <- numeric(total_edges)
+edge_xend <- numeric(total_edges)
+edge_yend <- numeric(total_edges)
+ei <- 0
+
+for (i in 1:max_draw) {
+    opts <- c(combos_draw$o1[i], combos_draw$o2[i], combos_draw$o3[i],
+              combos_draw$o4[i], combos_draw$o5[i], combos_draw$o6[i])
+    my <- model_y[i]
+    
+    for (step in 1:n_pred) {
+        ei <- ei + 1
+        edge_x[ei]    <- col_x[step]
+        edge_y[ei]    <- opt_y[opts[step]]
+        if (step < n_pred) {
+            edge_xend[ei] <- col_x[step + 1]
+            edge_yend[ei] <- opt_y[opts[step + 1]]
+        } else {
+            edge_xend[ei] <- model_x
+            edge_yend[ei] <- my
+        }
+    }
+}
+
+path_edges <- tibble(
+    x = edge_x[1:ei], y = edge_y[1:ei],
+    xend = edge_xend[1:ei], yend = edge_yend[1:ei]
+)
+
+model_nodes <- tibble(x = model_x, y = model_y)
+
+n_total <- 16^6 - 1
+
+# ============================================================
+# PLOT
+# ============================================================
+
+p <- ggplot() +
+    
+    # --- Crisscrossing paths ---
+    geom_segment(
+        data = path_edges,
+        aes(x = x, y = y, xend = xend, yend = yend),
+        color = col_main, alpha = 0.008, linewidth = 0.15
+    ) +
+    
+    # --- Column headers ---
+    annotate("text", x = col_x, y = max(opt_y) + 1.3,
+             label = pred_names,
+             color = col_main, size = 3.8, fontface = "bold") +
+    annotate("text", x = col_x, y = max(opt_y) + 0.9,
+             label = paste0(n_opts, " options"),
+             color = "#8d99ae", size = 2.8) +
+    annotate("text", x = model_x, y = max(opt_y) + 1.1,
+             label = paste0(format(n_total, big.mark = ","), "\nModels"),
+             color = col_main, size = 4.2, fontface = "bold",
+             lineheight = 0.85) +
+    
+    # --- Option nodes (drawn on top) ---
+    geom_point(
+        data = pred_nodes %>% filter(!is_skip),
+        aes(x, y), color = col_main, size = 3, alpha = 0.9
+    ) +
+    geom_point(
+        data = pred_nodes %>% filter(is_skip),
+        aes(x, y), color = "#bbb", size = 2.5, alpha = 0.5
+    ) +
+    
+    # --- Option labels (left of first column) ---
+    geom_text(
+        data = pred_nodes %>% filter(col == 1),
+        aes(x - 0.5, y, label = label),
+        color = ifelse(
+            pred_nodes %>% filter(col == 1) %>% pull(is_skip), "#999", "#111122"
+        ),
+        size = 2.6, hjust = 1, fontface = "bold"
+    ) +
+    
+    # --- Model dots ---
+    geom_point(
+        data = model_nodes,
+        aes(x, y), color = col_main, size = 0.15, alpha = 0.2
+    ) +
+    
+    # --- Bottom annotation ---
+    annotate("text", x = 12.5, y = min(opt_y) - 1.6,
+             label = paste0(
+                 n_opts, " options per predictor \u00D7 ", n_pred,
+                 " predictors = ", format(n_total + 1, big.mark = ","),
+                 " candidate models\n",
+                 format(max_draw, big.mark = ","), " paths shown"
+             ),
+             color = "#8d99ae", size = 3.2, lineheight = 1.3) +
+    
+    labs(
+        title = "Combinatorial Model Search",
+        subtitle = "Every line traces one candidate model through its predictor choices"
+    ) +
+    theme_void() +
+    theme(
+        plot.background  = element_rect(fill = "white", color = NA),
+        panel.background = element_rect(fill = "white", color = NA),
+        plot.title = element_text(color = col_main, size = 20, face = "bold",
+                                  hjust = 0.5,
+                                  margin = margin(t = 10, b = 2)),
+        plot.subtitle = element_text(color = "#8d99ae", size = 11, hjust = 0.5,
+                                     margin = margin(b = 10)),
+        plot.margin = margin(10, 30, 15, 30)
+    ) +
+    coord_cartesian(xlim = c(-0.5, 24),
+                    ylim = c(min(opt_y) - 2.5, max(opt_y) + 2.3),
+                    clip = "off")
+
+ggsave("arimax_search_network.png", p,
+       width = 20, height = 10, dpi = 300, bg = "white")
+
+cat("Saved: arimax_search_network.png\n")
