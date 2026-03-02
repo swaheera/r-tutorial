@@ -1,0 +1,161 @@
+library(DiagrammeR)
+
+grn <- '#66BB6A'
+red <- '#EF5350'
+nvy <- '#1B3A5C'
+gry <- 'black'
+blu <- '#7986CB'
+wht <- '#FFFFFF'
+
+lag_diagram <- grViz(paste0("
+digraph lag_grid {
+
+  graph [
+    rankdir  = TB,
+    fontname = 'Arial',
+    bgcolor  = 'white',
+    nodesep  = 0.50,
+    ranksep  = 0.40,
+    margin   = 0.3,
+    splines  = ortho
+  ]
+
+  node [
+    fontname = 'Arial',
+    fontsize = 9,
+    style    = 'filled,rounded',
+    shape    = box,
+    width    = 1.15,
+    height   = 0.40,
+    penwidth = 0
+  ]
+
+  # ===========================================================
+  # COLUMN HEADERS
+  # ===========================================================
+  node [shape = plaintext, fillcolor = 'white', fontsize = 12,
+        fontcolor = '", nvy, "', fontname = 'Arial Bold', width = 1.15]
+
+  hdr_usd  [label = 'USD/CAD\\nExchange Rate']
+  hdr_usc  [label = 'U.S. Core\\nCPI']
+  hdr_imp  [label = 'U.S. Food\\nImports (log)']
+  hdr_fao  [label = 'FAO Food\\nPrice Index']
+  hdr_ecpi [label = 'Energy\\nCPI']
+  hdr_nfne [label = 'Core CPI\\n(Canada)']
+
+  { rank = same; hdr_usd; hdr_usc; hdr_imp; hdr_fao; hdr_ecpi; hdr_nfne }
+  edge [style = invis]
+  hdr_usd -> hdr_usc -> hdr_imp -> hdr_fao -> hdr_ecpi -> hdr_nfne
+
+  # ===========================================================
+  # ROW 1: 1 month ago
+  # ===========================================================
+  node [shape = box, fontsize = 9, fontcolor = '", gry, "',
+        fontname = 'Arial', width = 1.15, height = 0.40]
+
+  r1_usd  [label = '1 month\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r1_usc  [label = '1 month\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r1_imp  [label = '1 month\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r1_fao  [label = '1 month\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r1_ecpi [label = '1 month\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r1_nfne [label = '1 month\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+
+  { rank = same; r1_usd; r1_usc; r1_imp; r1_fao; r1_ecpi; r1_nfne }
+  edge [style = invis]
+  r1_usd -> r1_usc -> r1_imp -> r1_fao -> r1_ecpi -> r1_nfne
+
+  # ===========================================================
+  # ROW 2: 2 months ago
+  # ===========================================================
+  r2_usd  [label = '2 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r2_usc  [label = '2 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r2_imp  [label = '2 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r2_fao  [label = '2 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r2_ecpi [label = '2 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r2_nfne [label = '2 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+
+  { rank = same; r2_usd; r2_usc; r2_imp; r2_fao; r2_ecpi; r2_nfne }
+  edge [style = invis]
+  r2_usd -> r2_usc -> r2_imp -> r2_fao -> r2_ecpi -> r2_nfne
+
+  # ===========================================================
+  # ROW 3: 3 months ago
+  # ===========================================================
+  r3_usd  [label = '3 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r3_usc  [label = '3 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r3_imp  [label = '3 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r3_fao  [label = '3 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r3_ecpi [label = '3 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r3_nfne [label = '3 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+
+  { rank = same; r3_usd; r3_usc; r3_imp; r3_fao; r3_ecpi; r3_nfne }
+  edge [style = invis]
+  r3_usd -> r3_usc -> r3_imp -> r3_fao -> r3_ecpi -> r3_nfne
+
+  # ===========================================================
+  # ROW 4: 4 months ago
+  # ===========================================================
+  r4_usd  [label = '4 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r4_usc  [label = '4 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r4_imp  [label = '4 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r4_fao  [label = '4 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r4_ecpi [label = '4 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r4_nfne [label = '4 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+
+  { rank = same; r4_usd; r4_usc; r4_imp; r4_fao; r4_ecpi; r4_nfne }
+  edge [style = invis]
+  r4_usd -> r4_usc -> r4_imp -> r4_fao -> r4_ecpi -> r4_nfne
+
+  # ===========================================================
+  # ROW 5: 5 months ago
+  # ===========================================================
+  r5_usd  [label = '5 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r5_usc  [label = '5 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r5_imp  [label = '5 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r5_fao  [label = '5 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r5_ecpi [label = '5 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r5_nfne [label = '5 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+
+  { rank = same; r5_usd; r5_usc; r5_imp; r5_fao; r5_ecpi; r5_nfne }
+  edge [style = invis]
+  r5_usd -> r5_usc -> r5_imp -> r5_fao -> r5_ecpi -> r5_nfne
+
+  # ===========================================================
+  # ROW 6: 6 months ago
+  # ===========================================================
+  r6_usd  [label = '6 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r6_usc  [label = '6 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r6_imp  [label = '6 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r6_fao  [label = '6 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r6_ecpi [label = '6 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+  r6_nfne [label = '6 months\\nago', fillcolor = '", wht, "', penwidth = 1, color = '", gry, "']
+
+  { rank = same; r6_usd; r6_usc; r6_imp; r6_fao; r6_ecpi; r6_nfne }
+  edge [style = invis]
+  r6_usd -> r6_usc -> r6_imp -> r6_fao -> r6_ecpi -> r6_nfne
+
+  # ===========================================================
+  # CHAIN ARROWS
+  # ===========================================================
+  edge [style = solid, color = '", gry, "', arrowhead = vee,
+        arrowsize = 0.4, penwidth = 0.9]
+
+  r1_usd  -> r2_usd  -> r3_usd  -> r4_usd  -> r5_usd  -> r6_usd
+  r1_usc  -> r2_usc  -> r3_usc  -> r4_usc  -> r5_usc  -> r6_usc
+  r1_imp  -> r2_imp  -> r3_imp  -> r4_imp  -> r5_imp  -> r6_imp
+  r1_fao  -> r2_fao  -> r3_fao  -> r4_fao  -> r5_fao  -> r6_fao
+  r1_ecpi -> r2_ecpi -> r3_ecpi -> r4_ecpi -> r5_ecpi -> r6_ecpi
+  r1_nfne -> r2_nfne -> r3_nfne -> r4_nfne -> r5_nfne -> r6_nfne
+
+  # ===========================================================
+  # VERTICAL ORDERING
+  # ===========================================================
+  edge [style = invis]
+  hdr_usd -> r1_usd
+
+}
+"))
+
+# ── Save ──
+htmlwidgets::saveWidget(lag_diagram, 'lag_selection_diagram.html', selfcontained = TRUE)
+cat('Done! See lag_selection_diagram.html\n')
