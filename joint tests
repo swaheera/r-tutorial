@@ -1,0 +1,368 @@
+# ============================================================
+# FULL PIPELINE: MODEL FIT + COUNTERFACTUAL ANALYSIS + GT TABLE
+# log_usa_imports_L2 + us_core_cpi_L2 + us_core_cpi_L4
+#   + usd_cad_L2 + S3 (seasonal dummies)
+# ============================================================
+
+options(scipen = 999)
+
+library(tidyverse)
+library(forecast)
+library(lubridate)
+library(lmtest)
+library(tseries)
+library(MASS)
+library(ggplot2)
+library(ggtext)
+library(gt)
+
+set.seed(123)
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DATA_START_DATE    <- as.Date("2017-01-01")
+INTERVENTION_START <- as.Date("2023-07-01")
+N_FORECAST_MONTHS  <- 6
+INTERVENTION_END   <- INTERVENTION_START %m+% months(N_FORECAST_MONTHS - 1)
+
+PLOT_START_DATE <- as.Date("2018-01-01")
+PLOT_END_DATE   <- INTERVENTION_END
+
+N_SIMS   <- 10000
+CV_FOLDS <- 8
+CV_WINDOW <- 4
+N_ECON   <- 4
+N_SEAS   <- 2
+
+DATA_SOURCE <- "Statistics Canada (2026)\nhttps://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810000401"
+INTERVENTION_LABEL <- paste0(format(INTERVENTION_START, "%B %Y"), " – ",
+                             format(INTERVENTION_END, "%B %Y"))
+
+provinces <- unique(master$province)
+provinces <- provinces[!grepl("Whitehorse|Yellowknife|Iqaluit", provinces)]
+
+cat("=== CONFIGURATION ===\n")
+cat(paste0("Forecast horizon: ", N_FORECAST_MONTHS, " months\n"))
+cat(paste0("Intervention:     ", INTERVENTION_LABEL, "\n"))
+cat(paste0("Provinces:        ", length(provinces), "\n\n"))
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+make_date_breaks <- function(start, end, extra_dates = NULL) {
+    year_breaks <- seq(as.Date(paste0(year(start), "-01-01")),
+                       as.Date(paste0(year(end),   "-01-01")), by = "year")
+    all_breaks  <- sort(unique(c(year_breaks, extra_dates)))
+    labels <- sapply(all_breaks, function(d) {
+        if (d %in% extra_dates && month(d) != 1)
+            return(paste0(format(d, "%b"), "\n", year(d)))
+        paste0("Jan\n", year(d))
+    })
+    list(breaks = all_breaks, labels = labels)
+}
+
+build_xreg <- function(df) {
+    df$log_usa_imports_L2 <- dplyr::lag(df$log_usa_imports, 2)
+    df$us_core_cpi_L2     <- dplyr::lag(df$us_core_cpi, 2)
+    df$us_core_cpi_L4     <- dplyr::lag(df$us_core_cpi, 4)
+    df$usd_cad_L2         <- dplyr::lag(df$usd_cad, 2)
+    m       <- month(df$date)
+    df$s3_1 <- as.numeric(m >= 5 & m <= 8)
+    df$s3_2 <- as.numeric(m >= 9)
+    df <- df %>% tidyr::drop_na(us_core_cpi_L4)
+    return(df)
+}
+
+xreg_cols <- c("log_usa_imports_L2", "us_core_cpi_L2", "us_core_cpi_L4",
+               "usd_cad_L2", "s3_1", "s3_2")
+
+# ============================================================
+# ROLLING CV
+# ============================================================
+
+rolling_cv <- function(y_vec, xreg_mat = NULL, n_folds = CV_FOLDS, win = CV_WINDOW) {
+    n <- length(y_vec)
+    n_f <- min(n_folds, floor((n - 24) / win))
+    if (n_f < 3) return(NA)
+    start_tr <- n - n_f * win
+    mapes <- numeric(n_f)
+    for (f in 1:n_f) {
+        te <- start_tr + (f - 1) * win
+        ts_idx <- (te + 1):min(te + win, n); h <- length(ts_idx)
+        y_tr <- ts(y_vec[1:te], frequency = 12); y_te <- y_vec[ts_idx]
+        if (is.null(xreg_mat)) {
+            fit <- tryCatch(auto.arima(y_tr, seasonal = FALSE), error = function(e) NULL)
+            if (is.null(fit)) return(NA)
+            fc <- tryCatch(as.numeric(forecast(fit, h = h)$mean), error = function(e) rep(NA, h))
+        } else {
+            fit <- tryCatch(auto.arima(y_tr, xreg = xreg_mat[1:te, , drop = FALSE],
+                                       seasonal = FALSE), error = function(e) NULL)
+            if (is.null(fit)) return(NA)
+            fc <- tryCatch(as.numeric(forecast(fit, xreg = xreg_mat[ts_idx, , drop = FALSE],
+                                               h = h)$mean), error = function(e) rep(NA, h))
+        }
+        if (any(is.na(fc))) return(NA)
+        mapes[f] <- mean(abs((y_te - fc) / y_te)) * 100
+    }
+    mean(mapes)
+}
+
+# ============================================================
+# SIMULATION ENGINE (fixed coefficients, innovation noise only)
+# ============================================================
+
+run_simulations <- function(fit, nsim, xreg_future, n_sims) {
+    sigma2    <- fit$sigma2
+    sim_paths <- matrix(NA, nrow = n_sims, ncol = nsim)
+    for (sim in 1:n_sims) {
+        sim_paths[sim, ] <- tryCatch(
+            as.numeric(simulate(fit, nsim = nsim,
+                                xreg = xreg_future, future = TRUE)),
+            error = function(e) {
+                as.numeric(forecast(fit, xreg = xreg_future, h = nsim)$mean) +
+                    rnorm(nsim, 0, sqrt(sigma2))
+            })
+    }
+    return(sim_paths)
+}
+
+# ============================================================
+# PART 1: MODEL FIT + WALD TEST (per province)
+# ============================================================
+
+cat("=== MODEL FITTING ===\n")
+
+fit_results  <- list()
+coef_details <- list()
+stored_fits  <- list()
+wald_results <- list()
+
+for (geo in provinces) {
+    
+    cat(sprintf("Fitting %s...\n", geo))
+    
+    df <- master %>%
+        dplyr::filter(province == geo) %>%
+        dplyr::arrange(date) %>%
+        build_xreg()
+    
+    train   <- df %>% dplyr::filter(date < INTERVENTION_START)
+    n_train <- nrow(train)
+    y_vec   <- train$food_cpi
+    y_ts    <- ts(y_vec, frequency = 12)
+    xreg_train <- as.matrix(train[, xreg_cols])
+    
+    # ---- BASE (no xreg) ----
+    base_fit   <- auto.arima(y_ts, seasonal = FALSE)
+    base_order <- arimaorder(base_fit)
+    base_aic   <- AIC(base_fit); base_bic <- BIC(base_fit)
+    base_cv    <- rolling_cv(y_vec, NULL)
+    base_res   <- as.numeric(residuals(base_fit))
+    base_adf   <- tryCatch(adf.test(base_res)$p.value, error = function(e) NA)
+    base_lb    <- tryCatch(Box.test(base_res, lag = 10, type = "Ljung-Box")$p.value, error = function(e) NA)
+    base_bp    <- tryCatch(bptest(lm(base_res ~ seq_along(base_res)))$p.value, error = function(e) NA)
+    base_sw    <- tryCatch(shapiro.test(base_res)$p.value, error = function(e) NA)
+    
+    # ---- ARIMAX ----
+    fit <- auto.arima(y_ts, xreg = xreg_train, seasonal = FALSE,
+                      stepwise = FALSE, approximation = FALSE)
+    ao        <- arimaorder(fit)
+    model_aic <- AIC(fit); model_bic <- BIC(fit)
+    model_cv  <- rolling_cv(y_vec, xreg_train)
+    res       <- as.numeric(residuals(fit))
+    model_adf <- tryCatch(adf.test(res)$p.value, error = function(e) NA)
+    model_lb  <- tryCatch(Box.test(res, lag = 10, type = "Ljung-Box")$p.value, error = function(e) NA)
+    model_bp  <- tryCatch(bptest(lm(res ~ seq_along(res)))$p.value, error = function(e) NA)
+    model_sw  <- tryCatch(shapiro.test(res)$p.value, error = function(e) NA)
+    
+    # ---- COEFFICIENTS ----
+    coefs_all  <- coef(fit)
+    se_all     <- sqrt(diag(fit$var.coef))
+    vcov_all   <- fit$var.coef
+    n_total    <- length(coefs_all)
+    n_arima_p  <- n_total - N_ECON - N_SEAS
+    
+    z_all <- abs(coefs_all / se_all)
+    p_all <- 2 * (1 - pnorm(z_all))
+    
+    arima_idx <- if (n_arima_p > 0) 1:n_arima_p else integer(0)
+    econ_idx  <- (n_arima_p + 1):(n_arima_p + N_ECON)
+    seas_idx  <- (n_arima_p + N_ECON + 1):n_total
+    
+    sig_arima_pct <- if (length(arima_idx) > 0) round(mean(p_all[arima_idx] < 0.05) * 100, 1) else NA
+    sig_econ_pct  <- round(mean(p_all[econ_idx] < 0.05) * 100, 1)
+    sig_seas_pct  <- round(mean(p_all[seas_idx] < 0.05) * 100, 1)
+    sig_xreg_pct  <- round(mean(p_all[c(econ_idx, seas_idx)] < 0.05) * 100, 1)
+    sig_total_pct <- round(mean(p_all < 0.05) * 100, 1)
+    
+    # ---- JOINT WALD TEST on all xreg coefficients ----
+    xreg_idx   <- c(econ_idx, seas_idx)
+    beta_xreg  <- coefs_all[xreg_idx]
+    vcov_xreg  <- vcov_all[xreg_idx, xreg_idx]
+    k          <- length(beta_xreg)
+    
+    wald_stat <- tryCatch({
+        as.numeric(t(beta_xreg) %*% solve(vcov_xreg) %*% beta_xreg)
+    }, error = function(e) NA)
+    
+    wald_p <- if (!is.na(wald_stat)) pchisq(wald_stat, df = k, lower.tail = FALSE) else NA
+    
+    wald_results[[geo]] <- tibble(
+        province   = geo,
+        wald_stat  = round(wald_stat, 2),
+        wald_df    = k,
+        wald_p     = wald_p,
+        joint_sig  = ifelse(!is.na(wald_p) & wald_p < 0.05, "Yes", "No")
+    )
+    
+    cat(sprintf("  Wald test: chi2=%.2f  df=%d  p=%.4f  => %s\n",
+                wald_stat, k, wald_p, wald_results[[geo]]$joint_sig))
+    
+    # ---- Store coefficient details ----
+    coef_details[[geo]] <- tibble(
+        province    = geo,
+        variable    = names(coefs_all[xreg_idx]),
+        type        = c(rep("economic", N_ECON), rep("seasonal", N_SEAS)),
+        estimate    = as.numeric(coefs_all[xreg_idx]),
+        se          = as.numeric(se_all[xreg_idx]),
+        p_value     = as.numeric(p_all[xreg_idx]),
+        significant = p_all[xreg_idx] < 0.05
+    )
+    
+    # ---- Store fit results ----
+    fit_results[[geo]] <- tibble(
+        province = geo, n_train = n_train,
+        train_start = min(train$date), train_end = max(train$date),
+        base_order = sprintf("(%d,%d,%d)", base_order[1], base_order[2], base_order[3]),
+        base_aic = round(base_aic, 1), base_bic = round(base_bic, 1), base_cv = round(base_cv, 3),
+        base_adf_p = round(base_adf, 4), base_lb_p = round(base_lb, 4),
+        base_bp_p = round(base_bp, 4), base_sw_p = round(base_sw, 4),
+        base_diag_pass = sum(c(base_adf < 0.05, base_lb >= 0.05, base_bp >= 0.05, base_sw >= 0.05), na.rm = TRUE),
+        model_order = sprintf("(%d,%d,%d)", ao[1], ao[2], ao[3]),
+        model_aic = round(model_aic, 1), model_bic = round(model_bic, 1), model_cv = round(model_cv, 3),
+        model_adf_p = round(model_adf, 4), model_lb_p = round(model_lb, 4),
+        model_bp_p = round(model_bp, 4), model_sw_p = round(model_sw, 4),
+        model_diag_pass = sum(c(model_adf < 0.05, model_lb >= 0.05, model_bp >= 0.05, model_sw >= 0.05), na.rm = TRUE),
+        sigma2 = round(fit$sigma2, 4),
+        sig_arima_pct = sig_arima_pct, sig_econ_pct = sig_econ_pct,
+        sig_seas_pct = sig_seas_pct, sig_xreg_pct = sig_xreg_pct, sig_total_pct = sig_total_pct,
+        n_arima_params = length(arima_idx), n_sig_arima = sum(p_all[arima_idx] < 0.05),
+        n_sig_econ = sum(p_all[econ_idx] < 0.05), n_econ_total = N_ECON,
+        n_sig_seas = sum(p_all[seas_idx] < 0.05), n_seas_total = N_SEAS,
+        aic_improvement = round(base_aic - model_aic, 1),
+        bic_improvement = round(base_bic - model_bic, 1),
+        cv_improvement = round((base_cv - model_cv) / base_cv * 100, 1),
+        beats_base_cv  = model_cv < base_cv,
+        beats_base_aic = model_aic < base_aic,
+        beats_base_bic = model_bic < base_bic
+    )
+    
+    # ---- Store fitted model for later use (e.g. simulations) ----
+    stored_fits[[geo]] <- fit
+    
+    cat(sprintf("  Base: ARIMA%s  CV=%.3f  diag=%d/4\n",
+                fit_results[[geo]]$base_order, base_cv, fit_results[[geo]]$base_diag_pass))
+    cat(sprintf("  Model: ARIMA%s  CV=%.3f  diag=%d/4  CV impr=%+.1f%%\n",
+                fit_results[[geo]]$model_order, model_cv, fit_results[[geo]]$model_diag_pass,
+                fit_results[[geo]]$cv_improvement))
+    cat(sprintf("  Sig: ARIMA=%s  Econ=%d/%d  Seas=%d/%d\n\n",
+                ifelse(is.na(sig_arima_pct), "n/a", sprintf("%.0f%%", sig_arima_pct)),
+                sum(p_all[econ_idx] < 0.05), N_ECON,
+                sum(p_all[seas_idx] < 0.05), N_SEAS))
+}
+
+final_results  <- bind_rows(fit_results)
+coef_detail_df <- bind_rows(coef_details)
+wald_df        <- bind_rows(wald_results)
+
+# ============================================================
+# GT TABLE FOR MODEL RESULTS
+# ============================================================
+
+cat("=== BUILDING GT TABLE ===\n")
+
+# Join fit results with Wald test results
+model_summary <- final_results %>%
+    select(province, cv_improvement, aic_improvement, model_diag_pass) %>%
+    left_join(wald_df %>% select(province, wald_stat, wald_df, wald_p, joint_sig),
+              by = "province") %>%
+    mutate(
+        diag_display = paste0(model_diag_pass, "/4"),
+        cv_display   = paste0(cv_improvement, "%"),
+        aic_display  = paste0(aic_improvement, "%"),
+        wald_display = ifelse(
+            joint_sig == "Yes",
+            paste0("Yes (p=", formatC(wald_p, format = "f", digits = 3), ")"),
+            paste0("No (p=", formatC(wald_p, format = "f", digits = 3), ")")
+        )
+    )
+
+gt_table <- model_summary %>%
+    select(province, cv_display, aic_display, diag_display, wald_display) %>%
+    gt() %>%
+    cols_label(
+        province     = "Province",
+        cv_display   = md("Forecast\nImprovement vs.\nModel Without Controls"),
+        aic_display  = md("Model Fit\nImprovement vs.\nModel Without Controls"),
+        diag_display = md("Diagnostics\nPassed"),
+        wald_display = md("Controls Jointly\nSignificant?")
+    ) %>%
+    cols_align(
+        align = "center",
+        columns = c(cv_display, aic_display, diag_display, wald_display)
+    ) %>%
+    cols_align(
+        align = "left",
+        columns = province
+    ) %>%
+    tab_header(
+        title = "Model Performance Summary: Comparison Against Model Without Controls",
+        subtitle = "Model performance was validated by comparing forecast accuracy, model fit, and diagnostic tests against a baseline model without economic or seasonal controls."
+    ) %>%
+    tab_style(
+        style = cell_text(weight = "bold"),
+        locations = cells_column_labels()
+    ) %>%
+    tab_style(
+        style = cell_text(weight = "bold"),
+        locations = cells_title()
+    ) %>%
+    tab_footnote(
+        footnote = "Rolling window cross-validation Mean Absolute Percentage Error (MAPE).",
+        locations = cells_column_labels(columns = cv_display)
+    ) %>%
+    tab_footnote(
+        footnote = "Akaike Information Criterion (AIC) improvement; higher values indicate better model fit.",
+        locations = cells_column_labels(columns = aic_display)
+    ) %>%
+    tab_footnote(
+        footnote = "ADF (stationarity), Ljung-Box (autocorrelation), Breusch-Pagan (heteroskedasticity), Shapiro-Wilk (normality).",
+        locations = cells_column_labels(columns = diag_display)
+    ) %>%
+    tab_footnote(
+        footnote = paste0(
+            "Joint Wald test of all economic and seasonal control coefficients ",
+            "(H\u2080: all coefficients = 0). Chi-squared test at p < 0.05."
+        ),
+        locations = cells_column_labels(columns = wald_display)
+    ) %>%
+    tab_source_note(
+        source_note = "Training period: Jan 2017 to Jun 2023."
+    ) %>%
+    tab_options(
+        table.font.size = px(12),
+        heading.title.font.size = px(16),
+        heading.subtitle.font.size = px(13),
+        column_labels.font.size = px(11),
+        footnotes.font.size = px(10),
+        source_notes.font.size = px(10)
+    )
+
+# Display and save
+gt_table
+gtsave(gt_table, "model_summary.html")
+
+cat("=== GT TABLE SAVED: model_summary.html ===\n")
