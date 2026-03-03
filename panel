@@ -1,0 +1,257 @@
+# ============================================================
+# SIMPLIFIED MULTI-PANEL COUNTERFACTUAL PLOTS
+# Fully reproducible from master.csv
+# ============================================================
+
+options(scipen = 999)
+
+library(tidyverse)
+library(forecast)
+library(lubridate)
+library(lmtest)
+library(tseries)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+
+set.seed(123)
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+master <- read.csv("master.csv")
+master$date <- as.Date(master$date)
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DATA_START_DATE    <- as.Date("2017-01-01")
+INTERVENTION_START <- as.Date("2023-07-01")
+N_FORECAST_MONTHS  <- 6
+INTERVENTION_END   <- INTERVENTION_START %m+% months(N_FORECAST_MONTHS - 1)
+
+PLOT_START_DATE <- as.Date("2018-01-01")
+PLOT_END_DATE   <- INTERVENTION_END
+
+N_SIMS <- 10000
+N_ECON <- 4
+N_SEAS <- 2
+
+DATA_SOURCE <- "Statistics Canada (2026)\nhttps://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810000401"
+INTERVENTION_LABEL <- paste0(format(INTERVENTION_START, "%B %Y"), " – ",
+                             format(INTERVENTION_END, "%B %Y"))
+
+provinces <- unique(master$province)
+provinces <- provinces[!grepl("Whitehorse|Yellowknife|Iqaluit", provinces)]
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+build_xreg <- function(df) {
+    df$log_usa_imports_L2 <- dplyr::lag(df$log_usa_imports, 2)
+    df$us_core_cpi_L2     <- dplyr::lag(df$us_core_cpi, 2)
+    df$us_core_cpi_L4     <- dplyr::lag(df$us_core_cpi, 4)
+    df$usd_cad_L2         <- dplyr::lag(df$usd_cad, 2)
+    m       <- month(df$date)
+    df$s3_1 <- as.numeric(m >= 5 & m <= 8)
+    df$s3_2 <- as.numeric(m >= 9)
+    df <- df %>% tidyr::drop_na(us_core_cpi_L4)
+    return(df)
+}
+
+xreg_cols <- c("log_usa_imports_L2", "us_core_cpi_L2", "us_core_cpi_L4",
+               "usd_cad_L2", "s3_1", "s3_2")
+
+run_simulations <- function(fit, nsim, xreg_future, n_sims) {
+    sigma2    <- fit$sigma2
+    sim_paths <- matrix(NA, nrow = n_sims, ncol = nsim)
+    for (sim in 1:n_sims) {
+        sim_paths[sim, ] <- tryCatch(
+            as.numeric(simulate(fit, nsim = nsim,
+                                xreg = xreg_future, future = TRUE)),
+            error = function(e) {
+                as.numeric(forecast(fit, xreg = xreg_future, h = nsim)$mean) +
+                    rnorm(nsim, 0, sqrt(sigma2))
+            })
+    }
+    return(sim_paths)
+}
+
+# ============================================================
+# FIT MODELS + COUNTERFACTUAL SIMULATIONS
+# ============================================================
+
+all_cf <- list()
+
+for (prov in provinces) {
+    
+    cat(paste0("  ", prov, "\n"))
+    
+    df <- master %>%
+        dplyr::filter(province == prov) %>%
+        dplyr::arrange(date) %>%
+        build_xreg()
+    
+    pre_data <- df %>% dplyr::filter(date < INTERVENTION_START)
+    int_data <- df %>% dplyr::filter(date >= INTERVENTION_START &
+                                         date <= INTERVENTION_END)
+    n_int <- nrow(int_data)
+    if (n_int == 0) { cat("    !! no intervention data – skipping\n"); next }
+    actuals <- int_data$food_cpi
+    
+    y_pre <- pre_data$food_cpi
+    y_ts  <- ts(y_pre,
+                start = c(year(min(pre_data$date)),
+                          month(min(pre_data$date))),
+                frequency = 12)
+    x_train <- as.matrix(pre_data[, xreg_cols])
+    x_post  <- as.matrix(int_data[, xreg_cols])
+    
+    fit <- tryCatch(
+        auto.arima(y_ts, xreg = x_train, seasonal = FALSE,
+                   stepwise = FALSE, approximation = FALSE),
+        error = function(e) NULL)
+    if (is.null(fit)) { cat("    !! fit failed – skipping\n"); next }
+    
+    sim_paths  <- run_simulations(fit, nsim = n_int,
+                                  xreg_future = x_post, n_sims = N_SIMS)
+    mean_diffs <- apply(sim_paths, 1, function(row) mean(actuals - row))
+    est <- mean(mean_diffs)
+    ci  <- quantile(mean_diffs, c(0.025, 0.975))
+    pv  <- min(ifelse(est >= 0,
+                      mean(mean_diffs < 0) * 2,
+                      mean(mean_diffs > 0) * 2), 1)
+    
+    all_cf[[prov]] <- list(
+        fit        = fit,
+        results    = data.frame(estimate = est, ci_lower = ci[1],
+                                ci_upper = ci[2], p_value = pv),
+        cf_mean    = colMeans(sim_paths),
+        cf_lower   = apply(sim_paths, 2, quantile, 0.025),
+        cf_upper   = apply(sim_paths, 2, quantile, 0.975),
+        fitted_pre = as.numeric(fitted(fit)),
+        pre_data   = pre_data,
+        int_data   = int_data,
+        prov_df    = df
+    )
+    
+    ao <- arimaorder(fit)
+    cat(sprintf("    ARIMA(%d,%d,%d)  est=%+.2f [%.2f, %.2f]  p=%.3f\n",
+                ao[1], ao[2], ao[3], est, ci[1], ci[2], pv))
+}
+
+# ============================================================
+# BUILD ONE SIMPLIFIED PLOT PER PROVINCE
+# ============================================================
+
+make_cf_panel <- function(prov, cf) {
+    pre  <- cf$pre_data
+    intv <- cf$int_data
+    eff  <- cf$results
+    
+    plot_df <- cf$prov_df %>%
+        dplyr::filter(date >= PLOT_START_DATE & date <= PLOT_END_DATE)
+    plot_df$fitted_solid  <- NA_real_
+    plot_df$fitted_dotted <- NA_real_
+    plot_df$cf_lower      <- NA_real_
+    plot_df$cf_upper      <- NA_real_
+    
+    for (i in seq_along(pre$date)) {
+        idx <- which(plot_df$date == pre$date[i])
+        if (length(idx) > 0 && i <= length(cf$fitted_pre) && !is.na(cf$fitted_pre[i]))
+            plot_df$fitted_solid[idx] <- cf$fitted_pre[i]
+    }
+    for (i in seq_along(intv$date)) {
+        idx <- which(plot_df$date == intv$date[i])
+        if (length(idx) > 0) {
+            if (i == 1) {
+                lf <- max(which(!is.na(plot_df$fitted_solid)))
+                if (length(lf) > 0) plot_df$fitted_solid[idx] <- cf$cf_mean[1]
+            }
+            plot_df$fitted_dotted[idx] <- cf$cf_mean[i]
+            plot_df$cf_lower[idx]      <- cf$cf_lower[i]
+            plot_df$cf_upper[idx]      <- cf$cf_upper[i]
+        }
+    }
+    
+    panel_title <- gsub(",.*", "", prov)
+    
+    panel_subtitle <- paste0(
+        "Avg. Effect: ", sprintf("%+.1f", eff$estimate), " pts | ",
+        "95% CI [", sprintf("%.1f", eff$ci_lower), ", ",
+        sprintf("%.1f", eff$ci_upper), "] | ",
+        "p=", sprintf("%.3f", eff$p_value)
+    )
+    
+    ggplot(plot_df, aes(x = date)) +
+        geom_ribbon(aes(ymin = cf_lower, ymax = cf_upper),
+                    fill = "lightpink", alpha = 0.4, na.rm = TRUE) +
+        geom_line(aes(y = food_cpi), color = "black", linewidth = 0.3) +
+        geom_line(aes(y = fitted_solid), color = "red", linewidth = 0.3, na.rm = TRUE) +
+        geom_line(aes(y = fitted_dotted), color = "red",
+                  linetype = "dotted", linewidth = 0.5, na.rm = TRUE) +
+        geom_vline(xintercept = INTERVENTION_START, linetype = "dotted",
+                   color = "darkgreen", linewidth = 0.4) +
+        geom_vline(xintercept = INTERVENTION_END, linetype = "dotted",
+                   color = "darkgreen", linewidth = 0.4) +
+        scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+        labs(title = panel_title, subtitle = panel_subtitle, x = NULL, y = NULL) +
+        theme_minimal(base_size = 8) +
+        theme(
+            plot.title       = element_text(face = "bold", size = 9, hjust = 0.5),
+            plot.subtitle    = element_text(size = 7, hjust = 0.5, color = "gray40"),
+            axis.text.x      = element_text(size = 7),
+            axis.text.y      = element_text(size = 7),
+            axis.ticks       = element_line(linewidth = 0.3),
+            panel.grid.minor = element_blank(),
+            panel.grid.major = element_line(linewidth = 0.2),
+            plot.margin      = margin(3, 5, 3, 5)
+        )
+}
+
+# ---- Create named plot objects ----
+
+province_plots <- list()
+
+for (prov in names(all_cf)) {
+    clean_name <- tolower(gsub("[^A-Za-z]", "_", gsub(",.*", "", prov)))
+    clean_name <- gsub("_+", "_", clean_name)
+    clean_name <- gsub("^_|_$", "", clean_name)
+    plot_name  <- paste0(clean_name, "_plot")
+    
+    p <- make_cf_panel(prov, all_cf[[prov]])
+    
+    assign(plot_name, p, envir = .GlobalEnv)
+    province_plots[[plot_name]] <- p
+    
+    cat(paste0("  Created: ", plot_name, "\n"))
+}
+
+# ============================================================
+# ARRANGE ALL ON ONE PAGE
+# ============================================================
+
+n     <- length(province_plots)
+ncols <- ceiling(sqrt(n))
+nrows <- ceiling(n / ncols)
+
+grid.arrange(
+    grobs  = province_plots,
+    ncol   = ncols,
+    nrow   = nrows,
+    top    = textGrob(
+        paste0(
+            "Counterfactual Analysis: Estimated Grocery Rebate Association with Food CPI\n",
+            "Effect in index points | ", INTERVENTION_LABEL
+        ),
+        gp = gpar(fontsize = 11, fontface = "bold")
+    ),
+    bottom = textGrob(
+        DATA_SOURCE,
+        gp = gpar(fontsize = 8, col = "gray40"),
+        hjust = 1, x = 1
+    )
+)
