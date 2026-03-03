@@ -210,4 +210,210 @@ gtsave(gt_ca, filename = "lit_review_canada_ppt.html")
 cat("Done! See lit_review_canada_ppt.html\n")
 
 # Preview:
-# gt_ca
+ gt_ca
+#####################################
+library(gt)
+library(dplyr)
+library(tibble)
+
+# ============================================================
+# Data Sources Summary Table — Condensed
+# ============================================================
+
+freq_label <- "(Monthly) Jan 2017 \u2013 present"
+
+sources <- tribble(
+    ~Variable,                              ~Source,                                     ~Link,                                                                    ~Description,                                                                                                                          ~Geography,                          ~Role,        ~Units,                  ~Frequency,
+    
+    "Food CPI",
+    "Statistics Canada (Table 18-10-0004)",
+    "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810000401",
+    paste0(
+        "\u2022 Consumer Price Index for food, not seasonally adjusted<br>",
+        "\u2022 Base period 2002 = 100"
+    ),
+    "Canada (provincial & national)", "Response", "Index", freq_label,
+    
+    "Core CPI & Energy CPI",
+    "Statistics Canada (Table 18-10-0004)",
+    "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810000401",
+    paste0(
+        "\u2022 Core CPI: all items excluding food and energy<br>",
+        "\u2022 Energy CPI: gasoline, natural gas, electricity, and fuel oil<br>",
+        "\u2022 Both not seasonally adjusted, base period 2002 = 100"
+    ),
+    "Canada (provincial & national)", "Predictor", "Index", freq_label,
+    
+    "Provincial Food Imports",
+    "Statistics Canada (Table 12-10-0175)",
+    "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1210017501",
+    paste0(
+        "\u2022 International merchandise imports of farm, fishing, and intermediate food products (NAPCS C11) by province<br>",
+        "\u2022 Reported for all countries, the United States, and non-U.S. partners<br>",
+        "\u2022 Based on province of clearance (where goods cleared customs), which may differ from the province where goods are ultimately consumed"
+    ),
+    "Canada (provincial & national)", "Predictor", "Dollars / Percent", freq_label,
+    
+    "U.S. Food-at-Home CPI",
+    "U.S. Bureau of Labor Statistics via FRED",
+    "https://fred.stlouisfed.org/series/CUSR0000SAF11",
+    paste0(
+        "\u2022 CPI for All Urban Consumers: Food at Home (series CUSR0000SAF11)<br>",
+        "\u2022 Not seasonally adjusted, base period 1982\u20131984 = 100<br>",
+        "\u2022 Proxies food-price pressures originating in the U.S. market"
+    ),
+    "USA (national only)", "Predictor", "Index", freq_label,
+    
+    "U.S. Core CPI",
+    "U.S. Bureau of Labor Statistics via FRED",
+    "https://fred.stlouisfed.org/series/CPILFESL",
+    paste0(
+        "\u2022 CPI for All Urban Consumers: All Items Less Food and Energy (series CPILFESL)<br>",
+        "\u2022 Seasonally adjusted, base period 1982\u20131984 = 100<br>",
+        "\u2022 Controls for broad U.S. inflationary conditions"
+    ),
+    "USA (national only)", "Predictor", "Index", freq_label,
+    
+    "USD/CAD Exchange Rate",
+    "Bank of Canada",
+    "https://www.bankofcanada.ca/rates/exchange/monthly-exchange-rates/",
+    paste0(
+        "\u2022 Monthly average nominal exchange rate (series FXMUSDCAD)<br>",
+        "\u2022 Canadian dollars per U.S. dollar<br>",
+        "\u2022 A weaker CAD raises the domestic cost of imported food priced in USD"
+    ),
+    "USA / Canada (national only)", "Predictor", "CAD per USD", freq_label,
+    
+    "FAO Food Price Index",
+    "Food and Agriculture Organization (FAO)",
+    "https://www.fao.org/worldfoodsituation/foodpricesindex/en/",
+    paste0(
+        "\u2022 Composite index of international food commodity prices (cereals, oils, dairy, meat, sugar)<br>",
+        "\u2022 Base period 2014\u20132016 = 100<br>",
+        "\u2022 Captures global supply-and-demand shocks"
+    ),
+    "Global (international only)", "Predictor", "Index", freq_label
+)
+
+
+# ============================================================
+# Build gt Table
+# ============================================================
+
+gt_sources <- sources %>%
+    mutate(
+        Source = paste0(
+            "<a href='", Link, "' target='_blank' style='color:#2A6496; text-decoration:none;'>",
+            Source, "</a>"
+        )
+    ) %>%
+    select(-Link) %>%
+    gt() %>%
+    
+    # ── Header ──
+    tab_header(
+        title    = md("**Data Sources: Determinants of Canadian Food CPI**"),
+        subtitle = md("*Panel dataset \u2014 10 provinces + Canada aggregate (11 geographies), January 2017 onward*")
+    ) %>%
+    
+    # ── Column Labels ──
+    cols_label(
+        Variable    = md("**Variable**"),
+        Source      = md("**Source**"),
+        Description = md("**Description**"),
+        Geography   = md("**Geography**"),
+        Role        = md("**Role**"),
+        Units       = md("**Units**"),
+        Frequency   = md("**Frequency**")
+    ) %>%
+    
+    # ── Column Widths ──
+    cols_width(
+        Variable    ~ px(140),
+        Source      ~ px(155),
+        Description ~ px(290),
+        Geography   ~ px(105),
+        Role        ~ px(68),
+        Units       ~ px(85),
+        Frequency   ~ px(105)
+    ) %>%
+    
+    # ── Render HTML in Source & Description ──
+    fmt_markdown(columns = c(Source, Description)) %>%
+    
+    # ── Column Header Styling (dark navy, white text) ──
+    tab_style(
+        style = list(
+            cell_fill(color = "#1B3A5C"),
+            cell_text(color = "white", weight = "bold", size = px(11))
+        ),
+        locations = cells_column_labels()
+    ) %>%
+    
+    # ── Title Styling ──
+    tab_style(
+        style = cell_text(size = px(16), weight = "bold"),
+        locations = cells_title(groups = "title")
+    ) %>%
+    tab_style(
+        style = cell_text(size = px(11), color = "grey40"),
+        locations = cells_title(groups = "subtitle")
+    ) %>%
+    
+    # ── Body Text ──
+    tab_style(
+        style = cell_text(size = px(10.5)),
+        locations = cells_body()
+    ) %>%
+    
+    # ── Variable name column: bold ──
+    tab_style(
+        style = cell_text(weight = "bold", size = px(10.5)),
+        locations = cells_body(columns = Variable)
+    ) %>%
+    
+    # ── Alignment ──
+    cols_align(align = "center", columns = c(Geography, Role, Units, Frequency)) %>%
+    cols_align(align = "left",   columns = c(Variable, Source, Description)) %>%
+    
+    # ── Subtle row borders ──
+    tab_style(
+        style = cell_borders(sides = "bottom", color = "#E0E0E0", weight = px(1)),
+        locations = cells_body()
+    ) %>%
+    
+    # ── Alternating row stripes ──
+    opt_row_striping() %>%
+    
+    # ── Source Note ──
+    tab_source_note(
+        source_note = md(
+            "**Response variable:** Food CPI. All other variables serve as predictors."
+        )
+    ) %>%
+    
+    # ── Global Table Options ──
+    tab_options(
+        table.font.names              = "Arial",
+        table.font.size               = px(10.5),
+        heading.align                 = "left",
+        column_labels.padding         = px(8),
+        data_row.padding              = px(7),
+        table.border.top.color        = "#1B3A5C",
+        table.border.top.width        = px(3),
+        table.border.bottom.color     = "#1B3A5C",
+        table.border.bottom.width     = px(2),
+        source_notes.font.size        = px(10)
+    )
+
+
+# ============================================================
+# Save as HTML
+# ============================================================
+
+gtsave(gt_sources, filename = "data_sources_table.html")
+
+cat("Done! See data_sources_table.html\n")
+
+# Preview in RStudio:
+gt_sources
