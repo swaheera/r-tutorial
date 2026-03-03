@@ -216,6 +216,10 @@ library(gt)
 library(dplyr)
 library(tibble)
 
+library(gt)
+library(dplyr)
+library(tibble)
+
 # ============================================================
 # Data Sources Summary Table — Condensed
 # ============================================================
@@ -223,9 +227,9 @@ library(tibble)
 freq_label <- "(Monthly) Jan 2017 \u2013 present"
 
 sources <- tribble(
-    ~Variable,                              ~Source,                                     ~Link,                                                                    ~Description,                                                                                                                          ~Geography,                          ~Role,        ~Units,                  ~Frequency,
+    ~Variable,                              ~Source,                                     ~Link,                                                                    ~Description,                                                                                                                          ~Geography,                          ~Role,        ~Units,                  ~Frequency,  ~Rationale,
     
-    "Food CPI",
+    "Canada Food CPI",
     "Statistics Canada (Table 18-10-0004)",
     "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810000401",
     paste0(
@@ -233,8 +237,9 @@ sources <- tribble(
         "\u2022 Base period 2002 = 100"
     ),
     "Canada (provincial & national)", "Response", "Index", freq_label,
+    "The outcome we aim to explain. Tracks changes in the price of food purchased from stores across Canadian provinces.",
     
-    "Core CPI & Energy CPI",
+    "Lagged (1\u20136 mo.) Core CPI & Energy CPI",
     "Statistics Canada (Table 18-10-0004)",
     "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810000401",
     paste0(
@@ -243,8 +248,9 @@ sources <- tribble(
         "\u2022 Both not seasonally adjusted, base period 2002 = 100"
     ),
     "Canada (provincial & national)", "Predictor", "Index", freq_label,
+    "Core CPI controls for broad domestic inflationary pressures (e.g. wages, rent) that also affect food supply chains. Energy CPI captures fuel and electricity costs that directly raise transportation, refrigeration, and processing costs for food.",
     
-    "Provincial Food Imports",
+    "Lagged (1\u20136 mo.) Provincial Food Imports (proxy)",
     "Statistics Canada (Table 12-10-0175)",
     "https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1210017501",
     paste0(
@@ -253,8 +259,9 @@ sources <- tribble(
         "\u2022 Based on province of clearance (where goods cleared customs), which may differ from the province where goods are ultimately consumed"
     ),
     "Canada (provincial & national)", "Predictor", "Dollars / Percent", freq_label,
+    "Proxies provincial exposure to imported food costs. Provinces more reliant on imports may be more sensitive to exchange rate swings and global price shocks. Province of clearance is an imperfect but readily available measure of regional import dependence.",
     
-    "U.S. Food-at-Home CPI",
+    "Lagged (1\u20136 mo.) U.S. Food-at-Home CPI",
     "U.S. Bureau of Labor Statistics via FRED",
     "https://fred.stlouisfed.org/series/CUSR0000SAF11",
     paste0(
@@ -263,8 +270,9 @@ sources <- tribble(
         "\u2022 Proxies food-price pressures originating in the U.S. market"
     ),
     "USA (national only)", "Predictor", "Index", freq_label,
+    "The U.S. is Canada’s largest food trading partner. Rising U.S. grocery prices signal higher input and wholesale costs that tend to pass through to Canadian retailers with a lag.",
     
-    "U.S. Core CPI",
+    "Lagged (1\u20136 mo.) U.S. Core CPI",
     "U.S. Bureau of Labor Statistics via FRED",
     "https://fred.stlouisfed.org/series/CPILFESL",
     paste0(
@@ -273,8 +281,9 @@ sources <- tribble(
         "\u2022 Controls for broad U.S. inflationary conditions"
     ),
     "USA (national only)", "Predictor", "Index", freq_label,
+    "Controls for general U.S. inflation so that the U.S. Food CPI variable isolates food-specific pressures rather than economy-wide price trends spilling over from the United States.",
     
-    "USD/CAD Exchange Rate",
+    "Lagged (1\u20136 mo.) USD/CAD Exchange Rate",
     "Bank of Canada",
     "https://www.bankofcanada.ca/rates/exchange/monthly-exchange-rates/",
     paste0(
@@ -283,8 +292,9 @@ sources <- tribble(
         "\u2022 A weaker CAD raises the domestic cost of imported food priced in USD"
     ),
     "USA / Canada (national only)", "Predictor", "CAD per USD", freq_label,
+    "A weaker Canadian dollar makes imports more expensive. Because Canada imports a large share of its food (especially fruits, vegetables, and processed goods), exchange rate movements directly affect grocery shelf prices.",
     
-    "FAO Food Price Index",
+    "Lagged (1\u20136 mo.) FAO Food Price Index",
     "Food and Agriculture Organization (FAO)",
     "https://www.fao.org/worldfoodsituation/foodpricesindex/en/",
     paste0(
@@ -292,7 +302,8 @@ sources <- tribble(
         "\u2022 Base period 2014\u20132016 = 100<br>",
         "\u2022 Captures global supply-and-demand shocks"
     ),
-    "Global (international only)", "Predictor", "Index", freq_label
+    "Global (international only)", "Predictor", "Index", freq_label,
+    "Captures global commodity shocks (e.g. droughts, conflicts, export bans) that raise the cost of raw ingredients worldwide. These shocks feed into Canadian food prices through import channels and global supply chains."
 )
 
 
@@ -324,18 +335,20 @@ gt_sources <- sources %>%
         Geography   = md("**Geography**"),
         Role        = md("**Role**"),
         Units       = md("**Units**"),
-        Frequency   = md("**Frequency**")
+        Frequency   = md("**Frequency**"),
+        Rationale   = md("**Rationale**")
     ) %>%
     
     # ── Column Widths ──
     cols_width(
         Variable    ~ px(140),
-        Source      ~ px(155),
-        Description ~ px(290),
-        Geography   ~ px(105),
+        Source      ~ px(145),
+        Description ~ px(250),
+        Geography   ~ px(95),
         Role        ~ px(68),
         Units       ~ px(85),
-        Frequency   ~ px(105)
+        Frequency   ~ px(95),
+        Rationale   ~ px(230)
     ) %>%
     
     # ── Render HTML in Source & Description ──
@@ -374,7 +387,7 @@ gt_sources <- sources %>%
     
     # ── Alignment ──
     cols_align(align = "center", columns = c(Geography, Role, Units, Frequency)) %>%
-    cols_align(align = "left",   columns = c(Variable, Source, Description)) %>%
+    cols_align(align = "left",   columns = c(Variable, Source, Description, Rationale)) %>%
     
     # ── Subtle row borders ──
     tab_style(
@@ -388,7 +401,7 @@ gt_sources <- sources %>%
     # ── Source Note ──
     tab_source_note(
         source_note = md(
-            "**Response variable:** Food CPI. All other variables serve as predictors."
+            "**Response variable:** Canada Food CPI. All predictors are lagged 1\u20136 months."
         )
     ) %>%
     
@@ -416,4 +429,4 @@ gtsave(gt_sources, filename = "data_sources_table.html")
 cat("Done! See data_sources_table.html\n")
 
 # Preview in RStudio:
-gt_sources
+# gt_sources
