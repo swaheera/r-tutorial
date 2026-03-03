@@ -1,0 +1,213 @@
+# =============================================================================
+# Literature Review — Canada (PowerPoint-Ready, Top 6 Studies)
+# =============================================================================
+# install.packages(c("gt", "dplyr"))
+
+library(gt)
+library(dplyr)
+
+# ---- 1. HAND-CRAFTED DATA (simplified from xlsx) ----------------------------
+# Keeping text concise and plain-language for slide readability
+
+tbl <- tibble::tribble(
+    ~study, ~method_data, ~variables, ~findings,
+    
+    # 1
+    paste0(
+        "**1) Variations in Pass-Through from Global Ag Commodity Prices to Food Inflation**<br>",
+        "Hyun & Lee (2023)<br>",
+        "[Link](https://www.bankofcanada.ca/2023/10/staff-discussion-paper-2023-24/)"
+    ),
+    paste0(
+        "\u2022 Panel regressions with interaction terms across 53 countries<br>",
+        "\u2022 Monthly FAO commodity indices & national food CPI, ~2000\u20132022 (public)<br>",
+        "\u2022 **Lags: Yes** \u2014 lagged commodity prices used as regressors"
+    ),
+    paste0(
+        "\u2022 Response: Food CPI inflation (y-o-y)<br>",
+        "\u2022 Predictors: Global ag commodity prices, local crop conditions, food industry development, net trade status"
+    ),
+    "When global commodity prices rise, countries feel the impact differently. Countries with strong local harvests or more developed food industries see smaller grocery price increases, while net food exporters see larger increases because producers redirect supply to take advantage of higher world prices.",
+    
+    
+    # 2
+    paste0(
+        "**2) Understanding the Resurgence of Food Inflation in 2025**<br>",
+        "Bank of Canada (2026)<br>",
+        "[Link](https://www.bankofcanada.ca/2026/02/understanding-the-resurgence-of-food-inflation-in-2025/)"
+    ),
+    paste0(
+        "\u2022 Supply-chain cost decomposition into 8 cost categories<br>",
+        "\u2022 StatCan supply-use tables & CPI food, 2020\u20132025 (public)<br>",
+        "\u2022 **Lags: Yes** \u2014 6\u20139 month lag confirmed from costs to retail food prices"
+    ),
+    paste0(
+        "\u2022 Response: Food CPI (food at stores, y-o-y)<br>",
+        "\u2022 Predictors: Imports, energy, labour, domestic goods, taxes, trade margins"
+    ),
+    "2025 food inflation driven by import costs (CAD depreciation). During COVID, pressures were broad-based (energy, freight, wages). Labour cost declines partially offset other pressures.",
+    
+    
+    # 3
+    paste0(
+        "**3) Canadian Food Inflation: International Dynamics and Local Agency**<br>",
+        "Nu\u00f1o-Ledesma (2023)<br>",
+        "[Link](https://onlinelibrary.wiley.com/doi/10.1111/cjag.12341)"
+    ),
+    paste0(
+        "\u2022 Descriptive/narrative analysis with graphical comparisons<br>",
+        "\u2022 StatCan CPI, FAO index, Bank of Canada data, 2019\u20132023 (public)<br>",
+        "\u2022 **Lags: No** \u2014 timing discussed qualitatively only"
+    ),
+    paste0(
+        "\u2022 Response: Food CPI (descriptive)<br>",
+        "\u2022 Predictors: Global commodity shocks, grocery concentration, carbon tax, minimum wage, interest rates"
+    ),
+    "Food inflation shaped by both global dynamics (conflicts, commodity surges) and domestic factors (grocery concentration, policy costs). Competition helps but large price drops are unrealistic for a small open economy.",
+    
+    
+    # 4
+    paste0(
+        "**4) Behind the Numbers: What\u2019s Causing Growth in Food Prices**<br>",
+        "Fradella / Statistics Canada (2022)<br>",
+        "[Link](https://www150.statcan.gc.ca/n1/pub/62f0014m/62f0014m2022014-eng.htm)"
+    ),
+    paste0(
+        "\u2022 Descriptive breakdown of CPI food sub-components<br>",
+        "\u2022 StatCan CPI, producer prices & trade data, 2019\u20132022 (public)<br>",
+        "\u2022 **Lags: No** \u2014 temporal sequencing noted but not modeled"
+    ),
+    paste0(
+        "\u2022 Response: Food CPI sub-components (y-o-y %)<br>",
+        "\u2022 Predictors: Supply disruptions, labour shortages, weather, trade tariffs, input costs, wages"
+    ),
+    "Multiple factors hit simultaneously: supply disruptions, labour shortages, poor weather, conflict-related tariffs, rising input costs. Breadth of pressures was unprecedented.",
+    
+    
+    # 5
+    paste0(
+        "**5) Import Prices and Inflation in Canada**<br>",
+        "Wang / Statistics Canada (2023)<br>",
+        "[Link](https://www150.statcan.gc.ca/n1/pub/36-28-0001/2023006/article/00002-eng.htm)"
+    ),
+    paste0(
+        "\u2022 Inflation decomposition into domestic vs import components<br>",
+        "\u2022 StatCan National Accounts, trade & import price data, quarterly 2012\u20132022 (public)<br>",
+        "\u2022 **Lags: Partial** \u2014 exchange rate \u2192 import price co-movement documented but not formally tested"
+    ),
+    paste0(
+        "\u2022 Response: Final domestic demand inflation<br>",
+        "\u2022 Predictors: Import prices, CAD/USD exchange rate, GDP, exports"
+    ),
+    "Import prices drove ~50% of domestic inflation by end 2022. CAD fell 10.6% vs USD while import prices rose 19.4%. Mainly through intermediate & capital goods, not direct consumer imports.",
+    
+    
+    # 6
+    paste0(
+        "**6) From Farms to Tables: Effect of Emissions Pricing on Food Prices**<br>",
+        "Tombe, Fellows & Winter (2025)<br>",
+        "[Link](https://onlinelibrary.wiley.com/doi/10.1111/cjag.12383)"
+    ),
+    paste0(
+        "\u2022 Input-output model tracing carbon costs through the supply chain<br>",
+        "\u2022 StatCan IO tables, farm input prices & GHG data, 2005\u20132024 (public)<br>",
+        "\u2022 **Lags: Yes** \u2014 farm input prices lagged 6 months explain ~\u2154 of grocery price variation"
+    ),
+    paste0(
+        "\u2022 Response: Cost of domestically produced food<br>",
+        "\u2022 Predictors: Carbon price ($/tonne), emissions by sector, fertilizer & fuel costs"
+    ),
+    "Carbon pricing at $80/tonne raises food costs by ~0.8% (domestic) or ~0.5% (including imports). Fertilizer and fuel are the main channels. Fertilizer surges during global conflicts were the dominant historical driver."
+)
+
+
+# ---- 2. BUILD GT TABLE ------------------------------------------------------
+
+gt_ca <- tbl %>%
+    gt() %>%
+    
+    tab_header(
+        title    = md("**Literature Review: Factors Affecting Food CPI in Canada**"),
+        subtitle = md("*Selected applied studies*")
+    ) %>%
+    
+    cols_label(
+        study       = md("**Study**"),
+        method_data = md("**Methodology & Data**"),
+        variables   = md("**Variables**"),
+        findings    = md("**Key Findings**")
+    ) %>%
+    
+    cols_width(
+        study       ~ px(200),
+        method_data ~ px(260),
+        variables   ~ px(200),
+        findings    ~ px(260)
+    ) %>%
+    
+    fmt_markdown(columns = c(study, method_data, variables)) %>%
+    
+    # ── Header style ──
+    tab_style(
+        style = list(
+            cell_fill(color = "#1B3A5C"),
+            cell_text(color = "white", weight = "bold", size = px(11))
+        ),
+        locations = cells_column_labels()
+    ) %>%
+    
+    # ── Title ──
+    tab_style(
+        style = cell_text(size = px(15)),
+        locations = cells_title(groups = "title")
+    ) %>%
+    tab_style(
+        style = cell_text(size = px(11), color = "grey40"),
+        locations = cells_title(groups = "subtitle")
+    ) %>%
+    
+    # ── Body ──
+    tab_style(
+        style = cell_text(size = px(9)),
+        locations = cells_body()
+    ) %>%
+    
+    # ── Bold the "Lags:" keyword in method_data column ──
+    # (already handled via markdown **Lags: Yes/No**)
+    
+    opt_row_striping() %>%
+    
+    tab_style(
+        style = cell_borders(sides = "bottom", color = "#E0E0E0", weight = px(1)),
+        locations = cells_body()
+    ) %>%
+    
+    tab_options(
+        table.font.names          = "Arial",
+        table.font.size           = px(9),
+        heading.align             = "left",
+        column_labels.padding     = px(6),
+        data_row.padding          = px(5),
+        table.border.top.color    = "#1B3A5C",
+        table.border.top.width    = px(3),
+        table.border.bottom.color = "#1B3A5C",
+        table.border.bottom.width = px(2)
+    ) %>%
+    
+    tab_source_note(
+        source_note = md(
+            "**Response** = outcome variable; **Predictors** = explanatory variables."
+        )
+    )
+
+# ---- 3. SAVE ----------------------------------------------------------------
+
+gtsave(gt_ca, filename = "lit_review_canada_ppt.html")
+
+# PNG for direct PowerPoint insertion (uncomment, needs webshot2):
+# gtsave(gt_ca, filename = "lit_review_canada_ppt.png", vwidth = 1200)
+
+cat("Done! See lit_review_canada_ppt.html\n")
+
+# Preview:
+# gt_ca
