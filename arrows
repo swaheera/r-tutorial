@@ -1,0 +1,425 @@
+library(DiagrammeR)
+library(htmlwidgets)
+
+grn <- '#66BB6A'
+red <- '#EF5350'
+nvy <- '#1B3A5C'
+gry <- '#BBBBBB'
+
+p1 <- grViz(paste0("
+digraph lag_grid {
+
+  graph [
+    rankdir  = TB,
+    fontname = 'Arial',
+    bgcolor  = 'white',
+    nodesep  = 0.50,
+    ranksep  = 0.40,
+    margin   = 0.3,
+    splines  = ortho
+  ]
+
+  node [
+    fontname = 'Arial',
+    fontsize = 9,
+    style    = 'filled,rounded',
+    shape    = box,
+    width    = 1.15,
+    height   = 0.40,
+    penwidth = 0
+  ]
+
+  node [shape = plaintext, fillcolor = 'white', fontsize = 12,
+        fontcolor = '", nvy, "', fontname = 'Arial Bold', width = 1.15]
+
+  hdr_usd  [label = 'USD/CAD\\nExchange Rate']
+  hdr_usc  [label = 'U.S. Core\\nCPI']
+  hdr_imp  [label = 'U.S. Food\\nImports']
+  hdr_fao  [label = 'FAO Food\\nPrice Index']
+  hdr_ecpi [label = 'Canada\\nEnergy CPI']
+  hdr_nfne [label = 'Canada\\nCore CPI']
+
+  { rank = same; hdr_usd; hdr_usc; hdr_imp; hdr_fao; hdr_ecpi; hdr_nfne }
+  edge [style = invis]
+  hdr_usd -> hdr_usc -> hdr_imp -> hdr_fao -> hdr_ecpi -> hdr_nfne
+
+  node [shape = box, fontsize = 9, fontcolor = 'white',
+        fontname = 'Arial', width = 1.15, height = 0.40]
+
+  r1_a [label = '6 months ago', fillcolor = '", red, "']
+  r1_b [label = '6 months ago', fillcolor = '", red, "']
+  r1_c [label = '6 months ago', fillcolor = '", red, "']
+  r1_d [label = '6 months ago', fillcolor = '", red, "']
+  r1_e [label = '6 months ago', fillcolor = '", red, "']
+  r1_f [label = '6 months ago', fillcolor = '", red, "']
+
+  { rank = same; r1_a; r1_b; r1_c; r1_d; r1_e; r1_f }
+  edge [style = invis]
+  r1_a -> r1_b -> r1_c -> r1_d -> r1_e -> r1_f
+
+  r2_a [label = '5 months ago', fillcolor = '", red, "']
+  r2_b [label = '5 months ago', fillcolor = '", red, "']
+  r2_c [label = '5 months ago', fillcolor = '", red, "']
+  r2_d [label = '5 months ago', fillcolor = '", red, "']
+  r2_e [label = '5 months ago', fillcolor = '", red, "']
+  r2_f [label = '5 months ago', fillcolor = '", red, "']
+
+  { rank = same; r2_a; r2_b; r2_c; r2_d; r2_e; r2_f }
+  edge [style = invis]
+  r2_a -> r2_b -> r2_c -> r2_d -> r2_e -> r2_f
+
+  r3_a [label = '4 months ago', fillcolor = '", red, "']
+  r3_b [label = '4 months ago', fillcolor = '", grn, "']
+  r3_c [label = '4 months ago', fillcolor = '", red, "']
+  r3_d [label = '4 months ago', fillcolor = '", red, "']
+  r3_e [label = '4 months ago', fillcolor = '", red, "']
+  r3_f [label = '4 months ago', fillcolor = '", red, "']
+
+  { rank = same; r3_a; r3_b; r3_c; r3_d; r3_e; r3_f }
+  edge [style = invis]
+  r3_a -> r3_b -> r3_c -> r3_d -> r3_e -> r3_f
+
+  r4_a [label = '3 months ago', fillcolor = '", red, "']
+  r4_b [label = '3 months ago', fillcolor = '", red, "']
+  r4_c [label = '3 months ago', fillcolor = '", red, "']
+  r4_d [label = '3 months ago', fillcolor = '", red, "']
+  r4_e [label = '3 months ago', fillcolor = '", red, "']
+  r4_f [label = '3 months ago', fillcolor = '", red, "']
+
+  { rank = same; r4_a; r4_b; r4_c; r4_d; r4_e; r4_f }
+  edge [style = invis]
+  r4_a -> r4_b -> r4_c -> r4_d -> r4_e -> r4_f
+
+  r5_a [label = '2 months ago', fillcolor = '", grn, "']
+  r5_b [label = '2 months ago', fillcolor = '", grn, "']
+  r5_c [label = '2 months ago', fillcolor = '", grn, "']
+  r5_d [label = '2 months ago', fillcolor = '", red, "']
+  r5_e [label = '2 months ago', fillcolor = '", red, "']
+  r5_f [label = '2 months ago', fillcolor = '", red, "']
+
+  { rank = same; r5_a; r5_b; r5_c; r5_d; r5_e; r5_f }
+  edge [style = invis]
+  r5_a -> r5_b -> r5_c -> r5_d -> r5_e -> r5_f
+
+  r6_a [label = '1 month ago', fillcolor = '", red, "']
+  r6_b [label = '1 month ago', fillcolor = '", red, "']
+  r6_c [label = '1 month ago', fillcolor = '", red, "']
+  r6_d [label = '1 month ago', fillcolor = '", red, "']
+  r6_e [label = '1 month ago', fillcolor = '", red, "']
+  r6_f [label = '1 month ago', fillcolor = '", red, "']
+
+  { rank = same; r6_a; r6_b; r6_c; r6_d; r6_e; r6_f }
+  edge [style = invis]
+  r6_a -> r6_b -> r6_c -> r6_d -> r6_e -> r6_f
+
+  r7_a [label = '', style = invis, width = 1.15]
+  r7_b [label = '', style = invis, width = 1.15]
+  r7_c [label = '', style = invis, width = 1.15]
+  r7_blue [label = 'Canada\\nFood CPI\\nToday', fillcolor = '", nvy, "', fontcolor = 'white']
+  r7_d [label = '', style = invis, width = 1.15]
+  r7_e [label = '', style = invis, width = 1.15]
+  r7_f [label = '', style = invis, width = 1.15]
+
+  { rank = same; r7_a; r7_b; r7_c; r7_blue; r7_d; r7_e; r7_f }
+  edge [style = invis]
+  r7_a -> r7_b -> r7_c -> r7_blue -> r7_d -> r7_e -> r7_f
+
+  edge [style = solid, color = '", gry, "', penwidth = 1.0,
+        arrowsize = 0.5, arrowhead = vee]
+
+  r1_a -> r2_a -> r3_a -> r4_a -> r5_a -> r6_a
+  r1_b -> r2_b -> r3_b -> r4_b -> r5_b -> r6_b
+  r1_c -> r2_c -> r3_c -> r4_c -> r5_c -> r6_c
+  r1_d -> r2_d -> r3_d -> r4_d -> r5_d -> r6_d
+  r1_e -> r2_e -> r3_e -> r4_e -> r5_e -> r6_e
+  r1_f -> r2_f -> r3_f -> r4_f -> r5_f -> r6_f
+
+  edge [style = invis]
+  hdr_usd -> r1_a -> r2_a -> r3_a -> r4_a -> r5_a -> r6_a -> r7_a
+
+}
+"))
+
+saveWidget(p1, "plot1_hardcoded.html", selfcontained = TRUE)
+
+
+set.seed(Sys.time())
+rand_color <- function() sample(c(grn, red), 1)
+colors <- matrix(sapply(1:36, function(x) rand_color()), nrow = 6, ncol = 6, byrow = TRUE)
+
+p2 <- grViz(paste0("
+digraph lag_grid {
+
+  graph [
+    rankdir  = TB,
+    fontname = 'Arial',
+    bgcolor  = 'white',
+    nodesep  = 0.50,
+    ranksep  = 0.40,
+    margin   = 0.3,
+    splines  = ortho
+  ]
+
+  node [
+    fontname = 'Arial',
+    fontsize = 9,
+    style    = 'filled,rounded',
+    shape    = box,
+    width    = 1.15,
+    height   = 0.40,
+    penwidth = 0
+  ]
+
+  node [shape = plaintext, fillcolor = 'white', fontsize = 12,
+        fontcolor = '", nvy, "', fontname = 'Arial Bold', width = 1.15]
+
+  hdr_usd  [label = 'USD/CAD\\nExchange Rate']
+  hdr_usc  [label = 'U.S. Core\\nCPI']
+  hdr_imp  [label = 'U.S. Food\\nImports']
+  hdr_fao  [label = 'FAO Food\\nPrice Index']
+  hdr_ecpi [label = 'Canada\\nEnergy CPI']
+  hdr_nfne [label = 'Canada\\nCore CPI']
+
+  { rank = same; hdr_usd; hdr_usc; hdr_imp; hdr_fao; hdr_ecpi; hdr_nfne }
+  edge [style = invis]
+  hdr_usd -> hdr_usc -> hdr_imp -> hdr_fao -> hdr_ecpi -> hdr_nfne
+
+  node [shape = box, fontsize = 9, fontcolor = 'white',
+        fontname = 'Arial', width = 1.15, height = 0.40]
+
+  r1_a [label = '6 months ago', fillcolor = '", colors[1,1], "']
+  r1_b [label = '6 months ago', fillcolor = '", colors[1,2], "']
+  r1_c [label = '6 months ago', fillcolor = '", colors[1,3], "']
+  r1_d [label = '6 months ago', fillcolor = '", colors[1,4], "']
+  r1_e [label = '6 months ago', fillcolor = '", colors[1,5], "']
+  r1_f [label = '6 months ago', fillcolor = '", colors[1,6], "']
+
+  { rank = same; r1_a; r1_b; r1_c; r1_d; r1_e; r1_f }
+  edge [style = invis]
+  r1_a -> r1_b -> r1_c -> r1_d -> r1_e -> r1_f
+
+  r2_a [label = '5 months ago', fillcolor = '", colors[2,1], "']
+  r2_b [label = '5 months ago', fillcolor = '", colors[2,2], "']
+  r2_c [label = '5 months ago', fillcolor = '", colors[2,3], "']
+  r2_d [label = '5 months ago', fillcolor = '", colors[2,4], "']
+  r2_e [label = '5 months ago', fillcolor = '", colors[2,5], "']
+  r2_f [label = '5 months ago', fillcolor = '", colors[2,6], "']
+
+  { rank = same; r2_a; r2_b; r2_c; r2_d; r2_e; r2_f }
+  edge [style = invis]
+  r2_a -> r2_b -> r2_c -> r2_d -> r2_e -> r2_f
+
+  r3_a [label = '4 months ago', fillcolor = '", colors[3,1], "']
+  r3_b [label = '4 months ago', fillcolor = '", colors[3,2], "']
+  r3_c [label = '4 months ago', fillcolor = '", colors[3,3], "']
+  r3_d [label = '4 months ago', fillcolor = '", colors[3,4], "']
+  r3_e [label = '4 months ago', fillcolor = '", colors[3,5], "']
+  r3_f [label = '4 months ago', fillcolor = '", colors[3,6], "']
+
+  { rank = same; r3_a; r3_b; r3_c; r3_d; r3_e; r3_f }
+  edge [style = invis]
+  r3_a -> r3_b -> r3_c -> r3_d -> r3_e -> r3_f
+
+  r4_a [label = '3 months ago', fillcolor = '", colors[4,1], "']
+  r4_b [label = '3 months ago', fillcolor = '", colors[4,2], "']
+  r4_c [label = '3 months ago', fillcolor = '", colors[4,3], "']
+  r4_d [label = '3 months ago', fillcolor = '", colors[4,4], "']
+  r4_e [label = '3 months ago', fillcolor = '", colors[4,5], "']
+  r4_f [label = '3 months ago', fillcolor = '", colors[4,6], "']
+
+  { rank = same; r4_a; r4_b; r4_c; r4_d; r4_e; r4_f }
+  edge [style = invis]
+  r4_a -> r4_b -> r4_c -> r4_d -> r4_e -> r4_f
+
+  r5_a [label = '2 months ago', fillcolor = '", colors[5,1], "']
+  r5_b [label = '2 months ago', fillcolor = '", colors[5,2], "']
+  r5_c [label = '2 months ago', fillcolor = '", colors[5,3], "']
+  r5_d [label = '2 months ago', fillcolor = '", colors[5,4], "']
+  r5_e [label = '2 months ago', fillcolor = '", colors[5,5], "']
+  r5_f [label = '2 months ago', fillcolor = '", colors[5,6], "']
+
+  { rank = same; r5_a; r5_b; r5_c; r5_d; r5_e; r5_f }
+  edge [style = invis]
+  r5_a -> r5_b -> r5_c -> r5_d -> r5_e -> r5_f
+
+  r6_a [label = '1 month ago', fillcolor = '", colors[6,1], "']
+  r6_b [label = '1 month ago', fillcolor = '", colors[6,2], "']
+  r6_c [label = '1 month ago', fillcolor = '", colors[6,3], "']
+  r6_d [label = '1 month ago', fillcolor = '", colors[6,4], "']
+  r6_e [label = '1 month ago', fillcolor = '", colors[6,5], "']
+  r6_f [label = '1 month ago', fillcolor = '", colors[6,6], "']
+
+  { rank = same; r6_a; r6_b; r6_c; r6_d; r6_e; r6_f }
+  edge [style = invis]
+  r6_a -> r6_b -> r6_c -> r6_d -> r6_e -> r6_f
+
+  r7_a [label = '', style = invis, width = 1.15]
+  r7_b [label = '', style = invis, width = 1.15]
+  r7_c [label = '', style = invis, width = 1.15]
+  r7_blue [label = 'Canada\\nFood CPI\\nToday', fillcolor = '", nvy, "', fontcolor = 'white']
+  r7_d [label = '', style = invis, width = 1.15]
+  r7_e [label = '', style = invis, width = 1.15]
+  r7_f [label = '', style = invis, width = 1.15]
+
+  { rank = same; r7_a; r7_b; r7_c; r7_blue; r7_d; r7_e; r7_f }
+  edge [style = invis]
+  r7_a -> r7_b -> r7_c -> r7_blue -> r7_d -> r7_e -> r7_f
+
+  edge [style = solid, color = '", gry, "', penwidth = 1.0,
+        arrowsize = 0.5, arrowhead = vee]
+
+  r1_a -> r2_a -> r3_a -> r4_a -> r5_a -> r6_a
+  r1_b -> r2_b -> r3_b -> r4_b -> r5_b -> r6_b
+  r1_c -> r2_c -> r3_c -> r4_c -> r5_c -> r6_c
+  r1_d -> r2_d -> r3_d -> r4_d -> r5_d -> r6_d
+  r1_e -> r2_e -> r3_e -> r4_e -> r5_e -> r6_e
+  r1_f -> r2_f -> r3_f -> r4_f -> r5_f -> r6_f
+
+  edge [style = invis]
+  hdr_usd -> r1_a -> r2_a -> r3_a -> r4_a -> r5_a -> r6_a -> r7_a
+
+}
+"))
+
+saveWidget(p2, "plot2_random.html", selfcontained = TRUE)
+
+
+wht <- '#FFFFFF'
+blk <- '#000000'
+
+p3 <- grViz(paste0("
+digraph lag_grid {
+
+  graph [
+    rankdir  = TB,
+    fontname = 'Arial',
+    bgcolor  = 'white',
+    nodesep  = 0.50,
+    ranksep  = 0.40,
+    margin   = 0.3,
+    splines  = ortho
+  ]
+
+  node [
+    fontname = 'Arial',
+    fontsize = 9,
+    style    = 'filled,rounded',
+    shape    = box,
+    width    = 1.15,
+    height   = 0.40,
+    penwidth = 1,
+    color    = '", gry, "'
+  ]
+
+  node [shape = plaintext, fillcolor = 'white', fontsize = 12,
+        fontcolor = '", nvy, "', fontname = 'Arial Bold', width = 1.15]
+
+  hdr_usd  [label = 'USD/CAD\\nExchange Rate']
+  hdr_usc  [label = 'U.S. Core\\nCPI']
+  hdr_imp  [label = 'U.S. Food\\nImports']
+  hdr_fao  [label = 'FAO Food\\nPrice Index']
+  hdr_ecpi [label = 'Canada\\nEnergy CPI']
+  hdr_nfne [label = 'Canada\\nCore CPI']
+
+  { rank = same; hdr_usd; hdr_usc; hdr_imp; hdr_fao; hdr_ecpi; hdr_nfne }
+  edge [style = invis]
+  hdr_usd -> hdr_usc -> hdr_imp -> hdr_fao -> hdr_ecpi -> hdr_nfne
+
+  node [shape = box, fontsize = 9, fontcolor = '", blk, "',
+        fontname = 'Arial', width = 1.15, height = 0.40]
+
+  r1_a [label = '6 months ago', fillcolor = '", wht, "']
+  r1_b [label = '6 months ago', fillcolor = '", wht, "']
+  r1_c [label = '6 months ago', fillcolor = '", wht, "']
+  r1_d [label = '6 months ago', fillcolor = '", wht, "']
+  r1_e [label = '6 months ago', fillcolor = '", wht, "']
+  r1_f [label = '6 months ago', fillcolor = '", wht, "']
+
+  { rank = same; r1_a; r1_b; r1_c; r1_d; r1_e; r1_f }
+  edge [style = invis]
+  r1_a -> r1_b -> r1_c -> r1_d -> r1_e -> r1_f
+
+  r2_a [label = '5 months ago', fillcolor = '", wht, "']
+  r2_b [label = '5 months ago', fillcolor = '", wht, "']
+  r2_c [label = '5 months ago', fillcolor = '", wht, "']
+  r2_d [label = '5 months ago', fillcolor = '", wht, "']
+  r2_e [label = '5 months ago', fillcolor = '", wht, "']
+  r2_f [label = '5 months ago', fillcolor = '", wht, "']
+
+  { rank = same; r2_a; r2_b; r2_c; r2_d; r2_e; r2_f }
+  edge [style = invis]
+  r2_a -> r2_b -> r2_c -> r2_d -> r2_e -> r2_f
+
+  r3_a [label = '4 months ago', fillcolor = '", wht, "']
+  r3_b [label = '4 months ago', fillcolor = '", wht, "']
+  r3_c [label = '4 months ago', fillcolor = '", wht, "']
+  r3_d [label = '4 months ago', fillcolor = '", wht, "']
+  r3_e [label = '4 months ago', fillcolor = '", wht, "']
+  r3_f [label = '4 months ago', fillcolor = '", wht, "']
+
+  { rank = same; r3_a; r3_b; r3_c; r3_d; r3_e; r3_f }
+  edge [style = invis]
+  r3_a -> r3_b -> r3_c -> r3_d -> r3_e -> r3_f
+
+  r4_a [label = '3 months ago', fillcolor = '", wht, "']
+  r4_b [label = '3 months ago', fillcolor = '", wht, "']
+  r4_c [label = '3 months ago', fillcolor = '", wht, "']
+  r4_d [label = '3 months ago', fillcolor = '", wht, "']
+  r4_e [label = '3 months ago', fillcolor = '", wht, "']
+  r4_f [label = '3 months ago', fillcolor = '", wht, "']
+
+  { rank = same; r4_a; r4_b; r4_c; r4_d; r4_e; r4_f }
+  edge [style = invis]
+  r4_a -> r4_b -> r4_c -> r4_d -> r4_e -> r4_f
+
+  r5_a [label = '2 months ago', fillcolor = '", wht, "']
+  r5_b [label = '2 months ago', fillcolor = '", wht, "']
+  r5_c [label = '2 months ago', fillcolor = '", wht, "']
+  r5_d [label = '2 months ago', fillcolor = '", wht, "']
+  r5_e [label = '2 months ago', fillcolor = '", wht, "']
+  r5_f [label = '2 months ago', fillcolor = '", wht, "']
+
+  { rank = same; r5_a; r5_b; r5_c; r5_d; r5_e; r5_f }
+  edge [style = invis]
+  r5_a -> r5_b -> r5_c -> r5_d -> r5_e -> r5_f
+
+  r6_a [label = '1 month ago', fillcolor = '", wht, "']
+  r6_b [label = '1 month ago', fillcolor = '", wht, "']
+  r6_c [label = '1 month ago', fillcolor = '", wht, "']
+  r6_d [label = '1 month ago', fillcolor = '", wht, "']
+  r6_e [label = '1 month ago', fillcolor = '", wht, "']
+  r6_f [label = '1 month ago', fillcolor = '", wht, "']
+
+  { rank = same; r6_a; r6_b; r6_c; r6_d; r6_e; r6_f }
+  edge [style = invis]
+  r6_a -> r6_b -> r6_c -> r6_d -> r6_e -> r6_f
+
+  r7_a [label = '', style = invis, width = 1.15]
+  r7_b [label = '', style = invis, width = 1.15]
+  r7_c [label = '', style = invis, width = 1.15]
+  r7_blue [label = 'Canada\\nFood CPI\\nToday', fillcolor = '", nvy, "', fontcolor = 'white']
+  r7_d [label = '', style = invis, width = 1.15]
+  r7_e [label = '', style = invis, width = 1.15]
+  r7_f [label = '', style = invis, width = 1.15]
+
+  { rank = same; r7_a; r7_b; r7_c; r7_blue; r7_d; r7_e; r7_f }
+  edge [style = invis]
+  r7_a -> r7_b -> r7_c -> r7_blue -> r7_d -> r7_e -> r7_f
+
+  edge [style = solid, color = '", gry, "', penwidth = 1.0,
+        arrowsize = 0.5, arrowhead = vee]
+
+  r1_a -> r2_a -> r3_a -> r4_a -> r5_a -> r6_a
+  r1_b -> r2_b -> r3_b -> r4_b -> r5_b -> r6_b
+  r1_c -> r2_c -> r3_c -> r4_c -> r5_c -> r6_c
+  r1_d -> r2_d -> r3_d -> r4_d -> r5_d -> r6_d
+  r1_e -> r2_e -> r3_e -> r4_e -> r5_e -> r6_e
+  r1_f -> r2_f -> r3_f -> r4_f -> r5_f -> r6_f
+
+  edge [style = invis]
+  hdr_usd -> r1_a -> r2_a -> r3_a -> r4_a -> r5_a -> r6_a -> r7_a
+
+}
+"))
+
+saveWidget(p3, "plot3_white.html", selfcontained = TRUE)
