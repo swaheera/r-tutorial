@@ -1,0 +1,143 @@
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(gridExtra)
+library(grid)
+
+# ============================================================
+# DATA PREP
+# ============================================================
+
+farm_long <- master %>%
+  select(date,
+         province,
+         USA = usa_imports,
+         `Non-USA` = non_usa_imports) %>%
+  pivot_longer(c(USA, `Non-USA`),
+               names_to = "source",
+               values_to = "value")
+
+farm_yearly <- farm_long %>%
+  mutate(year = floor_date(date, "year")) %>%
+  group_by(province, year, source) %>%
+  summarise(value = sum(value, na.rm = TRUE),
+            .groups = "drop")
+
+# ============================================================
+# COLORS
+# ============================================================
+
+usa_col     <- "#1B3A5C"
+non_usa_col <- "#D4A03C"
+
+# ============================================================
+# AXIS SCALING FUNCTION
+# ============================================================
+
+get_axis_unit <- function(max_thousands) {
+  max_actual <- max_thousands * 1000
+  
+  if (max_actual >= 1e9) {
+    return(list(divisor = 1e6, unit = "B"))
+  } else if (max_actual >= 5e6) {
+    return(list(divisor = 1e3, unit = "M"))
+  } else {
+    return(list(divisor = 1, unit = "K"))
+  }
+}
+
+format_total <- function(x, unit) {
+  paste0("$", round(x), unit)
+}
+
+# ============================================================
+# BUILD PLOTS
+# ============================================================
+
+plot_list <- list()
+
+for (prov in unique(master$province)) {
+  
+  prov_data <- farm_yearly %>%
+    filter(province == prov)
+  
+  max_total <- prov_data %>%
+    group_by(year) %>%
+    summarise(t = sum(value), .groups = "drop") %>%
+    pull(t) %>%
+    max()
+  
+  ax <- get_axis_unit(max_total)
+  
+  prov_data <- prov_data %>%
+    mutate(value_scaled = value / ax$divisor)
+  
+  prov_totals <- prov_data %>%
+    group_by(year) %>%
+    summarise(total_scaled = sum(value_scaled),
+              .groups = "drop") %>%
+    mutate(label = format_total(total_scaled, ax$unit))
+  
+  p <- ggplot(prov_data,
+              aes(x = year,
+                  y = value_scaled,
+                  fill = source)) +
+    
+    geom_col(width = 250) +
+    
+    geom_text(data = prov_totals,
+              aes(x = year,
+                  y = total_scaled,
+                  label = label),
+              inherit.aes = FALSE,
+              vjust = -0.35,
+              size = 2.3,
+              fontface = "bold") +
+    
+    scale_fill_manual(values = c("USA" = usa_col,
+                                 "Non-USA" = non_usa_col)) +
+    
+    scale_y_continuous(
+      labels = function(x) paste0("$", x, ax$unit),
+      expand = expansion(mult = c(0, 0.14))
+    ) +
+    
+    # 🔹 SHOW EVERY YEAR
+    scale_x_date(
+      date_labels = "%Y",
+      date_breaks = "1 year"
+    ) +
+    
+    labs(
+      title = paste0(prov,
+                     " Farm & Food Imports: USA vs Non-USA"),
+      x = NULL,
+      y = NULL
+    ) +
+    
+    coord_cartesian(clip = "off") +
+    
+    theme_minimal(base_size = 8.5) +
+    theme(
+      plot.title = element_text(face = "bold",
+                                size = 9.5),
+      legend.position = "none",
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_text(size = 6, angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 6.5),
+      plot.margin = margin(10, 15, 12, 10)
+    )
+  
+  plot_list[[prov]] <- p
+}
+
+# ============================================================
+# ARRANGE ALL ON ONE PAGE
+# ============================================================
+
+grid.arrange(
+  grobs = plot_list,
+  ncol = 3
+)
