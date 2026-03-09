@@ -1,0 +1,607 @@
+# ============================================================
+# ALL PROVINCES REVIEW
+# Same flat code, just wrapped in run_province()
+# Each CV fold written out explicitly. No inner loops.
+# Returns: table1, table2, and plot_data
+# ============================================================
+
+options(scipen = 999)
+suppressPackageStartupMessages({
+    library(tidyverse)
+    library(forecast)
+    library(lubridate)
+    library(lmtest)
+    library(tseries)
+    library(MASS)
+})
+
+set.seed(123)
+
+INTERVENTION_START <- as.Date("2023-07-01")
+N_FORECAST_MONTHS  <- 6
+INTERVENTION_END   <- INTERVENTION_START %m+% months(N_FORECAST_MONTHS - 1)
+N_SIMS             <- 10000
+
+provinces <- unique(master$province)
+provinces <- provinces[!grepl("Whitehorse|Yellowknife|Iqaluit", provinces)]
+
+# ============================================================
+# ONE FUNCTION — EVERYTHING INSIDE IS THE SAME FLAT CODE
+# ============================================================
+
+run_province <- function(province_name) {
+
+    # --- data prep ---
+
+    df <- master %>%
+        dplyr::filter(province == province_name) %>%
+        dplyr::arrange(date)
+
+    df$log_usa_imports_L2 <- dplyr::lag(df$log_usa_imports, 2)
+    df$us_core_cpi_L2     <- dplyr::lag(df$us_core_cpi, 2)
+    df$us_core_cpi_L4     <- dplyr::lag(df$us_core_cpi, 4)
+    df$usd_cad_L2         <- dplyr::lag(df$usd_cad, 2)
+    m       <- month(df$date)
+    df$s3_1 <- as.numeric(m >= 5 & m <= 8)
+    df$s3_2 <- as.numeric(m >= 9)
+    df <- df %>% drop_na(us_core_cpi_L4)
+
+    xreg_cols <- c("log_usa_imports_L2", "us_core_cpi_L2", "us_core_cpi_L4",
+                   "usd_cad_L2", "s3_1", "s3_2")
+
+    train <- df %>% dplyr::filter(date < INTERVENTION_START)
+    intv  <- df %>% dplyr::filter(date >= INTERVENTION_START & date <= INTERVENTION_END)
+
+    y_vec      <- train$food_cpi
+    y_ts       <- ts(y_vec, frequency = 12)
+    xreg_train <- as.matrix(train[, xreg_cols])
+
+    # --- base model ---
+
+    base_fit <- auto.arima(y_ts, seasonal = FALSE)
+    base_aic <- AIC(base_fit)
+
+    # --- arimax model ---
+
+    fit       <- auto.arima(y_ts, xreg = xreg_train, seasonal = FALSE,
+                            stepwise = FALSE, approximation = FALSE)
+    model_aic <- AIC(fit)
+    res       <- as.numeric(residuals(fit))
+
+    # --- diagnostics ---
+
+    model_adf  <- adf.test(res)$p.value
+    model_lb   <- Box.test(res, lag = 10, type = "Ljung-Box")$p.value
+    model_bp   <- bptest(lm(res ~ seq_along(res)))$p.value
+    model_sw   <- shapiro.test(res)$p.value
+    model_diag <- sum(c(model_adf < 0.05, model_lb >= 0.05, model_bp >= 0.05, model_sw >= 0.05))
+
+    # --- wald test ---
+
+    coefs_all <- coef(fit)
+    vcov_all  <- fit$var.coef
+    n_total   <- length(coefs_all)
+    n_arima_p <- n_total - 6
+    xreg_idx  <- (n_arima_p + 1):n_total
+
+    beta_xreg <- coefs_all[xreg_idx]
+    vcov_xreg <- vcov_all[xreg_idx, xreg_idx]
+    k         <- length(beta_xreg)
+
+    wald_stat <- as.numeric(t(beta_xreg) %*% solve(vcov_xreg) %*% beta_xreg)
+    wald_p    <- pchisq(wald_stat, df = k, lower.tail = FALSE)
+    joint_sig <- ifelse(wald_p < 0.05, "Yes", "No")
+
+    # ============================================================
+    # CROSS-VALIDATION — EACH FOLD WRITTEN OUT
+    # ============================================================
+
+    h <- 4
+
+    # ---- FOLD 1: train to Sep 2020, test Oct 2020 – Jan 2021 ----
+
+    cv_train_1 <- train %>% dplyr::filter(date < as.Date("2020-10-01"))
+    cv_test_1  <- train %>% dplyr::filter(date >= as.Date("2020-10-01") & date < as.Date("2021-02-01"))
+
+    y_cv_1    <- ts(cv_train_1$food_cpi, frequency = 12)
+    y_test_1  <- cv_test_1$food_cpi
+    xreg_cv_1 <- as.matrix(cv_train_1[, xreg_cols])
+    xreg_te_1 <- as.matrix(cv_test_1[, xreg_cols])
+
+    base_fc_1       <- as.numeric(forecast(auto.arima(y_cv_1, seasonal = FALSE), h = nrow(cv_test_1))$mean)
+    base_mape_1     <- mean(abs((y_test_1 - base_fc_1) / y_test_1)) * 100
+
+    model_cv_fit_1  <- auto.arima(y_cv_1, xreg = xreg_cv_1, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+    model_fc_1      <- as.numeric(forecast(model_cv_fit_1, xreg = xreg_te_1, h = nrow(cv_test_1))$mean)
+    model_mape_1    <- mean(abs((y_test_1 - model_fc_1) / y_test_1)) * 100
+
+    # ---- FOLD 2: train to Jan 2021, test Feb 2021 – May 2021 ----
+
+    cv_train_2 <- train %>% dplyr::filter(date < as.Date("2021-02-01"))
+    cv_test_2  <- train %>% dplyr::filter(date >= as.Date("2021-02-01") & date < as.Date("2021-06-01"))
+
+    y_cv_2    <- ts(cv_train_2$food_cpi, frequency = 12)
+    y_test_2  <- cv_test_2$food_cpi
+    xreg_cv_2 <- as.matrix(cv_train_2[, xreg_cols])
+    xreg_te_2 <- as.matrix(cv_test_2[, xreg_cols])
+
+    base_fc_2       <- as.numeric(forecast(auto.arima(y_cv_2, seasonal = FALSE), h = nrow(cv_test_2))$mean)
+    base_mape_2     <- mean(abs((y_test_2 - base_fc_2) / y_test_2)) * 100
+
+    model_cv_fit_2  <- auto.arima(y_cv_2, xreg = xreg_cv_2, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+    model_fc_2      <- as.numeric(forecast(model_cv_fit_2, xreg = xreg_te_2, h = nrow(cv_test_2))$mean)
+    model_mape_2    <- mean(abs((y_test_2 - model_fc_2) / y_test_2)) * 100
+
+    # ---- FOLD 3: train to May 2021, test Jun 2021 – Sep 2021 ----
+
+    cv_train_3 <- train %>% dplyr::filter(date < as.Date("2021-06-01"))
+    cv_test_3  <- train %>% dplyr::filter(date >= as.Date("2021-06-01") & date < as.Date("2021-10-01"))
+
+    y_cv_3    <- ts(cv_train_3$food_cpi, frequency = 12)
+    y_test_3  <- cv_test_3$food_cpi
+    xreg_cv_3 <- as.matrix(cv_train_3[, xreg_cols])
+    xreg_te_3 <- as.matrix(cv_test_3[, xreg_cols])
+
+    base_fc_3       <- as.numeric(forecast(auto.arima(y_cv_3, seasonal = FALSE), h = nrow(cv_test_3))$mean)
+    base_mape_3     <- mean(abs((y_test_3 - base_fc_3) / y_test_3)) * 100
+
+    model_cv_fit_3  <- auto.arima(y_cv_3, xreg = xreg_cv_3, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+    model_fc_3      <- as.numeric(forecast(model_cv_fit_3, xreg = xreg_te_3, h = nrow(cv_test_3))$mean)
+    model_mape_3    <- mean(abs((y_test_3 - model_fc_3) / y_test_3)) * 100
+
+    # ---- FOLD 4: train to Sep 2021, test Oct 2021 – Jan 2022 ----
+
+    cv_train_4 <- train %>% dplyr::filter(date < as.Date("2021-10-01"))
+    cv_test_4  <- train %>% dplyr::filter(date >= as.Date("2021-10-01") & date < as.Date("2022-02-01"))
+
+    y_cv_4    <- ts(cv_train_4$food_cpi, frequency = 12)
+    y_test_4  <- cv_test_4$food_cpi
+    xreg_cv_4 <- as.matrix(cv_train_4[, xreg_cols])
+    xreg_te_4 <- as.matrix(cv_test_4[, xreg_cols])
+
+    base_fc_4       <- as.numeric(forecast(auto.arima(y_cv_4, seasonal = FALSE), h = nrow(cv_test_4))$mean)
+    base_mape_4     <- mean(abs((y_test_4 - base_fc_4) / y_test_4)) * 100
+
+    model_cv_fit_4  <- auto.arima(y_cv_4, xreg = xreg_cv_4, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+    model_fc_4      <- as.numeric(forecast(model_cv_fit_4, xreg = xreg_te_4, h = nrow(cv_test_4))$mean)
+    model_mape_4    <- mean(abs((y_test_4 - model_fc_4) / y_test_4)) * 100
+
+    # ---- FOLD 5: train to Jan 2022, test Feb 2022 – May 2022 ----
+
+    cv_train_5 <- train %>% dplyr::filter(date < as.Date("2022-02-01"))
+    cv_test_5  <- train %>% dplyr::filter(date >= as.Date("2022-02-01") & date < as.Date("2022-06-01"))
+
+    y_cv_5    <- ts(cv_train_5$food_cpi, frequency = 12)
+    y_test_5  <- cv_test_5$food_cpi
+    xreg_cv_5 <- as.matrix(cv_train_5[, xreg_cols])
+    xreg_te_5 <- as.matrix(cv_test_5[, xreg_cols])
+
+    base_fc_5       <- as.numeric(forecast(auto.arima(y_cv_5, seasonal = FALSE), h = nrow(cv_test_5))$mean)
+    base_mape_5     <- mean(abs((y_test_5 - base_fc_5) / y_test_5)) * 100
+
+    model_cv_fit_5  <- auto.arima(y_cv_5, xreg = xreg_cv_5, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+    model_fc_5      <- as.numeric(forecast(model_cv_fit_5, xreg = xreg_te_5, h = nrow(cv_test_5))$mean)
+    model_mape_5    <- mean(abs((y_test_5 - model_fc_5) / y_test_5)) * 100
+
+    # ---- FOLD 6: train to May 2022, test Jun 2022 – Sep 2022 ----
+
+    cv_train_6 <- train %>% dplyr::filter(date < as.Date("2022-06-01"))
+    cv_test_6  <- train %>% dplyr::filter(date >= as.Date("2022-06-01") & date < as.Date("2022-10-01"))
+
+    y_cv_6    <- ts(cv_train_6$food_cpi, frequency = 12)
+    y_test_6  <- cv_test_6$food_cpi
+    xreg_cv_6 <- as.matrix(cv_train_6[, xreg_cols])
+    xreg_te_6 <- as.matrix(cv_test_6[, xreg_cols])
+
+    base_fc_6       <- as.numeric(forecast(auto.arima(y_cv_6, seasonal = FALSE), h = nrow(cv_test_6))$mean)
+    base_mape_6     <- mean(abs((y_test_6 - base_fc_6) / y_test_6)) * 100
+
+    model_cv_fit_6  <- auto.arima(y_cv_6, xreg = xreg_cv_6, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+    model_fc_6      <- as.numeric(forecast(model_cv_fit_6, xreg = xreg_te_6, h = nrow(cv_test_6))$mean)
+    model_mape_6    <- mean(abs((y_test_6 - model_fc_6) / y_test_6)) * 100
+
+    # ---- FOLD 7: train to Sep 2022, test Oct 2022 – Jan 2023 ----
+
+    cv_train_7 <- train %>% dplyr::filter(date < as.Date("2022-10-01"))
+    cv_test_7  <- train %>% dplyr::filter(date >= as.Date("2022-10-01") & date < as.Date("2023-02-01"))
+
+    y_cv_7    <- ts(cv_train_7$food_cpi, frequency = 12)
+    y_test_7  <- cv_test_7$food_cpi
+    xreg_cv_7 <- as.matrix(cv_train_7[, xreg_cols])
+    xreg_te_7 <- as.matrix(cv_test_7[, xreg_cols])
+
+    base_fc_7       <- as.numeric(forecast(auto.arima(y_cv_7, seasonal = FALSE), h = nrow(cv_test_7))$mean)
+    base_mape_7     <- mean(abs((y_test_7 - base_fc_7) / y_test_7)) * 100
+
+    model_cv_fit_7  <- auto.arima(y_cv_7, xreg = xreg_cv_7, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+    model_fc_7      <- as.numeric(forecast(model_cv_fit_7, xreg = xreg_te_7, h = nrow(cv_test_7))$mean)
+    model_mape_7    <- mean(abs((y_test_7 - model_fc_7) / y_test_7)) * 100
+
+    # ---- FOLD 8: train to Jan 2023, test Feb 2023 – May 2023 ----
+
+    cv_train_8 <- train %>% dplyr::filter(date < as.Date("2023-02-01"))
+    cv_test_8  <- train %>% dplyr::filter(date >= as.Date("2023-02-01") & date < as.Date("2023-06-01"))
+
+    y_cv_8    <- ts(cv_train_8$food_cpi, frequency = 12)
+    y_test_8  <- cv_test_8$food_cpi
+    xreg_cv_8 <- as.matrix(cv_train_8[, xreg_cols])
+    xreg_te_8 <- as.matrix(cv_test_8[, xreg_cols])
+
+    base_fc_8       <- as.numeric(forecast(auto.arima(y_cv_8, seasonal = FALSE), h = nrow(cv_test_8))$mean)
+    base_mape_8     <- mean(abs((y_test_8 - base_fc_8) / y_test_8)) * 100
+
+    model_cv_fit_8  <- auto.arima(y_cv_8, xreg = xreg_cv_8, seasonal = FALSE, stepwise = FALSE, approximation = FALSE)
+    model_fc_8      <- as.numeric(forecast(model_cv_fit_8, xreg = xreg_te_8, h = nrow(cv_test_8))$mean)
+    model_mape_8    <- mean(abs((y_test_8 - model_fc_8) / y_test_8)) * 100
+
+    # ---- CV SUMMARY ----
+
+    base_mapes  <- c(base_mape_1, base_mape_2, base_mape_3, base_mape_4,
+                      base_mape_5, base_mape_6, base_mape_7, base_mape_8)
+    model_mapes <- c(model_mape_1, model_mape_2, model_mape_3, model_mape_4,
+                      model_mape_5, model_mape_6, model_mape_7, model_mape_8)
+
+    base_cv_mean   <- mean(base_mapes)
+    model_cv_mean  <- mean(model_mapes)
+    cv_improvement <- round((base_cv_mean - model_cv_mean) / base_cv_mean * 100, 1)
+
+    # --- aic improvement ---
+
+    aic_improvement_pct <- round((base_aic - model_aic) / abs(base_aic) * 100, 1)
+
+    # ============================================================
+    # COUNTERFACTUAL
+    # ============================================================
+
+    actuals  <- intv$food_cpi
+    x_post   <- as.matrix(intv[, xreg_cols])
+    n_int    <- nrow(intv)
+    sigma2   <- fit$sigma2
+    coef_hat <- coef(fit)
+    vcov_mat <- fit$var.coef
+
+    sim_paths <- matrix(NA, nrow = N_SIMS, ncol = n_int)
+    for (sim in 1:N_SIMS) {
+        coef_draw     <- MASS::mvrnorm(n = 1, mu = coef_hat, Sigma = vcov_mat)
+        fit_star      <- fit
+        fit_star$coef <- coef_draw
+        sim_paths[sim, ] <- tryCatch(
+            as.numeric(simulate(fit_star, nsim = n_int, xreg = x_post, future = TRUE)),
+            error = function(e) {
+                as.numeric(forecast(fit_star, xreg = x_post, h = n_int)$mean) +
+                    rnorm(n_int, 0, sqrt(sigma2))
+            })
+    }
+
+    mean_diffs <- apply(sim_paths, 1, function(row) mean(actuals - row))
+    est <- mean(mean_diffs)
+    ci  <- quantile(mean_diffs, c(0.025, 0.975))
+    pv  <- min(ifelse(est >= 0, mean(mean_diffs < 0) * 2, mean(mean_diffs > 0) * 2), 1)
+
+    # ============================================================
+    # RETURN
+    # ============================================================
+
+    table1 <- data.frame(
+        province                = province_name,
+        estimated_effect        = round(est, 2),
+        ci_lower                = round(ci[1], 2),
+        ci_upper                = round(ci[2], 2),
+        statistically_significant = ifelse(pv < 0.05, "Yes", "No")
+    )
+
+    table2 <- data.frame(
+        province                     = province_name,
+        forecast_improvement_pct     = cv_improvement,
+        model_fit_improvement_pct    = aic_improvement_pct,
+        diagnostics_passed           = paste0(model_diag, "/4"),
+        controls_jointly_significant = joint_sig
+    )
+
+    plot_data <- list(
+        prov_df    = df,
+        train      = train,
+        intv       = intv,
+        fitted_pre = as.numeric(fitted(fit)),
+        cf_mean    = colMeans(sim_paths),
+        cf_lower   = apply(sim_paths, 2, quantile, 0.025),
+        cf_upper   = apply(sim_paths, 2, quantile, 0.975),
+        effect     = data.frame(estimate = est, ci_lower = ci[1],
+                                ci_upper = ci[2], p_value = pv)
+    )
+
+    return(list(table1 = table1, table2 = table2, plot_data = plot_data))
+}
+
+# ============================================================
+# RUN ALL PROVINCES AND BIND
+# ============================================================
+
+results <- lapply(provinces, run_province)
+
+all_table1   <- bind_rows(lapply(results, `[[`, "table1"))
+all_table2   <- bind_rows(lapply(results, `[[`, "table2"))
+all_plot_data <- setNames(lapply(results, `[[`, "plot_data"), provinces)
+
+all_table1
+all_table2
+#############################
+#############################
+# ============================================================
+# RECREATE GT TABLES AND ALL PLOTS
+# Assumes all_table1, all_table2, all_plot_data already exist
+# ============================================================
+
+library(tidyverse)
+library(gt)
+library(ggplot2)
+library(lubridate)
+
+INTERVENTION_START <- as.Date("2023-07-01")
+N_FORECAST_MONTHS  <- 6
+INTERVENTION_END   <- INTERVENTION_START %m+% months(N_FORECAST_MONTHS - 1)
+PLOT_START_DATE    <- as.Date("2023-01-01")
+PLOT_END_DATE      <- INTERVENTION_END
+INTERVENTION_LABEL <- paste0(format(INTERVENTION_START, "%B %Y"), " – ",
+                             format(INTERVENTION_END, "%B %Y"))
+DATA_SOURCE <- "Statistics Canada (2026)\nhttps://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810000401"
+
+# ============================================================
+# GT TABLE 1: MODEL PERFORMANCE SUMMARY
+# ============================================================
+
+gt_table1 <- all_table2 %>%
+    mutate(
+        cv_display  = paste0(forecast_improvement_pct, "%"),
+        aic_display = paste0(model_fit_improvement_pct, "%")
+    ) %>%
+    dplyr::select(province, cv_display, aic_display,
+                  diagnostics_passed, controls_jointly_significant) %>%
+    gt() %>%
+    cols_label(
+        province                     = "Province",
+        cv_display                   = md("Forecast\nImprovement vs.\nModel Without Controls"),
+        aic_display                  = md("Model Fit\nImprovement vs.\nModel Without Controls"),
+        diagnostics_passed           = md("Diagnostics\nPassed"),
+        controls_jointly_significant = md("Controls Jointly\nSignificant?")
+    ) %>%
+    cols_align(align = "center", columns = c(cv_display, aic_display,
+                                              diagnostics_passed, controls_jointly_significant)) %>%
+    cols_align(align = "left", columns = province) %>%
+    tab_header(
+        title = "Model Performance Summary: Comparison Against Model Without Controls",
+        subtitle = "Model performance was validated by comparing forecast accuracy, model fit, and diagnostic tests against a baseline model without economic or seasonal controls."
+    ) %>%
+    tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels()) %>%
+    tab_style(style = cell_text(weight = "bold"), locations = cells_title()) %>%
+    tab_footnote(
+        footnote = "Rolling window cross-validation Mean Absolute Percentage Error (MAPE).",
+        locations = cells_column_labels(columns = cv_display)
+    ) %>%
+    tab_footnote(
+        footnote = "Percentage reduction in Akaike Information Criterion (AIC) relative to the baseline model; higher values indicate better fit.",
+        locations = cells_column_labels(columns = aic_display)
+    ) %>%
+    tab_footnote(
+        footnote = "ADF (stationarity), Ljung-Box (autocorrelation), Breusch-Pagan (heteroskedasticity), Shapiro-Wilk (normality).",
+        locations = cells_column_labels(columns = diagnostics_passed)
+    ) %>%
+    tab_footnote(
+        footnote = paste0(
+            "Joint Wald test of all economic and seasonal control coefficients ",
+            "(H\u2080: all coefficients = 0). Chi-squared test at \u03B1 = 0.05."
+        ),
+        locations = cells_column_labels(columns = controls_jointly_significant)
+    ) %>%
+    tab_source_note(source_note = "Training period: Jan 2017 to Jun 2023.") %>%
+    tab_options(
+        table.font.size = px(12),
+        heading.title.font.size = px(16),
+        heading.subtitle.font.size = px(13),
+        column_labels.font.size = px(11),
+        footnotes.font.size = px(10),
+        source_notes.font.size = px(10)
+    )
+
+gt_table1
+gtsave(gt_table1, "model_summary.html")
+
+# ============================================================
+# GT TABLE 2: COUNTERFACTUAL EFFECTS
+# ============================================================
+
+gt_table2 <- all_table1 %>%
+    dplyr::arrange(province) %>%
+    gt() %>%
+    cols_label(
+        province                  = "Province",
+        estimated_effect          = "Estimated Effect (pts)",
+        ci_lower                  = "95% Lower",
+        ci_upper                  = "95% Upper",
+        statistically_significant = "Statistically Significant"
+    ) %>%
+    tab_header(
+        title = md(paste0(
+            "**Counterfactual: Estimated Association Between the 2023 Grocery ",
+            "Rebate and Food CPI (Statistical Model with Lagged Indicators)**")),
+        subtitle = md(paste0(
+            "Effect is the ", N_FORECAST_MONTHS, "-month period average, ",
+            "assuming pre-rebate dynamics would have continued | ",
+            INTERVENTION_LABEL))
+    ) %>%
+    fmt_number(columns = c(estimated_effect, ci_lower, ci_upper), decimals = 2) %>%
+    tab_footnote(
+        footnote = paste0(
+            "Effect = mean(actual \u2013 counterfactual). Significance at \u03B1 = 0.05. ",
+            "Prediction intervals via parametric bootstrap (10,000 draws from the joint ",
+            "distribution of estimated coefficients)."),
+        locations = cells_column_labels(columns = estimated_effect)
+    ) %>%
+    tab_source_note(source_note = md("**Data:** Statistics Canada Table 18-10-0004-01")) %>%
+    cols_width(province ~ px(170), statistically_significant ~ px(130), everything() ~ px(110)) %>%
+    cols_align(align = "center", columns = -province) %>%
+    cols_align(align = "left", columns = province) %>%
+    tab_style(style = cell_text(weight = "bold"), locations = cells_column_labels()) %>%
+    tab_style(style = cell_text(size = px(12)), locations = cells_body()) %>%
+    tab_options(
+        table.font.size             = px(13),
+        heading.title.font.size     = px(14),
+        heading.subtitle.font.size  = px(11),
+        source_notes.font.size      = px(10),
+        footnotes.font.size         = px(10),
+        table.border.top.style      = "solid",
+        table.border.top.width      = px(2),
+        table.border.bottom.style   = "solid",
+        table.border.bottom.width   = px(2),
+        heading.border.bottom.style = "solid",
+        heading.border.bottom.width = px(1)
+    )
+
+gt_table2
+gtsave(gt_table2, "effect_estimates_counterfactual.html")
+
+# ============================================================
+# LOLLIPOP PLOT
+# ============================================================
+
+lollipop <- ggplot(all_table1 %>% dplyr::filter(!is.na(estimated_effect)),
+                   aes(x = reorder(province, estimated_effect), y = estimated_effect)) +
+    geom_point(size = 3, color = "black") +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                  width = 0.3, color = "black") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    coord_flip() +
+    labs(
+        title = paste0(
+            "Counterfactual: Estimated Association Between the 2023 Grocery Rebate\n",
+            "and Food CPI Across Canadian Provinces (Statistical Model with Lagged Indicators)"),
+        subtitle = paste0(
+            "Each point shows the ", N_FORECAST_MONTHS,
+            "-month period average effect on Food CPI (index points) ",
+            "relative to the counterfactual,\nassuming that pre-rebate dynamics ",
+            "would have continued after. Error bars show 95% prediction intervals\n",
+            "(parametric bootstrap accounting for parameter uncertainty)."),
+        x = "", y = "Estimated Change in Food CPI (Index Points)",
+        caption = DATA_SOURCE
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title    = element_text(face = "bold", size = 12),
+        plot.subtitle = element_text(size = 9, color = "gray30"),
+        plot.caption  = element_text(hjust = 0, size = 8)
+    )
+
+print(lollipop)
+
+# ============================================================
+# PER-PROVINCE COUNTERFACTUAL PLOTS
+# ============================================================
+
+for (prov in names(all_plot_data)) {
+
+    pd   <- all_plot_data[[prov]]
+    pre  <- pd$train
+    intv <- pd$intv
+    eff  <- pd$effect
+
+    plot_df <- pd$prov_df %>%
+        dplyr::filter(date >= PLOT_START_DATE & date <= PLOT_END_DATE)
+    plot_df$fitted_solid  <- NA_real_
+    plot_df$fitted_dotted <- NA_real_
+    plot_df$cf_lower      <- NA_real_
+    plot_df$cf_upper      <- NA_real_
+
+    for (i in seq_along(pre$date)) {
+        idx <- which(plot_df$date == pre$date[i])
+        if (length(idx) > 0 && i <= length(pd$fitted_pre) && !is.na(pd$fitted_pre[i]))
+            plot_df$fitted_solid[idx] <- pd$fitted_pre[i]
+    }
+    for (i in seq_along(intv$date)) {
+        idx <- which(plot_df$date == intv$date[i])
+        if (length(idx) > 0) {
+            if (i == 1) {
+                lf <- max(which(!is.na(plot_df$fitted_solid)))
+                if (length(lf) > 0) plot_df$fitted_solid[idx] <- pd$cf_mean[1]
+            }
+            plot_df$fitted_dotted[idx] <- pd$cf_mean[i]
+            plot_df$cf_lower[idx]      <- pd$cf_lower[i]
+            plot_df$cf_upper[idx]      <- pd$cf_upper[i]
+        }
+    }
+
+    title_txt <- paste0(
+        "Counterfactual Analysis for ", prov,
+        ": Estimating the Grocery Rebate's\nAssociation with Food Prices ",
+        "Using a Statistical Model with Lagged Indicators")
+
+    sub_txt <- paste0(
+        "A statistical model was fit on pre-rebate Food CPI using lagged US imports (2-mo), ",
+        "lagged US core CPI (2- and 4-mo), lagged USD/CAD (2-mo),\n",
+        "and seasonal controls (",
+        format(min(pre$date), "%b %Y"), " \u2013 ",
+        format(max(pre$date), "%b %Y"),
+        "), assuming that pre-rebate dynamics would have continued after.\n",
+        "The ", N_FORECAST_MONTHS, "-month period average effect is ",
+        sprintf("%+.2f", eff$estimate), " index points ",
+        "[95% PI: ", sprintf("%.2f", eff$ci_lower), ", ",
+        sprintf("%.2f", eff$ci_upper), "] | p = ", sprintf("%.3f", eff$p_value))
+
+    # x-axis: Jan 2023, Jul 2023 (intervention), Dec 2023 (end)
+    x_breaks <- c(as.Date("2023-01-01"), INTERVENTION_START, INTERVENTION_END)
+    x_labels <- c("Jan\n2023", "Jul\n2023", "Dec\n2023")
+
+    ym <- mean(range(plot_df$food_cpi, na.rm = TRUE))
+
+    p <- ggplot(plot_df, aes(x = date)) +
+        geom_ribbon(aes(ymin = cf_lower, ymax = cf_upper,
+                        fill = "95% Prediction Interval"),
+                    alpha = 0.4, na.rm = TRUE) +
+        geom_line(aes(y = food_cpi, color = "Actual Food CPI"),
+                  linewidth = 0.7) +
+        geom_line(aes(y = fitted_solid, color = "Fitted Model"),
+                  linewidth = 0.8, na.rm = TRUE) +
+        geom_line(aes(y = fitted_dotted, color = "Counterfactual (No Rebate)"),
+                  linetype = "dotted", linewidth = 1, na.rm = TRUE) +
+        geom_vline(xintercept = INTERVENTION_START, linetype = "dotted",
+                   color = "darkgreen", linewidth = 0.8) +
+        geom_vline(xintercept = INTERVENTION_END, linetype = "dotted",
+                   color = "darkgreen", linewidth = 0.8) +
+        geom_segment(aes(x = PLOT_START_DATE, xend = PLOT_START_DATE + 1,
+                         y = ym, yend = ym,
+                         linetype = "2023 Grocery Rebate"),
+                     color = "darkgreen", linewidth = 0.8, alpha = 0) +
+        scale_color_manual(
+            name   = "",
+            values = c("Actual Food CPI"            = "black",
+                       "Fitted Model"               = "red",
+                       "Counterfactual (No Rebate)" = "red"),
+            guide  = guide_legend(order = 1,
+                                  override.aes = list(
+                                      linetype  = c("solid", "solid", "dotted"),
+                                      linewidth = c(0.7, 0.8, 1)))) +
+        scale_fill_manual(
+            name   = "",
+            values = c("95% Prediction Interval" = "lightpink"),
+            guide  = guide_legend(order = 2)) +
+        scale_linetype_manual(
+            name   = "",
+            values = c("2023 Grocery Rebate" = "dotted"),
+            guide  = guide_legend(order = 3,
+                                  override.aes = list(
+                                      color = "darkgreen", linewidth = 0.8, alpha = 1))) +
+        scale_x_date(breaks = x_breaks, labels = x_labels,
+                     limits = c(PLOT_START_DATE, PLOT_END_DATE)) +
+        labs(title    = title_txt,
+             subtitle = sub_txt,
+             x = "", y = "Food CPI",
+             caption  = DATA_SOURCE) +
+        theme_minimal() +
+        theme(plot.title    = element_text(face = "bold", size = 12),
+              plot.subtitle = element_text(size = 8, color = "gray30"),
+              plot.caption  = element_text(hjust = 0, size = 8),
+              legend.position = "bottom",
+              legend.box      = "horizontal",
+              legend.text     = element_text(size = 8))
+
+    print(p)
+}
