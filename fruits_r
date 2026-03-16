@@ -12,7 +12,7 @@
 #         Table 2 — Yearly detail (fiscal year: Apr–Mar)
 #         Table 3 — Model ranking within ±TOLERANCE_PP
 #
-# Dependencies: forecast, zoo, truncnorm (if SCENARIO_AVG_ENABLED)
+# Dependencies: forecast, zoo
 ################################################################################
 
 library(forecast)
@@ -56,11 +56,6 @@ SCENARIO_STEP   <-  0.1       # step size (pp)
 TOLERANCE_PP    <- 1.0        # best-model ranking uses scenarios within ±X pp
 MAPE_TYPE       <- "both"     # "yearly", "monthly", or "both"
 
-# --- Scenario averaging (truncated normal weighting) -------------------------
-SCENARIO_AVG_ENABLED   <- TRUE    # TRUE = also produce weighted-average forecasts
-SCENARIO_AVG_HALFWIDTH <- 0.5     # half-width in pp
-SCENARIO_AVG_SD        <- 0.25    # SD of truncated normal in pp
-
 # --- ARIMAX fitting ----------------------------------------------------------
 MAX_AR          <- 3
 MAX_MA          <- 3
@@ -80,14 +75,7 @@ cat("  CV:          train", MIN_TRAIN_YEARS, "FY expanding, predict", FORECAST_M
 cat("  Lags:        1–", MAX_LAG, ", max", MAX_N_LAGS, "per model\n")
 cat("  Scenarios:   ", SCENARIO_MIN, "% to", SCENARIO_MAX, "% by", SCENARIO_STEP, "pp\n")
 cat("  Tolerance:   ±", TOLERANCE_PP, "pp for ranking\n")
-cat("  MAPE type:   ", MAPE_TYPE, "\n")
-if (SCENARIO_AVG_ENABLED) {
-  cat("  Scenario avg: ON  |  half-width =", SCENARIO_AVG_HALFWIDTH,
-      "pp  |  SD =", SCENARIO_AVG_SD, "pp\n")
-} else {
-  cat("  Scenario avg: OFF\n")
-}
-cat("\n")
+cat("  MAPE type:   ", MAPE_TYPE, "\n\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. IMPORT DATA
@@ -411,112 +399,20 @@ cat(sprintf("\nAll done. %d fits (%d failures) across %d folds in %.1f min.\n\n"
 
 # ── Table 1: Monthly detail ──────────────────────────────────────────────────
 table1 <- do.call(rbind, monthly_results)
-table1$scenario_type <- "point"
 rownames(table1) <- NULL
-
-# ── Scenario averaging: weighted forecasts via truncated normal ──────────────
-if (SCENARIO_AVG_ENABLED) {
-
-  cat("Computing scenario-averaged (weighted) forecasts...\n")
-
-  library(truncnorm)
-
-  weighted_rows <- list()
-  w_idx <- 0
-
-  fm_combos <- unique(table1[, c("fold", "model")])
-
-  for (r in seq_len(nrow(fm_combos))) {
-    f_val <- fm_combos$fold[r]
-    m_val <- fm_combos$model[r]
-
-    sub <- table1[table1$fold == f_val & table1$model == m_val &
-                    table1$scenario_type == "point", ]
-    if (nrow(sub) == 0) next
-
-    avail_scenarios <- sort(unique(sub$scenario))
-    true_scen       <- sub$true_scenario[1]
-    test_fy_val     <- sub$fiscal_year[1]
-
-    for (center in avail_scenarios) {
-
-      lo <- center - SCENARIO_AVG_HALFWIDTH
-      hi <- center + SCENARIO_AVG_HALFWIDTH
-
-      neighbours <- avail_scenarios[avail_scenarios >= lo & avail_scenarios <= hi]
-      if (length(neighbours) < 2) next
-
-      raw_weights <- dtruncnorm(neighbours, a = lo, b = hi,
-                                mean = center, sd = SCENARIO_AVG_SD)
-      weights <- raw_weights / sum(raw_weights)
-
-      neighbour_rows <- sub[sub$scenario %in% neighbours, ]
-      months_in_fold <- sort(unique(neighbour_rows$month))
-      weighted_fc    <- numeric(length(months_in_fold))
-      actual_vals    <- numeric(length(months_in_fold))
-      cal_years_out  <- numeric(length(months_in_fold))
-
-      for (mi in seq_along(months_in_fold)) {
-        mo <- months_in_fold[mi]
-        mo_rows <- neighbour_rows[neighbour_rows$month == mo, ]
-
-        mo_scens  <- mo_rows$scenario
-        w_matched <- weights[match(mo_scens, neighbours)]
-        w_matched <- w_matched / sum(w_matched, na.rm = TRUE)
-
-        weighted_fc[mi] <- sum(mo_rows$forecast_month * w_matched, na.rm = TRUE)
-        actual_vals[mi] <- mo_rows$actual_month[1]
-        cal_years_out[mi] <- mo_rows$cal_year[1]
-      }
-
-      diff_pct <- round(true_scen - center, 2)
-
-      w_idx <- w_idx + 1
-      weighted_rows[[w_idx]] <- data.frame(
-        fold           = f_val,
-        fiscal_year    = test_fy_val,
-        month          = months_in_fold,
-        cal_year       = cal_years_out,
-        model          = m_val,
-        actual_month   = round(actual_vals, 2),
-        forecast_month = round(weighted_fc, 2),
-        scenario       = center,
-        true_scenario  = true_scen,
-        monthly_mape   = round(abs(actual_vals - weighted_fc) / abs(actual_vals) * 100, 3),
-        scenario_diff  = diff_pct,
-        scenario_type  = "weighted",
-        stringsAsFactors = FALSE
-      )
-    }
-
-    if (r %% 500 == 0) cat(sprintf("  Weighted: %d / %d fold x model combos\n", r, nrow(fm_combos)))
-  }
-
-  if (length(weighted_rows) > 0) {
-    weighted_df <- do.call(rbind, weighted_rows)
-    table1 <- rbind(table1, weighted_df)
-    rownames(table1) <- NULL
-    cat(sprintf("  Added %d weighted rows (%d total in Table 1)\n",
-                nrow(weighted_df), nrow(table1)))
-  }
-}
 
 cat("TABLE 1 (monthly):", nrow(table1), "rows\n")
 
 write.csv(table1, OUTPUT_TABLE1, row.names = FALSE)
 cat("  Saved to", OUTPUT_TABLE1, "\n")
 
-cat("\n  Sample — point (first 10):\n")
-print(head(table1[table1$scenario_type == "point", ], 10), row.names = FALSE)
-if (SCENARIO_AVG_ENABLED && any(table1$scenario_type == "weighted")) {
-  cat("\n  Sample — weighted (first 10):\n")
-  print(head(table1[table1$scenario_type == "weighted", ], 10), row.names = FALSE)
-}
+cat("\n  Sample (first 10):\n")
+print(head(table1, 10), row.names = FALSE)
 
 # ── Table 2: Yearly detail (fiscal year aggregation from Table 1) ────────────
 table2 <- aggregate(
   cbind(actual_month, forecast_month) ~
-    fold + fiscal_year + model + scenario + true_scenario + scenario_diff + scenario_type,
+    fold + fiscal_year + model + scenario + true_scenario + scenario_diff,
   data = table1,
   FUN  = sum
 )
@@ -529,8 +425,7 @@ table2$yearly_mape   <- round(abs(table2$actual_year - table2$forecast_year) /
                                 abs(table2$actual_year) * 100, 3)
 
 table2 <- table2[, c("fold", "fiscal_year", "model", "actual_year", "forecast_year",
-                      "scenario", "true_scenario", "yearly_mape", "scenario_diff",
-                      "scenario_type")]
+                      "scenario", "true_scenario", "yearly_mape", "scenario_diff")]
 table2 <- table2[order(table2$yearly_mape), ]
 rownames(table2) <- NULL
 
@@ -539,12 +434,8 @@ cat("\nTABLE 2 (yearly):", nrow(table2), "rows\n")
 write.csv(table2, OUTPUT_TABLE2, row.names = FALSE)
 cat("  Saved to", OUTPUT_TABLE2, "\n")
 
-cat("\n  Sample — point (first 10):\n")
-print(head(table2[table2$scenario_type == "point", ], 10), row.names = FALSE)
-if (SCENARIO_AVG_ENABLED && any(table2$scenario_type == "weighted")) {
-  cat("\n  Sample — weighted (first 10):\n")
-  print(head(table2[table2$scenario_type == "weighted", ], 10), row.names = FALSE)
-}
+cat("\n  Sample (first 10):\n")
+print(head(table2, 10), row.names = FALSE)
 
 # ── Table 3: Model ranking within ±TOLERANCE_PP ─────────────────────────────
 in_band <- table2[abs(table2$scenario_diff) <= TOLERANCE_PP, ]
@@ -552,17 +443,17 @@ in_band <- table2[abs(table2$scenario_diff) <= TOLERANCE_PP, ]
 if (nrow(in_band) > 0) {
 
   if (MAPE_TYPE %in% c("yearly", "both")) {
-    yearly_rank <- aggregate(yearly_mape ~ model + scenario_type,
+    yearly_rank <- aggregate(yearly_mape ~ model,
                              data = in_band, FUN = mean, na.rm = TRUE)
-    names(yearly_rank)[3] <- "avg_yearly_mape"
+    names(yearly_rank)[2] <- "avg_yearly_mape"
     yearly_rank$avg_yearly_mape <- round(yearly_rank$avg_yearly_mape, 3)
   }
 
   if (MAPE_TYPE %in% c("monthly", "both")) {
     t1_band <- table1[abs(table1$scenario_diff) <= TOLERANCE_PP, ]
-    monthly_rank <- aggregate(monthly_mape ~ model + scenario_type,
+    monthly_rank <- aggregate(monthly_mape ~ model,
                               data = t1_band, FUN = mean, na.rm = TRUE)
-    names(monthly_rank)[3] <- "avg_monthly_mape"
+    names(monthly_rank)[2] <- "avg_monthly_mape"
     monthly_rank$avg_monthly_mape <- round(monthly_rank$avg_monthly_mape, 3)
   }
 
@@ -571,24 +462,21 @@ if (nrow(in_band) > 0) {
   } else if (MAPE_TYPE == "monthly") {
     table3 <- monthly_rank[order(monthly_rank$avg_monthly_mape), ]
   } else {
-    table3 <- merge(yearly_rank, monthly_rank, by = c("model", "scenario_type"))
+    table3 <- merge(yearly_rank, monthly_rank, by = "model")
     table3 <- table3[order(table3$avg_yearly_mape), ]
   }
 
   rownames(table3) <- NULL
 
-  cat(sprintf("\nTABLE 3: Model Ranking within +/- %.1f pp (%d rows)\n",
+  cat(sprintf("\nTABLE 3: Model Ranking within +/- %.1f pp (%d models)\n",
               TOLERANCE_PP, nrow(table3)))
   print(table3, row.names = FALSE)
 
-  for (st in unique(table3$scenario_type)) {
-    sub  <- table3[table3$scenario_type == st, ]
-    best <- sub[1, ]
-    cat(sprintf("\n>>> Best (%s): lags = %s", st, best$model))
-    if ("avg_yearly_mape"  %in% names(best)) cat(sprintf("  |  yearly = %.3f%%", best$avg_yearly_mape))
-    if ("avg_monthly_mape" %in% names(best)) cat(sprintf("  |  monthly = %.3f%%", best$avg_monthly_mape))
-    cat("\n")
-  }
+  best <- table3[1, ]
+  cat(sprintf("\n>>> Best model: lags = %s", best$model))
+  if ("avg_yearly_mape"  %in% names(best)) cat(sprintf("  |  yearly = %.3f%%", best$avg_yearly_mape))
+  if ("avg_monthly_mape" %in% names(best)) cat(sprintf("  |  monthly = %.3f%%", best$avg_monthly_mape))
+  cat("\n")
 
   write.csv(table3, OUTPUT_TABLE3, row.names = FALSE)
   cat("  Saved to", OUTPUT_TABLE3, "\n")
