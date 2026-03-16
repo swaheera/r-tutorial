@@ -1,0 +1,457 @@
+################################################################################
+# ARIMAX Rolling-Origin Cross-Validation: Sales ~ Lagged Population
+#
+# Step 0: Simulate two CSV files (quarterly_population.csv, monthly_sales.csv)
+# Step 1: Import them as if they were real data
+# Step 2: Interpolate population to monthly
+# Step 3: Rolling-origin CV across expanding training windows
+# Step 4: For every lag combo × scenario × fold → store monthly forecasts
+# Step 5: Build 3 output tables:
+#         Table 1 — Monthly detail (month, year, model, actual, forecast, etc.)
+#         Table 2 — Yearly detail  (year, model, actual, forecast, etc.)
+#         Table 3 — Model ranking within ±TOLERANCE_PP
+#
+# Dependencies: forecast, zoo
+################################################################################
+
+library(forecast)
+library(zoo)
+
+set.seed(42)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0. SIMULATE INPUT FILES (replace this section when using real data)
+# ══════════════════════════════════════════════════════════════════════════════
+
+sim_quarter_dates <- seq(as.Date("2020-01-01"), as.Date("2026-10-01"), by = "3 months")
+sim_n_q <- length(sim_quarter_dates)
+sim_pop <- 38e6 * cumprod(c(1, rep(1 + 0.013/4, sim_n_q - 1))) +
+  cumsum(rnorm(sim_n_q, 0, 15000))
+
+write.csv(
+  data.frame(date = sim_quarter_dates, population = sim_pop),
+  "quarterly_population.csv", row.names = FALSE
+)
+
+sim_month_dates <- seq(as.Date("2020-01-01"), as.Date("2026-10-01"), by = "month")
+sim_n_m <- length(sim_month_dates)
+sim_pop_m <- approx(as.numeric(sim_quarter_dates), sim_pop,
+                    xout = as.numeric(sim_month_dates), rule = 2)$y
+sim_pop_sc <- (sim_pop_m - mean(sim_pop_m)) / sd(sim_pop_m)
+
+sim_exog <- rep(0, sim_n_m)
+for (k in seq_along(c(1, 3, 6))) {
+  L <- c(1, 3, 6)[k]; B <- c(800, 500, 300)[k]
+  lagged <- c(rep(NA, L), sim_pop_sc[1:(sim_n_m - L)])
+  sim_exog <- sim_exog + B * ifelse(is.na(lagged), 0, lagged)
+}
+sim_noise <- arima.sim(list(ar = 0.6, ma = 0.3), n = sim_n_m, sd = 400)
+sim_sales <- 50000 + sim_exog + as.numeric(sim_noise) + rnorm(sim_n_m, 0, 200)
+
+write.csv(
+  data.frame(date = sim_month_dates, sales = sim_sales),
+  "monthly_sales.csv", row.names = FALSE
+)
+
+cat("Simulated CSVs written: quarterly_population.csv, monthly_sales.csv\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+# --- Input files & column names ----------------------------------------------
+POP_FILE        <- "quarterly_population.csv"
+POP_DATE_COL    <- "date"
+POP_VALUE_COL   <- "population"
+
+SALES_FILE      <- "monthly_sales.csv"
+SALES_DATE_COL  <- "date"
+SALES_VALUE_COL <- "sales"
+
+# --- Time range --------------------------------------------------------------
+START_YEAR      <- 2020
+END_YEAR        <- 2026
+END_MONTH       <- 10
+
+# --- Cross-validation --------------------------------------------------------
+MIN_TRAIN_YEARS <- 2          # first fold trains on this many years
+FORECAST_MONTHS <- 12         # predict this many months per fold
+
+# --- Lag structure -----------------------------------------------------------
+MAX_LAG         <- 12         # consider lags 1 through this value
+MAX_N_LAGS      <- 6          # max number of lags per model
+
+# --- Transform ---------------------------------------------------------------
+LOG_XREG        <- FALSE      # TRUE = take log of population before lagging
+
+# --- Population growth scenarios (in %, human-readable) ----------------------
+SCENARIO_MIN    <- -3         # lowest annual growth rate (%)
+SCENARIO_MAX    <-  3         # highest annual growth rate (%)
+SCENARIO_STEP   <-  0.1       # step size (pp)
+
+# --- Evaluation --------------------------------------------------------------
+TOLERANCE_PP    <- 1.0        # best-model ranking uses scenarios within ±X pp
+MAPE_TYPE       <- "both"     # "yearly", "monthly", or "both"
+
+# --- ARIMAX fitting ----------------------------------------------------------
+MAX_AR          <- 3
+MAX_MA          <- 3
+MAX_DIFF        <- 1
+
+# --- Output ------------------------------------------------------------------
+OUTPUT_TABLE1   <- "table1_monthly.csv"
+OUTPUT_TABLE2   <- "table2_yearly.csv"
+OUTPUT_TABLE3   <- "table3_ranking.csv"
+
+cat("=== Configuration ===\n")
+cat("  Pop file:   ", POP_FILE, " (cols:", POP_DATE_COL, ",", POP_VALUE_COL, ")\n")
+cat("  Sales file: ", SALES_FILE, " (cols:", SALES_DATE_COL, ",", SALES_VALUE_COL, ")\n")
+cat("  Log xreg:   ", LOG_XREG, "\n")
+cat("  Period:      ", START_YEAR, "–", END_YEAR, "\n")
+cat("  CV:          train", MIN_TRAIN_YEARS, "yr expanding, predict", FORECAST_MONTHS, "mo\n")
+cat("  Lags:        1–", MAX_LAG, ", max", MAX_N_LAGS, "per model\n")
+cat("  Scenarios:   ", SCENARIO_MIN, "% to", SCENARIO_MAX, "% by", SCENARIO_STEP, "pp\n")
+cat("  Tolerance:   ±", TOLERANCE_PP, "pp for ranking\n")
+cat("  MAPE type:   ", MAPE_TYPE, "\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. IMPORT DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
+pop_raw <- read.csv(POP_FILE, stringsAsFactors = FALSE)
+pop_q_df <- data.frame(
+  date = as.Date(pop_raw[[POP_DATE_COL]]),
+  pop  = as.numeric(pop_raw[[POP_VALUE_COL]])
+)
+cat("Quarterly population:", nrow(pop_q_df), "rows\n")
+
+monthly_dates <- seq(as.Date(paste0(START_YEAR, "-01-01")),
+                     as.Date(paste0(END_YEAR, "-", sprintf("%02d", END_MONTH), "-01")),
+                     by = "month")
+
+pop_monthly <- approx(
+  x = as.numeric(pop_q_df$date), y = pop_q_df$pop,
+  xout = as.numeric(monthly_dates), rule = 2
+)$y
+
+pop_m_df <- data.frame(date = monthly_dates, pop = pop_monthly)
+if (LOG_XREG) {
+  pop_m_df$pop <- log(pop_m_df$pop)
+  cat("  (log transform applied to population)\n")
+}
+cat("Monthly population:", nrow(pop_m_df), "rows\n")
+
+sales_raw <- read.csv(SALES_FILE, stringsAsFactors = FALSE)
+sales_df <- data.frame(
+  date  = as.Date(sales_raw[[SALES_DATE_COL]]),
+  sales = as.numeric(sales_raw[[SALES_VALUE_COL]])
+)
+cat("Monthly sales:", nrow(sales_df), "rows\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. CROSS-VALIDATION FOLDS
+# ══════════════════════════════════════════════════════════════════════════════
+all_dates  <- pop_m_df$date
+first_date <- min(all_dates)
+
+folds   <- list()
+fold_id <- 0
+
+for (n_train_years in MIN_TRAIN_YEARS:(END_YEAR - START_YEAR)) {
+  train_end_date <- as.Date(paste0(START_YEAR + n_train_years - 1, "-12-01"))
+  test_start     <- as.Date(paste0(START_YEAR + n_train_years, "-01-01"))
+  test_end       <- as.Date(paste0(START_YEAR + n_train_years, "-",
+                                    sprintf("%02d", FORECAST_MONTHS), "-01"))
+  if (test_end > max(all_dates)) break
+
+  fold_id <- fold_id + 1
+  folds[[fold_id]] <- list(
+    fold      = fold_id,
+    train_idx = which(all_dates >= first_date & all_dates <= train_end_date),
+    test_idx  = which(all_dates >= test_start & all_dates <= test_end),
+    train_end = train_end_date, test_start = test_start, test_end = test_end
+  )
+}
+
+n_folds <- length(folds)
+cat("Folds:", n_folds, "\n")
+for (f in folds) {
+  cat(sprintf("  Fold %d: train %s–%s (%d mo) → test %s–%s (%d mo)\n",
+              f$fold, format(min(all_dates[f$train_idx])), format(f$train_end),
+              length(f$train_idx), format(f$test_start), format(f$test_end),
+              length(f$test_idx)))
+}
+cat("\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. LAG COMBOS + SCENARIOS
+# ══════════════════════════════════════════════════════════════════════════════
+all_combos   <- list()
+combo_labels <- character()
+for (k in 1:MAX_N_LAGS) {
+  ck <- combn(1:MAX_LAG, k, simplify = FALSE)
+  all_combos   <- c(all_combos, ck)
+  combo_labels <- c(combo_labels, sapply(ck, function(x) paste(x, collapse = ",")))
+}
+n_combos <- length(all_combos)
+
+annual_rates <- seq(SCENARIO_MIN, SCENARIO_MAX, by = SCENARIO_STEP) / 100
+n_scenarios  <- length(annual_rates)
+
+cat("Lag combos:", n_combos, " | Scenarios:", n_scenarios, "\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+build_xreg <- function(pop_vector, lags) {
+  n <- length(pop_vector)
+  X <- matrix(NA, nrow = n, ncol = length(lags))
+  colnames(X) <- paste0("lag", lags)
+  for (k in seq_along(lags)) {
+    L <- lags[k]
+    X[, k] <- c(rep(NA, L), pop_vector[1:(n - L)])
+  }
+  return(X)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. MAIN LOOP — store monthly forecasts in a list of data frames
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Collect monthly rows here (pre-allocate a list, rbind once at the end)
+monthly_results <- vector("list", n_folds)
+
+true_growth <- numeric(n_folds)
+
+total_models <- n_combos * n_folds
+model_count  <- 0
+fail_count   <- 0
+t_start      <- Sys.time()
+
+for (f_idx in seq_len(n_folds)) {
+
+  fold <- folds[[f_idx]]
+  h    <- length(fold$test_idx)
+
+  pop_train  <- pop_m_df$pop[fold$train_idx]
+  y_train_ts <- ts(sales_df$sales[fold$train_idx], frequency = 12,
+                   start = c(as.numeric(format(min(all_dates[fold$train_idx]), "%Y")),
+                             as.numeric(format(min(all_dates[fold$train_idx]), "%m"))))
+
+  actual_monthly <- sales_df$sales[fold$test_idx]
+  test_dates     <- all_dates[fold$test_idx]
+  test_months    <- as.numeric(format(test_dates, "%m"))
+  test_year      <- as.numeric(format(test_dates[1], "%Y"))  # fold predicts one year
+
+  pop_test_true      <- pop_m_df$pop[fold$test_idx]
+  true_growth[f_idx] <- (pop_test_true[h] / pop_test_true[1])^(12 / (h - 1)) - 1
+  true_scen_pct      <- round(true_growth[f_idx] * 100, 2)
+  last_train_pop     <- pop_train[length(pop_train)]
+
+  pop_scen_fold <- matrix(NA, nrow = h, ncol = n_scenarios)
+  for (s in seq_len(n_scenarios)) {
+    mr <- (1 + annual_rates[s])^(1/12) - 1
+    pop_scen_fold[, s] <- last_train_pop * (1 + mr)^(1:h)
+  }
+
+  cat(sprintf("\n── Fold %d / %d ─────────────────────────────────────────────\n",
+              f_idx, n_folds))
+  cat(sprintf("   Train : %s – %s  (%d months)\n",
+              format(min(all_dates[fold$train_idx])), format(fold$train_end),
+              length(fold$train_idx)))
+  cat(sprintf("   Test  : %s – %s  (%d months)\n",
+              format(fold$test_start), format(fold$test_end), h))
+  cat(sprintf("   Models: %d  |  Scenarios: %d\n", n_combos, n_scenarios))
+
+  fold_fit   <- 0
+  fold_fail  <- 0
+  fold_start <- Sys.time()
+
+  # Pre-allocate for this fold: list of data frames per (combo, scenario)
+  fold_rows <- vector("list", n_combos * n_scenarios)
+  row_idx   <- 0
+
+  for (i in seq_len(n_combos)) {
+
+    lags_i    <- all_combos[[i]]
+    max_lag_i <- max(lags_i)
+
+    X_train_full <- build_xreg(pop_train, lags_i)
+    first_valid  <- max_lag_i + 1
+
+    if (first_valid >= length(pop_train)) {
+      fail_count <- fail_count + 1
+      fold_fail  <- fold_fail + 1
+      next
+    }
+
+    X_train <- X_train_full[first_valid:length(pop_train), , drop = FALSE]
+    y_trim  <- y_train_ts[first_valid:length(y_train_ts)]
+
+    sy <- as.numeric(format(all_dates[fold$train_idx[first_valid]], "%Y"))
+    sm <- as.numeric(format(all_dates[fold$train_idx[first_valid]], "%m"))
+    y_trim <- ts(y_trim, frequency = 12, start = c(sy, sm))
+
+    fit <- tryCatch(
+      auto.arima(y_trim, xreg = X_train, seasonal = FALSE,
+                 max.p = MAX_AR, max.q = MAX_MA, max.d = MAX_DIFF,
+                 stepwise = TRUE, approximation = TRUE, trace = FALSE),
+      error = function(e) NULL
+    )
+
+    if (is.null(fit)) {
+      fail_count <- fail_count + 1
+      fold_fail  <- fold_fail + 1
+      next
+    }
+
+    for (s in seq_len(n_scenarios)) {
+      pop_ext  <- c(pop_train, pop_scen_fold[, s])
+      X_ext    <- build_xreg(pop_ext, lags_i)
+      X_future <- X_ext[(length(pop_train) + 1):(length(pop_train) + h), , drop = FALSE]
+
+      if (any(is.na(X_future))) next
+
+      fc <- tryCatch(
+        forecast(fit, xreg = X_future, h = h),
+        error = function(e) NULL
+      )
+      if (is.null(fc)) next
+
+      fc_vals   <- as.numeric(fc$mean)
+      scen_pct  <- round(annual_rates[s] * 100, 2)
+      diff_pct  <- true_scen_pct - scen_pct
+
+      row_idx <- row_idx + 1
+      fold_rows[[row_idx]] <- data.frame(
+        fold           = f_idx,
+        month          = test_months,
+        year           = test_year,
+        model          = combo_labels[i],
+        actual_month   = round(actual_monthly, 2),
+        forecast_month = round(fc_vals, 2),
+        scenario       = scen_pct,
+        true_scenario  = true_scen_pct,
+        monthly_mape   = round(abs(actual_monthly - fc_vals) / abs(actual_monthly) * 100, 3),
+        scenario_diff  = round(diff_pct, 2),
+        stringsAsFactors = FALSE
+      )
+    }
+
+    model_count <- model_count + 1
+    fold_fit    <- fold_fit + 1
+
+    fold_elapsed <- as.numeric(difftime(Sys.time(), fold_start, units = "mins"))
+    rate <- fold_fit / max(fold_elapsed, 0.001)
+    remaining <- (n_combos - fold_fit - fold_fail) / max(rate, 0.001)
+    cat(sprintf("   [%4d / %d]  %.0f%%  |  %.1f min elapsed  |  ~%.1f min left  |  lags: %s\n",
+                fold_fit, n_combos, fold_fit / n_combos * 100,
+                fold_elapsed, remaining, combo_labels[i]))
+  }
+
+  fold_elapsed <- as.numeric(difftime(Sys.time(), fold_start, units = "mins"))
+  cat(sprintf("   Fold %d done: %d fitted, %d failed, %.1f min\n",
+              f_idx, fold_fit, fold_fail, fold_elapsed))
+
+  # Combine non-null rows for this fold
+  monthly_results[[f_idx]] <- do.call(rbind, fold_rows[1:row_idx])
+}
+
+elapsed_total <- as.numeric(difftime(Sys.time(), t_start, units = "mins"))
+cat(sprintf("\nAll done. %d fits (%d failures) across %d folds in %.1f min.\n\n",
+            model_count, fail_count, n_folds, elapsed_total))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. BUILD TABLES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Table 1: Monthly detail ──────────────────────────────────────────────────
+table1 <- do.call(rbind, monthly_results)
+rownames(table1) <- NULL
+
+cat("TABLE 1 (monthly):", nrow(table1), "rows\n")
+
+write.csv(table1, OUTPUT_TABLE1, row.names = FALSE)
+cat("  Saved to", OUTPUT_TABLE1, "\n")
+
+cat("\n  Sample (first 20 rows):\n")
+print(head(table1, 20), row.names = FALSE)
+
+# ── Table 2: Yearly detail (aggregate from Table 1) ─────────────────────────
+table2 <- aggregate(
+  cbind(actual_month, forecast_month) ~ fold + year + model + scenario + true_scenario + scenario_diff,
+  data = table1,
+  FUN  = sum
+)
+names(table2)[names(table2) == "actual_month"]   <- "actual_year"
+names(table2)[names(table2) == "forecast_month"] <- "forecast_year"
+
+table2$actual_year   <- round(table2$actual_year, 2)
+table2$forecast_year <- round(table2$forecast_year, 2)
+table2$yearly_mape   <- round(abs(table2$actual_year - table2$forecast_year) /
+                                abs(table2$actual_year) * 100, 3)
+
+table2 <- table2[, c("fold", "year", "model", "actual_year", "forecast_year",
+                      "scenario", "true_scenario", "yearly_mape", "scenario_diff")]
+table2 <- table2[order(table2$yearly_mape), ]
+rownames(table2) <- NULL
+
+cat("\nTABLE 2 (yearly):", nrow(table2), "rows\n")
+
+write.csv(table2, OUTPUT_TABLE2, row.names = FALSE)
+cat("  Saved to", OUTPUT_TABLE2, "\n")
+
+cat("\n  Sample (first 20 rows):\n")
+print(head(table2, 20), row.names = FALSE)
+
+# ── Table 3: Model ranking within ±TOLERANCE_PP ─────────────────────────────
+# Filter table2 to scenarios within tolerance, then rank models by avg MAPE
+
+in_band <- table2[abs(table2$scenario_diff) <= TOLERANCE_PP, ]
+
+if (nrow(in_band) > 0) {
+
+  # Build ranking depending on MAPE_TYPE
+  if (MAPE_TYPE %in% c("yearly", "both")) {
+    yearly_rank <- aggregate(yearly_mape ~ model, data = in_band, FUN = mean, na.rm = TRUE)
+    names(yearly_rank)[2] <- "avg_yearly_mape"
+    yearly_rank$avg_yearly_mape <- round(yearly_rank$avg_yearly_mape, 3)
+  }
+
+  if (MAPE_TYPE %in% c("monthly", "both")) {
+    # Get avg monthly MAPE from table1 filtered to the same band
+    t1_band <- table1[abs(table1$scenario_diff) <= TOLERANCE_PP, ]
+    monthly_rank <- aggregate(monthly_mape ~ model, data = t1_band, FUN = mean, na.rm = TRUE)
+    names(monthly_rank)[2] <- "avg_monthly_mape"
+    monthly_rank$avg_monthly_mape <- round(monthly_rank$avg_monthly_mape, 3)
+  }
+
+  if (MAPE_TYPE == "yearly") {
+    table3 <- yearly_rank[order(yearly_rank$avg_yearly_mape), ]
+  } else if (MAPE_TYPE == "monthly") {
+    table3 <- monthly_rank[order(monthly_rank$avg_monthly_mape), ]
+  } else {
+    table3 <- merge(yearly_rank, monthly_rank, by = "model")
+    table3 <- table3[order(table3$avg_yearly_mape), ]
+  }
+
+  rownames(table3) <- NULL
+
+  cat(sprintf("\nTABLE 3: Model Ranking within +/- %.1f pp (%d models)\n",
+              TOLERANCE_PP, nrow(table3)))
+  print(table3, row.names = FALSE)
+
+  best <- table3[1, ]
+  cat(sprintf("\n>>> Best model: lags = %s", best$model))
+  if ("avg_yearly_mape"  %in% names(best)) cat(sprintf("  |  yearly = %.3f%%", best$avg_yearly_mape))
+  if ("avg_monthly_mape" %in% names(best)) cat(sprintf("  |  monthly = %.3f%%", best$avg_monthly_mape))
+  cat("\n")
+
+  write.csv(table3, OUTPUT_TABLE3, row.names = FALSE)
+  cat("  Saved to", OUTPUT_TABLE3, "\n")
+
+} else {
+  cat(sprintf("\nNo scenarios within +/- %.1f pp — widen TOLERANCE_PP.\n", TOLERANCE_PP))
+}
+
+cat("\nScript complete.\n")
