@@ -1,0 +1,572 @@
+################################################################################
+# ARIMAX Rolling-Origin CV: Coherent Component Ensemble Forecasting
+#
+# For each lag combo × fold:
+#   1. Observe last year's population growth rate from training data
+#   2. Draw N_SIM samples from truncated normal centered on that rate (±HALFWIDTH)
+#   3. For each sample, build a population path and forecast apple + banana
+#   4. Average the N_SIM forecast vectors → one ensemble forecast
+#   5. forecast_total = forecast_apple + forecast_banana (coherent)
+#   6. Evaluate MAPE for apple, banana, total
+#
+# Fiscal year: April 1 – March 31 (partial last FY allowed)
+# Includes null model (no xreg — pure ARIMA)
+#
+# Output:
+#   Table 1 — Monthly detail (apple, banana, total per row)
+#   Table 2 — Yearly detail  (fiscal year aggregation)
+#   Table 3 — Model ranking (all models sorted by total MAPE)
+#
+# Dependencies: forecast, zoo, truncnorm
+################################################################################
+
+library(forecast)
+library(zoo)
+library(truncnorm)
+
+set.seed(42)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+# --- Input files & column names ----------------------------------------------
+POP_FILE        <- "quarterly_population.csv"
+POP_DATE_COL    <- "date"
+POP_VALUE_COL   <- "population"
+
+DATA_FILE       <- "monthly_data.csv"
+DATA_DATE_COL   <- "date"
+
+# --- Component columns -------------------------------------------------------
+APPLE_COL       <- "apple_sales"
+BANANA_COL      <- "banana_sales"
+TOTAL_COL       <- "total_sales"
+
+# --- Fiscal year definition --------------------------------------------------
+FY_START_MONTH  <- 4          # fiscal year starts April
+FORECAST_MONTHS <- 12         # predict 12 months per fold
+
+# --- Cross-validation --------------------------------------------------------
+MIN_TRAIN_YEARS <- 2          # first fold trains on this many fiscal years
+
+# --- Lag structure -----------------------------------------------------------
+MAX_LAG         <- 12         # consider lags 1 through this value
+MAX_N_LAGS      <- 6          # max number of lags per model
+
+# --- Transform ---------------------------------------------------------------
+LOG_XREG        <- FALSE      # TRUE = take log of population before lagging
+
+# --- Ensemble scenario sampling ----------------------------------------------
+N_SIM           <- 100        # number of random population growth draws per fold
+SIM_HALFWIDTH   <- 1.0        # half-width in pp (centered on last year's rate)
+SIM_SD          <- 0.25       # SD of truncated normal in pp
+
+# --- ARIMAX fitting ----------------------------------------------------------
+MAX_AR          <- 3
+MAX_MA          <- 3
+MAX_DIFF        <- 1
+
+# --- Output ------------------------------------------------------------------
+OUTPUT_DIR      <- "."
+
+cat("=== Configuration ===\n")
+cat("  Pop file:    ", POP_FILE, "\n")
+cat("  Data file:   ", DATA_FILE, "\n")
+cat("  Components:  ", APPLE_COL, " + ", BANANA_COL, " → ", TOTAL_COL, "\n")
+cat("  Fiscal year: Apr 1 – Mar 31\n")
+cat("  CV:          train", MIN_TRAIN_YEARS, "FY expanding, predict", FORECAST_MONTHS, "mo\n")
+cat("  Lags:        1–", MAX_LAG, ", max", MAX_N_LAGS, "per model  (+null)\n")
+cat("  Ensemble:   ", N_SIM, "draws ~ TruncNorm(last_yr_rate, SD=", SIM_SD,
+    ", +/-", SIM_HALFWIDTH, "pp)\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. IMPORT DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
+pop_raw <- read.csv(POP_FILE, stringsAsFactors = FALSE)
+pop_q_df <- data.frame(
+  date = as.Date(pop_raw[[POP_DATE_COL]]),
+  pop  = as.numeric(pop_raw[[POP_VALUE_COL]])
+)
+cat("Quarterly population:", nrow(pop_q_df), "rows\n")
+
+monthly_dates <- seq(min(pop_q_df$date), max(pop_q_df$date), by = "month")
+pop_monthly <- approx(
+  x = as.numeric(pop_q_df$date), y = pop_q_df$pop,
+  xout = as.numeric(monthly_dates), rule = 2
+)$y
+
+pop_m_df <- data.frame(date = monthly_dates, pop = pop_monthly)
+if (LOG_XREG) {
+  pop_m_df$pop <- log(pop_m_df$pop)
+  cat("  (log transform applied)\n")
+}
+cat("Monthly population:", nrow(pop_m_df), "rows\n")
+
+data_raw <- read.csv(DATA_FILE, stringsAsFactors = FALSE)
+data_raw[[DATA_DATE_COL]] <- as.Date(data_raw[[DATA_DATE_COL]])
+
+needed_cols <- c(APPLE_COL, BANANA_COL, TOTAL_COL)
+missing <- setdiff(needed_cols, names(data_raw))
+if (length(missing) > 0) stop("Missing columns: ", paste(missing, collapse = ", "))
+
+cat("Monthly data:", nrow(data_raw), "rows\n")
+cat("  Range:", format(min(data_raw[[DATA_DATE_COL]])), "to",
+    format(max(data_raw[[DATA_DATE_COL]])), "\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. CROSS-VALIDATION FOLDS
+# ══════════════════════════════════════════════════════════════════════════════
+all_dates  <- pop_m_df$date
+all_months <- as.numeric(format(all_dates, "%m"))
+
+first_april_idx <- which(all_months == FY_START_MONTH)[1]
+if (is.na(first_april_idx)) stop("No April found in data.")
+
+first_fy_start <- all_dates[first_april_idx]
+data_min <- min(data_raw[[DATA_DATE_COL]])
+data_max <- max(data_raw[[DATA_DATE_COL]])
+
+fy_starts <- seq(first_fy_start, max(all_dates), by = "year")
+fy_starts <- fy_starts[as.numeric(format(fy_starts, "%m")) == FY_START_MONTH]
+fy_labels <- as.numeric(format(fy_starts, "%Y"))
+
+folds   <- list()
+fold_id <- 0
+n_fy    <- length(fy_starts)
+
+for (n_train_fy in MIN_TRAIN_YEARS:(n_fy - 1)) {
+  train_start <- fy_starts[1]
+  train_end   <- as.Date(paste0(fy_labels[n_train_fy] + 1, "-03-01"))
+
+  test_fy_idx <- n_train_fy + 1
+  if (test_fy_idx > n_fy) break
+
+  test_start <- fy_starts[test_fy_idx]
+  test_end   <- as.Date(paste0(fy_labels[test_fy_idx] + 1, "-03-01"))
+
+  cap <- min(max(all_dates), data_max)
+  if (test_start > cap) break
+  if (test_end > cap) test_end <- cap
+  if (test_start < data_min) next
+
+  train_idx <- which(all_dates >= train_start & all_dates <= train_end)
+  test_idx  <- which(all_dates >= test_start  & all_dates <= test_end)
+
+  if (!all(all_dates[test_idx] %in% data_raw[[DATA_DATE_COL]])) next
+
+  fold_id <- fold_id + 1
+  folds[[fold_id]] <- list(
+    fold = fold_id, train_idx = train_idx, test_idx = test_idx,
+    train_start = train_start, train_end = train_end,
+    test_start = test_start, test_end = test_end,
+    test_fy = fy_labels[test_fy_idx],
+    partial = (test_end < as.Date(paste0(fy_labels[test_fy_idx] + 1, "-03-01")))
+  )
+}
+
+n_folds <- length(folds)
+if (n_folds == 0) stop("No valid folds.")
+
+cat("Folds:", n_folds, "\n")
+for (f in folds) {
+  tag <- if (f$partial) "  ** PARTIAL **" else ""
+  cat(sprintf("  Fold %d: train %s – %s (%d mo) → FY%d: %s – %s (%d mo)%s\n",
+              f$fold, format(f$train_start), format(f$train_end),
+              length(f$train_idx), f$test_fy,
+              format(f$test_start), format(f$test_end),
+              length(f$test_idx), tag))
+}
+cat("\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. LAG COMBOS (incl. null)
+# ══════════════════════════════════════════════════════════════════════════════
+all_combos   <- list()
+combo_labels <- character()
+
+all_combos[[1]] <- integer(0)
+combo_labels[1] <- "null"
+
+for (k in 1:MAX_N_LAGS) {
+  ck <- combn(1:MAX_LAG, k, simplify = FALSE)
+  all_combos   <- c(all_combos, ck)
+  combo_labels <- c(combo_labels, sapply(ck, function(x) paste(x, collapse = ",")))
+}
+n_combos <- length(all_combos)
+
+cat("Lag combos:", n_combos, "(incl. null)  | Sims per fold:", N_SIM, "\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+build_xreg <- function(pop_vector, lags) {
+  n <- length(pop_vector)
+  X <- matrix(NA, nrow = n, ncol = length(lags))
+  colnames(X) <- paste0("lag", lags)
+  for (k in seq_along(lags)) {
+    L <- lags[k]
+    X[, k] <- c(rep(NA, L), pop_vector[1:(n - L)])
+  }
+  return(X)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. MAIN LOOP
+#    For each fold:
+#      - Compute last year's observed growth rate from training pop
+#      - Draw N_SIM growth rates from TruncNorm(center, SD, ±HALFWIDTH)
+#      - For each lag combo, fit apple + banana once, then forecast under
+#        each of the N_SIM pop paths and average → one ensemble forecast
+# ══════════════════════════════════════════════════════════════════════════════
+
+apple_vals  <- data_raw[[APPLE_COL]][match(all_dates, data_raw[[DATA_DATE_COL]])]
+banana_vals <- data_raw[[BANANA_COL]][match(all_dates, data_raw[[DATA_DATE_COL]])]
+total_vals  <- data_raw[[TOTAL_COL]][match(all_dates, data_raw[[DATA_DATE_COL]])]
+
+monthly_results <- vector("list", n_folds)
+
+model_count <- 0
+fail_count  <- 0
+t_start     <- Sys.time()
+
+for (f_idx in seq_len(n_folds)) {
+
+  fold <- folds[[f_idx]]
+  h    <- length(fold$test_idx)
+
+  pop_train   <- pop_m_df$pop[fold$train_idx]
+  train_dates <- all_dates[fold$train_idx]
+  n_train     <- length(pop_train)
+
+  ts_start <- c(as.numeric(format(train_dates[1], "%Y")),
+                as.numeric(format(train_dates[1], "%m")))
+
+  y_apple_ts  <- ts(apple_vals[fold$train_idx],  frequency = 12, start = ts_start)
+  y_banana_ts <- ts(banana_vals[fold$train_idx], frequency = 12, start = ts_start)
+
+  actual_apple  <- apple_vals[fold$test_idx]
+  actual_banana <- banana_vals[fold$test_idx]
+  actual_total  <- total_vals[fold$test_idx]
+
+  test_dates  <- all_dates[fold$test_idx]
+  test_months <- as.numeric(format(test_dates, "%m"))
+  test_years  <- as.numeric(format(test_dates, "%Y"))
+  test_fy     <- fold$test_fy
+
+  # ── Compute last year's observed growth rate (last 12 months of training pop) ──
+  if (n_train >= 13) {
+    last_yr_growth <- (pop_train[n_train] / pop_train[n_train - 12]) - 1
+  } else {
+    # Not enough history — use overall training growth annualised
+    last_yr_growth <- (pop_train[n_train] / pop_train[1])^(12 / (n_train - 1)) - 1
+  }
+  center_pct <- last_yr_growth * 100  # in %
+
+  # ── Draw N_SIM growth rates from truncated normal ──
+  lo_pct <- center_pct - SIM_HALFWIDTH
+  hi_pct <- center_pct + SIM_HALFWIDTH
+
+  sim_rates_pct <- rtruncnorm(N_SIM, a = lo_pct, b = hi_pct,
+                               mean = center_pct, sd = SIM_SD)
+  sim_rates <- sim_rates_pct / 100  # convert to decimal
+
+  # ── Build N_SIM population paths ──
+  last_train_pop <- pop_train[n_train]
+  pop_sim_paths <- matrix(NA, nrow = h, ncol = N_SIM)
+  for (j in seq_len(N_SIM)) {
+    mr <- (1 + sim_rates[j])^(1/12) - 1
+    pop_sim_paths[, j] <- last_train_pop * (1 + mr)^(1:h)
+  }
+
+  # True growth for reference
+  pop_test_true <- pop_m_df$pop[fold$test_idx]
+  true_growth_pct <- round(
+    ((pop_test_true[h] / pop_test_true[1])^(12 / (h - 1)) - 1) * 100, 2
+  )
+
+  cat(sprintf("\n── Fold %d / %d ─────────────────────────────────────────────\n",
+              f_idx, n_folds))
+  cat(sprintf("   Train : %s – %s  (%d mo)\n",
+              format(fold$train_start), format(fold$train_end), n_train))
+  cat(sprintf("   Test  : FY%d  %s – %s  (%d mo)%s\n",
+              test_fy, format(fold$test_start), format(fold$test_end), h,
+              if (fold$partial) " PARTIAL" else ""))
+  cat(sprintf("   Last-yr growth: %.2f%%  |  Sampling: %.2f%% +/- %.1fpp  |  %d draws\n",
+              center_pct, center_pct, SIM_HALFWIDTH, N_SIM))
+  cat(sprintf("   True growth:    %.2f%%\n", true_growth_pct))
+  cat(sprintf("   Models: %d\n", n_combos))
+
+  fold_fit   <- 0
+  fold_fail  <- 0
+  fold_start <- Sys.time()
+
+  fold_rows <- vector("list", n_combos)
+  row_idx   <- 0
+
+  for (i in seq_len(n_combos)) {
+
+    lags_i  <- all_combos[[i]]
+    is_null <- (length(lags_i) == 0)
+
+    if (is_null) {
+      # ── Null model: pure ARIMA, no xreg ──
+      fit_a <- tryCatch(
+        auto.arima(y_apple_ts, seasonal = FALSE,
+                   max.p = MAX_AR, max.q = MAX_MA, max.d = MAX_DIFF,
+                   stepwise = TRUE, approximation = TRUE, trace = FALSE),
+        error = function(e) NULL)
+      fit_b <- tryCatch(
+        auto.arima(y_banana_ts, seasonal = FALSE,
+                   max.p = MAX_AR, max.q = MAX_MA, max.d = MAX_DIFF,
+                   stepwise = TRUE, approximation = TRUE, trace = FALSE),
+        error = function(e) NULL)
+
+      if (is.null(fit_a) || is.null(fit_b)) {
+        fail_count <- fail_count + 1; fold_fail <- fold_fail + 1; next
+      }
+
+      fc_a <- tryCatch(forecast(fit_a, h = h), error = function(e) NULL)
+      fc_b <- tryCatch(forecast(fit_b, h = h), error = function(e) NULL)
+
+      if (is.null(fc_a) || is.null(fc_b)) {
+        fail_count <- fail_count + 1; fold_fail <- fold_fail + 1; next
+      }
+
+      # Null model: same forecast regardless of pop — no ensemble needed
+      fc_apple_v  <- as.numeric(fc_a$mean)
+      fc_banana_v <- as.numeric(fc_b$mean)
+      fc_total_v  <- fc_apple_v + fc_banana_v
+
+    } else {
+      # ── Lag model: fit once, forecast N_SIM times, average ──
+      max_lag_i    <- max(lags_i)
+      X_train_full <- build_xreg(pop_train, lags_i)
+      first_valid  <- max_lag_i + 1
+
+      if (first_valid >= n_train) {
+        fail_count <- fail_count + 1; fold_fail <- fold_fail + 1; next
+      }
+
+      X_train <- X_train_full[first_valid:n_train, , drop = FALSE]
+
+      # Fit apple
+      y_a_trim <- y_apple_ts[first_valid:length(y_apple_ts)]
+      sy <- as.numeric(format(train_dates[first_valid], "%Y"))
+      sm <- as.numeric(format(train_dates[first_valid], "%m"))
+      y_a_trim <- ts(y_a_trim, frequency = 12, start = c(sy, sm))
+
+      fit_a <- tryCatch(
+        auto.arima(y_a_trim, xreg = X_train, seasonal = FALSE,
+                   max.p = MAX_AR, max.q = MAX_MA, max.d = MAX_DIFF,
+                   stepwise = TRUE, approximation = TRUE, trace = FALSE),
+        error = function(e) NULL)
+
+      # Fit banana
+      y_b_trim <- y_banana_ts[first_valid:length(y_banana_ts)]
+      y_b_trim <- ts(y_b_trim, frequency = 12, start = c(sy, sm))
+
+      fit_b <- tryCatch(
+        auto.arima(y_b_trim, xreg = X_train, seasonal = FALSE,
+                   max.p = MAX_AR, max.q = MAX_MA, max.d = MAX_DIFF,
+                   stepwise = TRUE, approximation = TRUE, trace = FALSE),
+        error = function(e) NULL)
+
+      if (is.null(fit_a) || is.null(fit_b)) {
+        fail_count <- fail_count + 1; fold_fail <- fold_fail + 1; next
+      }
+
+      # ── Ensemble: forecast under each sim path, accumulate ──
+      fc_apple_sum  <- rep(0, h)
+      fc_banana_sum <- rep(0, h)
+      valid_sims    <- 0
+
+      for (j in seq_len(N_SIM)) {
+        pop_ext  <- c(pop_train, pop_sim_paths[, j])
+        X_ext    <- build_xreg(pop_ext, lags_i)
+        X_future <- X_ext[(n_train + 1):(n_train + h), , drop = FALSE]
+
+        if (any(is.na(X_future))) next
+
+        fc_a <- tryCatch(forecast(fit_a, xreg = X_future, h = h), error = function(e) NULL)
+        fc_b <- tryCatch(forecast(fit_b, xreg = X_future, h = h), error = function(e) NULL)
+
+        if (is.null(fc_a) || is.null(fc_b)) next
+
+        fc_apple_sum  <- fc_apple_sum  + as.numeric(fc_a$mean)
+        fc_banana_sum <- fc_banana_sum + as.numeric(fc_b$mean)
+        valid_sims    <- valid_sims + 1
+      }
+
+      if (valid_sims == 0) {
+        fail_count <- fail_count + 1; fold_fail <- fold_fail + 1; next
+      }
+
+      fc_apple_v  <- fc_apple_sum / valid_sims
+      fc_banana_v <- fc_banana_sum / valid_sims
+      fc_total_v  <- fc_apple_v + fc_banana_v
+    }
+
+    # ── Store results ──
+    row_idx <- row_idx + 1
+    fold_rows[[row_idx]] <- data.frame(
+      fold             = f_idx,
+      fiscal_year      = test_fy,
+      month            = test_months,
+      cal_year         = test_years,
+      model            = combo_labels[i],
+      actual_apple     = round(actual_apple, 2),
+      forecast_apple   = round(fc_apple_v, 2),
+      actual_banana    = round(actual_banana, 2),
+      forecast_banana  = round(fc_banana_v, 2),
+      actual_total     = round(actual_total, 2),
+      forecast_total   = round(fc_total_v, 2),
+      mape_apple       = round(abs(actual_apple - fc_apple_v) / abs(actual_apple) * 100, 3),
+      mape_banana      = round(abs(actual_banana - fc_banana_v) / abs(actual_banana) * 100, 3),
+      mape_total       = round(abs(actual_total - fc_total_v) / abs(actual_total) * 100, 3),
+      center_growth    = round(center_pct, 2),
+      true_growth      = true_growth_pct,
+      n_sims_used      = if (is_null) NA_integer_ else valid_sims,
+      stringsAsFactors = FALSE
+    )
+
+    model_count <- model_count + 1
+    fold_fit    <- fold_fit + 1
+
+    fold_elapsed <- as.numeric(difftime(Sys.time(), fold_start, units = "mins"))
+    rate <- fold_fit / max(fold_elapsed, 0.001)
+    remaining <- (n_combos - fold_fit - fold_fail) / max(rate, 0.001)
+    cat(sprintf("   [%4d / %d]  %.0f%%  |  %.1f min  |  ~%.1f min left  |  %s\n",
+                fold_fit, n_combos, fold_fit / n_combos * 100,
+                fold_elapsed, remaining, combo_labels[i]))
+  }
+
+  fold_elapsed <- as.numeric(difftime(Sys.time(), fold_start, units = "mins"))
+  cat(sprintf("   Fold %d done: %d fitted, %d failed, %.1f min\n",
+              f_idx, fold_fit, fold_fail, fold_elapsed))
+
+  monthly_results[[f_idx]] <- do.call(rbind, fold_rows[1:row_idx])
+}
+
+elapsed_total <- as.numeric(difftime(Sys.time(), t_start, units = "mins"))
+cat(sprintf("\nAll done. %d fits (%d failures) across %d folds in %.1f min.\n\n",
+            model_count, fail_count, n_folds, elapsed_total))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. BUILD TABLES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Table 1: Monthly detail ──────────────────────────────────────────────────
+table1 <- do.call(rbind, monthly_results)
+rownames(table1) <- NULL
+
+cat("TABLE 1 (monthly):", nrow(table1), "rows\n")
+t1_file <- file.path(OUTPUT_DIR, "table1_monthly.csv")
+# write.csv(table1, t1_file, row.names = FALSE)
+cat("  File:", t1_file, "\n")
+
+cat("\n  Sample (first 10):\n")
+print(head(table1, 10), row.names = FALSE)
+
+# ── Table 2: Yearly detail ───────────────────────────────────────────────────
+table2 <- aggregate(
+  cbind(actual_apple, forecast_apple, actual_banana, forecast_banana,
+        actual_total, forecast_total) ~
+    fold + fiscal_year + model + center_growth + true_growth,
+  data = table1, FUN = sum
+)
+
+table2$actual_apple    <- round(table2$actual_apple, 2)
+table2$forecast_apple  <- round(table2$forecast_apple, 2)
+table2$actual_banana   <- round(table2$actual_banana, 2)
+table2$forecast_banana <- round(table2$forecast_banana, 2)
+table2$actual_total    <- round(table2$actual_total, 2)
+table2$forecast_total  <- round(table2$forecast_total, 2)
+
+table2$yearly_mape_apple  <- round(abs(table2$actual_apple - table2$forecast_apple) /
+                                     abs(table2$actual_apple) * 100, 3)
+table2$yearly_mape_banana <- round(abs(table2$actual_banana - table2$forecast_banana) /
+                                     abs(table2$actual_banana) * 100, 3)
+table2$yearly_mape_total  <- round(abs(table2$actual_total - table2$forecast_total) /
+                                     abs(table2$actual_total) * 100, 3)
+
+table2$growth_error <- round(table2$true_growth - table2$center_growth, 2)
+
+table2 <- table2[order(table2$yearly_mape_total), ]
+rownames(table2) <- NULL
+
+cat("\nTABLE 2 (yearly):", nrow(table2), "rows\n")
+t2_file <- file.path(OUTPUT_DIR, "table2_yearly.csv")
+# write.csv(table2, t2_file, row.names = FALSE)
+cat("  File:", t2_file, "\n")
+
+cat("\n  Sample (first 10):\n")
+print(head(table2, 10), row.names = FALSE)
+
+# ── Table 3: Model ranking ───────────────────────────────────────────────────
+# Average yearly MAPE across all folds
+yearly_rank <- aggregate(
+  cbind(yearly_mape_apple, yearly_mape_banana, yearly_mape_total) ~ model,
+  data = table2, FUN = mean, na.rm = TRUE
+)
+yearly_rank$yearly_mape_apple  <- round(yearly_rank$yearly_mape_apple, 3)
+yearly_rank$yearly_mape_banana <- round(yearly_rank$yearly_mape_banana, 3)
+yearly_rank$yearly_mape_total  <- round(yearly_rank$yearly_mape_total, 3)
+
+# Average monthly MAPE across all folds
+monthly_rank <- aggregate(
+  cbind(mape_apple, mape_banana, mape_total) ~ model,
+  data = table1, FUN = mean, na.rm = TRUE
+)
+names(monthly_rank) <- c("model", "monthly_mape_apple", "monthly_mape_banana", "monthly_mape_total")
+monthly_rank$monthly_mape_apple  <- round(monthly_rank$monthly_mape_apple, 3)
+monthly_rank$monthly_mape_banana <- round(monthly_rank$monthly_mape_banana, 3)
+monthly_rank$monthly_mape_total  <- round(monthly_rank$monthly_mape_total, 3)
+
+table3 <- merge(yearly_rank, monthly_rank, by = "model")
+table3 <- table3[order(table3$yearly_mape_total), ]
+rownames(table3) <- NULL
+
+cat(sprintf("\nTABLE 3: Model Ranking (%d models)\n", nrow(table3)))
+print(table3, row.names = FALSE)
+
+t3_file <- file.path(OUTPUT_DIR, "table3_ranking.csv")
+# write.csv(table3, t3_file, row.names = FALSE)
+cat("  File:", t3_file, "\n")
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+cat("\n========== SUMMARY ==========\n")
+
+best <- table3[1, ]
+cat(sprintf("\n>>> Best model: %s\n", best$model))
+cat(sprintf("    Yearly MAPE  — apple: %.3f%%  banana: %.3f%%  total: %.3f%%\n",
+            best$yearly_mape_apple, best$yearly_mape_banana, best$yearly_mape_total))
+cat(sprintf("    Monthly MAPE — apple: %.3f%%  banana: %.3f%%  total: %.3f%%\n",
+            best$monthly_mape_apple, best$monthly_mape_banana, best$monthly_mape_total))
+
+null_row <- table3[table3$model == "null", ]
+if (nrow(null_row) > 0) {
+  null_rank <- which(table3$model == "null")
+  cat(sprintf("\n    Null model (no xreg) ranks #%d / %d\n", null_rank, nrow(table3)))
+  cat(sprintf("    Yearly MAPE  — apple: %.3f%%  banana: %.3f%%  total: %.3f%%\n",
+              null_row$yearly_mape_apple, null_row$yearly_mape_banana, null_row$yearly_mape_total))
+
+  if (null_rank == 1) {
+    cat("    *** Population lags do NOT improve forecasts over pure ARIMA ***\n")
+  } else {
+    improvement <- round((null_row$yearly_mape_total - best$yearly_mape_total) /
+                           null_row$yearly_mape_total * 100, 1)
+    cat(sprintf("    Best model improves total yearly MAPE by %.1f%% vs null\n", improvement))
+  }
+}
+
+# ── Per-fold detail for best model ───────────────────────────────────────────
+cat(sprintf("\n>>> Best model (%s) per fiscal year:\n", best$model))
+best_detail <- table2[table2$model == best$model, ]
+best_detail <- best_detail[order(best_detail$fiscal_year), ]
+print(best_detail[, c("fiscal_year", "yearly_mape_apple", "yearly_mape_banana",
+                       "yearly_mape_total", "center_growth", "true_growth", "growth_error")],
+      row.names = FALSE)
+
+cat("\nScript complete.\n")
