@@ -1,0 +1,221 @@
+################################################################################
+# ARIMAX Forecast — No Population Extrapolation
+#
+# Population is only interpolated over the known quarterly range.
+# For the forecast period, future population is built from the assumed
+# growth rate (POP_GROWTH_RATE) applied to the last known value.
+# These are NOT added to the mega frame — they are used only to construct
+# the future xreg matrix at forecast time.
+#
+# Dependencies: forecast, zoo
+################################################################################
+
+library(forecast)
+library(zoo)
+
+set.seed(42)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0. SIMULATE DATA (remove this section when using real files)
+# ══════════════════════════════════════════════════════════════════════════════
+
+sim_q_dates <- seq(as.Date("2020-01-01"), as.Date("2025-10-01"), by = "3 months")
+sim_n_q     <- length(sim_q_dates)
+sim_pop     <- 38e6 * cumprod(c(1, rep(1 + 0.013/4, sim_n_q - 1))) +
+  cumsum(rnorm(sim_n_q, 0, 15000))
+write.csv(data.frame(date = sim_q_dates, population = sim_pop),
+          "quarterly_population.csv", row.names = FALSE)
+
+sim_m_dates <- seq(as.Date("2020-01-01"), as.Date("2025-10-01"), by = "month")
+sim_n_m     <- length(sim_m_dates)
+sim_pop_m   <- approx(as.numeric(sim_q_dates), sim_pop,
+                      xout = as.numeric(sim_m_dates), rule = 2)$y
+sim_pop_sc  <- (sim_pop_m - mean(sim_pop_m)) / sd(sim_pop_m)
+
+sim_apple <- 30000 + 600 * c(rep(0,3), sim_pop_sc[1:(sim_n_m-3)]) +
+  as.numeric(arima.sim(list(ar=0.5, ma=0.2), n=sim_n_m, sd=300)) + rnorm(sim_n_m, 0, 150)
+sim_banana <- 20000 + 500 * c(rep(0,3), sim_pop_sc[1:(sim_n_m-3)]) +
+  as.numeric(arima.sim(list(ar=0.6, ma=0.3), n=sim_n_m, sd=350)) + rnorm(sim_n_m, 0, 100)
+
+keep <- sim_m_dates >= as.Date("2020-04-01")
+write.csv(data.frame(
+  date         = sim_m_dates[keep],
+  apple_sales  = round(sim_apple[keep], 2),
+  banana_sales = round(sim_banana[keep], 2),
+  total_sales  = round((sim_apple + sim_banana)[keep], 2)
+), "monthly_data.csv", row.names = FALSE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+# --- Data sources ------------------------------------------------------------
+POP_FILE        <- "quarterly_population.csv"
+POP_DATE_COL    <- "date"
+POP_VALUE_COL   <- "population"
+
+DATA_FILE       <- "monthly_data.csv"
+DATA_DATE_COL   <- "date"
+
+# --- Target columns ----------------------------------------------------------
+APPLE_COL       <- "apple_sales"
+BANANA_COL      <- "banana_sales"
+TOTAL_COL       <- "total_sales"
+
+# --- Model -------------------------------------------------------------------
+LAGS            <- c(3, 6, 12)    # which lags to use, or NULL for null model
+
+# --- Training window ---------------------------------------------------------
+TRAIN_START     <- "2020-04-01"
+TRAIN_END       <- "2025-07-01"
+
+# --- Forecast end date -------------------------------------------------------
+FORECAST_END    <- "2026-03-01"
+
+# --- Population assumption (for forecast period only) ------------------------
+POP_GROWTH_RATE <- 1.3            # assumed annual pop growth (%)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. LOAD DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
+pop_raw  <- read.csv(POP_FILE, stringsAsFactors = FALSE)
+pop_q_df <- data.frame(date = as.Date(pop_raw[[POP_DATE_COL]]),
+                       pop  = as.numeric(pop_raw[[POP_VALUE_COL]]))
+
+data_raw <- read.csv(DATA_FILE, stringsAsFactors = FALSE)
+data_raw[[DATA_DATE_COL]] <- as.Date(data_raw[[DATA_DATE_COL]])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. BUILD MEGA DATA FRAME (known population only — no extrapolation)
+#    Covers: min(pop dates) through max(pop dates), interpolated monthly
+# ══════════════════════════════════════════════════════════════════════════════
+
+train_start  <- as.Date(TRAIN_START)
+train_end    <- as.Date(TRAIN_END)
+forecast_end <- as.Date(FORECAST_END)
+
+# Monthly grid over known population range only
+known_dates <- seq(min(pop_q_df$date), max(pop_q_df$date), by = "month")
+known_pop   <- approx(as.numeric(pop_q_df$date), pop_q_df$pop,
+                      xout = as.numeric(known_dates), rule = 2)$y
+
+mega <- data.frame(date = known_dates, pop = known_pop)
+
+# Add lags 1–12 (from known population only)
+for (L in 1:12) {
+  mega[[paste0("lag", L)]] <- c(rep(NA, L), known_pop[1:(nrow(mega) - L)])
+}
+
+# Merge in sales
+mega$apple  <- data_raw[[APPLE_COL]][match(mega$date, data_raw[[DATA_DATE_COL]])]
+mega$banana <- data_raw[[BANANA_COL]][match(mega$date, data_raw[[DATA_DATE_COL]])]
+mega$total  <- data_raw[[TOTAL_COL]][match(mega$date, data_raw[[DATA_DATE_COL]])]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. TRAINING SLICE (from mega — all known data)
+# ══════════════════════════════════════════════════════════════════════════════
+
+train_rows <- mega[mega$date >= train_start & mega$date <= train_end, ]
+
+is_null  <- is.null(LAGS) || length(LAGS) == 0
+lag_cols <- if (!is_null) paste0("lag", LAGS) else NULL
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. BUILD FUTURE XREG (using assumed growth rate, not extrapolated mega)
+#    The future population path starts from the last known pop value and
+#    grows at POP_GROWTH_RATE. Lags are built from known + future pop combined.
+# ══════════════════════════════════════════════════════════════════════════════
+
+fc_dates <- seq(train_end + 1, forecast_end, by = "month")
+fc_dates <- as.Date(paste0(format(fc_dates, "%Y-%m"), "-01"))
+fc_dates <- fc_dates[fc_dates > train_end & fc_dates <= forecast_end]
+h        <- length(fc_dates)
+
+# Future pop from assumed growth rate
+last_known_pop <- tail(mega$pop, 1)
+mr             <- (1 + POP_GROWTH_RATE / 100)^(1/12) - 1
+pop_future     <- last_known_pop * (1 + mr)^(1:h)
+
+# Full pop vector: training pop + future pop (for building lagged xreg)
+pop_train  <- mega$pop[mega$date >= train_start & mega$date <= train_end]
+pop_full   <- c(pop_train, pop_future)
+n_train    <- length(pop_train)
+
+# Build lagged xreg over the full vector, extract future rows
+if (!is_null) {
+  X_full <- matrix(NA, nrow = length(pop_full), ncol = length(LAGS))
+  colnames(X_full) <- paste0("lag", LAGS)
+  for (k in seq_along(LAGS)) {
+    L <- LAGS[k]
+    X_full[, k] <- c(rep(NA, L), pop_full[1:(length(pop_full) - L)])
+  }
+  X_future <- X_full[(n_train + 1):(n_train + h), , drop = FALSE]
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. FIT + FORECAST
+# ══════════════════════════════════════════════════════════════════════════════
+
+sy <- as.numeric(format(train_rows$date[1], "%Y"))
+sm <- as.numeric(format(train_rows$date[1], "%m"))
+
+if (is_null) {
+
+  fit_apple  <- auto.arima(ts(train_rows$apple, frequency = 12, start = c(sy, sm)),
+                           seasonal = FALSE, max.p = 3, max.q = 3, max.d = 1,
+                           stepwise = TRUE, approximation = TRUE)
+  fit_banana <- auto.arima(ts(train_rows$banana, frequency = 12, start = c(sy, sm)),
+                           seasonal = FALSE, max.p = 3, max.q = 3, max.d = 1,
+                           stepwise = TRUE, approximation = TRUE)
+
+  fc_apple  <- forecast(fit_apple, h = h)
+  fc_banana <- forecast(fit_banana, h = h)
+
+} else {
+
+  max_lag     <- max(LAGS)
+  first_valid <- max_lag + 1
+
+  X_train <- as.matrix(train_rows[first_valid:nrow(train_rows), lag_cols, drop = FALSE])
+  y_apple_trim  <- train_rows$apple[first_valid:nrow(train_rows)]
+  y_banana_trim <- train_rows$banana[first_valid:nrow(train_rows)]
+
+  sy2 <- as.numeric(format(train_rows$date[first_valid], "%Y"))
+  sm2 <- as.numeric(format(train_rows$date[first_valid], "%m"))
+
+  fit_apple <- auto.arima(ts(y_apple_trim, frequency = 12, start = c(sy2, sm2)),
+                          xreg = X_train, seasonal = FALSE,
+                          max.p = 3, max.q = 3, max.d = 1,
+                          stepwise = TRUE, approximation = TRUE)
+
+  fit_banana <- auto.arima(ts(y_banana_trim, frequency = 12, start = c(sy2, sm2)),
+                           xreg = X_train, seasonal = FALSE,
+                           max.p = 3, max.q = 3, max.d = 1,
+                           stepwise = TRUE, approximation = TRUE)
+
+  fc_apple  <- forecast(fit_apple, xreg = X_future, h = h)
+  fc_banana <- forecast(fit_banana, xreg = X_future, h = h)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. OUTPUT TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Actuals (NA for dates beyond sales data)
+actual_apple  <- data_raw[[APPLE_COL]][match(fc_dates, data_raw[[DATA_DATE_COL]])]
+actual_banana <- data_raw[[BANANA_COL]][match(fc_dates, data_raw[[DATA_DATE_COL]])]
+actual_total  <- data_raw[[TOTAL_COL]][match(fc_dates, data_raw[[DATA_DATE_COL]])]
+
+output <- data.frame(
+  date              = fc_dates,
+  apple_real        = round(actual_apple, 2),
+  apple_forecast    = round(as.numeric(fc_apple$mean), 2),
+  banana_real       = round(actual_banana, 2),
+  banana_forecast   = round(as.numeric(fc_banana$mean), 2),
+  total_real        = round(actual_total, 2),
+  total_forecast    = round(as.numeric(fc_apple$mean) + as.numeric(fc_banana$mean), 2),
+  population_growth = POP_GROWTH_RATE
+)
+
+print(output, row.names = FALSE)
