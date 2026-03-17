@@ -1,38 +1,32 @@
 ################################################################################
-# Bayesian Monotonic Forecasting — Fruit Sales (Total + Logit Apple Share)
-# *** rstan version (no brms / no QuickJSR dependency) ***
+# Bayesian Monotonic Forecasting — Fruit Sales
+# *** Pure R MCMC sampler (no Stan, no brms, no QuickJSR) ***
 #
-# Strategy:
-#   Place truncated-normal priors (lower = 0) on population-lag coefficients
-#   so every posterior draw has non-negative effects. Higher population growth
-#   scenario => higher forecast for the ENTIRE posterior — not just point est.
+# Model (for both total and logit(apple_share)):
+#   y[t] = b0 + b[1]*pop_lag3[t] + b[2]*pop_lag6[t] + b[3]*pop_lag12[t] + e[t]
+#   e[t] = phi * e[t-1] + eps[t],   eps[t] ~ N(0, sigma^2)
+#
+# Priors:
+#   b[k] ~ N(slope_mu, slope_sd) truncated below at 0   (monotonicity)
+#   b0   ~ N(0, intcpt_sd)
+#   phi  ~ N(0, ar_sd) truncated to (-1, 1)              (stationarity)
+#   sigma ~ Half-t(3, 0, 10)                              (positive)
+#
+# Sampler: Metropolis-within-Gibbs with adaptive proposal SDs
+#   - Each parameter updated one-at-a-time via random-walk MH
+#   - Proposal SDs tuned during warmup to target ~25% acceptance
 #
 # Structure:
-#   Model 1: Stan on total_sales ~ lagged population (lags 3, 6, 12) + AR(1)
-#   Model 2: Stan on logit(apple_share) ~ lagged population + AR(1)
-#   Then:
-#     apple_forecast  = total_forecast × inv_logit(share_forecast)
-#     banana_forecast = total_forecast × (1 − inv_logit(share_forecast))
-#   Coherence guaranteed: apple + banana = total by construction.
+#   Model 1: total_sales ~ lagged population + AR(1)
+#   Model 2: logit(apple_share) ~ lagged population + AR(1)
+#   apple_forecast  = total_forecast × inv_logit(share_forecast)
+#   banana_forecast = total_forecast × (1 − inv_logit(share_forecast))
 #
-# CV: expanding-window fiscal-year folds (Apr 1 – Mar 31)
-# Includes null model (intercept + AR(1) only)
-#
-# Output:
-#   Table 1 — Monthly detail
-#   Table 2 — Yearly detail (fiscal year)
-#   Table 3 — Model ranking within ±TOLERANCE_PP
-#   Monotonicity check across population scenarios
-#
-# Dependencies: rstan, tidyverse, zoo   (NO brms, NO QuickJSR)
+# Dependencies: tidyverse, zoo   (base R packages only for MCMC)
 ################################################################################
 
-library(rstan)
 library(tidyverse)
 library(zoo)
-
-rstan_options(auto_write = TRUE)
-options(mc.cores = parallel::detectCores())
 
 set.seed(42)
 
@@ -74,12 +68,12 @@ SCENARIO_STEP   <-  0.1
 # --- Evaluation --------------------------------------------------------------
 TOLERANCE_PP    <- 1.0
 
-# --- Stan sampling -----------------------------------------------------------
-STAN_ITER       <- 4000
-STAN_WARMUP     <- 1000
-STAN_CHAINS     <- 4
-STAN_ADAPT      <- 0.95
-STAN_SEED       <- 123
+# --- MCMC sampling -----------------------------------------------------------
+MCMC_ITER       <- 6000
+MCMC_WARMUP     <- 2000
+MCMC_CHAINS     <- 4
+MCMC_THIN       <- 1
+MCMC_SEED       <- 123
 
 # --- Priors ------------------------------------------------------------------
 SLOPE_PRIOR_MU  <- 0
@@ -87,129 +81,372 @@ SLOPE_PRIOR_SD  <- 5
 INTCPT_PRIOR_SD <- 100
 AR_PRIOR_SD     <- 0.5
 
+# --- Adaptation --------------------------------------------------------------
+ADAPT_INTERVAL  <- 100    # tune proposal SDs every N iterations during warmup
+TARGET_ACCEPT   <- 0.25   # target acceptance rate
+
 cat("=== Configuration ===\n")
-cat("  Approach:     Bayesian (rstan) total + logit(apple_share) → derive components\n")
+cat("  Approach:     Pure R MCMC (Metropolis-within-Gibbs)\n")
 cat("  Monotonicity: truncated-normal priors (lower = 0) on population-lag slopes\n")
 cat("  Lags:         ", paste(LAGS, collapse = ", "), "\n")
 cat("  Fiscal year:  Apr 1 – Mar 31\n")
 cat("  CV:           train", MIN_TRAIN_YEARS, "FY expanding\n")
 cat("  Scenarios:    ", SCENARIO_MIN, "% to", SCENARIO_MAX, "% by", SCENARIO_STEP, "pp\n")
 cat("  Tolerance:    ±", TOLERANCE_PP, "pp\n")
-cat("  Stan:         ", STAN_ITER, "iter,", STAN_WARMUP, "warmup,",
-    STAN_CHAINS, "chains\n\n")
+cat("  MCMC:         ", MCMC_ITER, "iter,", MCMC_WARMUP, "warmup,",
+    MCMC_CHAINS, "chains, thin =", MCMC_THIN, "\n\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAN MODELS (compiled once, reused across folds)
+# MCMC ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-# --------------------------------------------------------------------------- #
-# Lag model: y = b0 + b[1..K]*X + AR(1) errors
-#   b[k] ~ normal(mu, sd) truncated below at 0   (monotonicity)
-#   phi  ~ normal(0, ar_sd)                       (stationarity)
-# --------------------------------------------------------------------------- #
-stan_lag_code <- "
-data {
-  int<lower=1> N;           // training obs
-  int<lower=1> K;           // number of lag regressors
-  int<lower=1> H;           // forecast horizon
-  matrix[N, K] X;           // training regressors
-  vector[N] y;              // training response
-  matrix[H, K] X_new;      // future regressors
-
-  // prior hyperparameters
-  real slope_mu;
-  real<lower=0> slope_sd;
-  real<lower=0> intcpt_sd;
-  real<lower=0> ar_sd;
-}
-
-parameters {
-  real b0;                          // intercept
-  vector<lower=0>[K] b;            // slopes, constrained >= 0
-  real<lower=-1, upper=1> phi;     // AR(1) coefficient
-  real<lower=0> sigma;             // residual SD
-}
-
-model {
-  // priors
-  b0    ~ normal(0, intcpt_sd);
-  b     ~ normal(slope_mu, slope_sd);   // truncation handled by <lower=0>
-  phi   ~ normal(0, ar_sd);
-  sigma ~ student_t(3, 0, 10);
-
-  // likelihood with AR(1) errors
-  {
-    vector[N] mu = b0 + X * b;
-    y[1] ~ normal(mu[1], sigma);
-    for (t in 2:N)
-      y[t] ~ normal(mu[t] + phi * (y[t-1] - mu[t-1]), sigma);
-  }
-}
-
-generated quantities {
-  vector[H] y_pred;       // posterior predictive mean trajectory
-  {
-    vector[N] mu_train = b0 + X * b;
-    vector[H] mu_new   = b0 + X_new * b;
-    real last_resid = y[N] - mu_train[N];
-
-    for (t in 1:H) {
-      if (t == 1)
-        y_pred[t] = mu_new[t] + phi * last_resid + normal_rng(0, sigma);
-      else
-        y_pred[t] = mu_new[t] + phi * (y_pred[t-1] - mu_new[t-1]) + normal_rng(0, sigma);
+#' Log-likelihood for linear regression with AR(1) errors
+#' y[t] = mu[t] + e[t],  e[t] = phi * e[t-1] + eps[t],  eps ~ N(0, sigma^2)
+#' where mu[t] = b0 + X[t,] %*% b
+log_likelihood_ar1 <- function(y, X, b0, b, phi, sigma) {
+    N   <- length(y)
+    mu  <- b0 + as.numeric(X %*% b)
+    res <- y - mu
+    
+    # First obs: marginal variance = sigma^2 / (1 - phi^2) if |phi| < 1
+    if (abs(phi) >= 1) return(-Inf)
+    marg_var <- sigma^2 / (1 - phi^2)
+    
+    ll <- dnorm(res[1], mean = 0, sd = sqrt(marg_var), log = TRUE)
+    for (t in 2:N) {
+        ll <- ll + dnorm(res[t], mean = phi * res[t - 1], sd = sigma, log = TRUE)
     }
-  }
-}
-"
-
-# --------------------------------------------------------------------------- #
-# Null model: y = b0 + AR(1) errors  (no regressors)
-# --------------------------------------------------------------------------- #
-stan_null_code <- "
-data {
-  int<lower=1> N;
-  int<lower=1> H;
-  vector[N] y;
-
-  real<lower=0> intcpt_sd;
-  real<lower=0> ar_sd;
+    return(ll)
 }
 
-parameters {
-  real b0;
-  real<lower=-1, upper=1> phi;
-  real<lower=0> sigma;
-}
-
-model {
-  b0    ~ normal(0, intcpt_sd);
-  phi   ~ normal(0, ar_sd);
-  sigma ~ student_t(3, 0, 10);
-
-  y[1] ~ normal(b0, sigma);
-  for (t in 2:N)
-    y[t] ~ normal(b0 + phi * (y[t-1] - b0), sigma);
-}
-
-generated quantities {
-  vector[H] y_pred;
-  {
-    real last_resid = y[N] - b0;
-    for (t in 1:H) {
-      if (t == 1)
-        y_pred[t] = b0 + phi * last_resid + normal_rng(0, sigma);
-      else
-        y_pred[t] = b0 + phi * (y_pred[t-1] - b0) + normal_rng(0, sigma);
+#' Log-prior for the full parameter vector
+log_prior <- function(b0, b, phi, sigma, K,
+                      slope_mu, slope_sd, intcpt_sd, ar_sd) {
+    # b0: normal
+    
+    lp <- dnorm(b0, 0, intcpt_sd, log = TRUE)
+    
+    # b[k]: truncated normal at 0 — if any b[k] < 0, return -Inf
+    if (any(b < 0)) return(-Inf)
+    for (k in 1:K) {
+        # log density of truncated normal: log(dnorm) - log(1 - Phi(-mu/sd))
+        lp <- lp + dnorm(b[k], slope_mu, slope_sd, log = TRUE) -
+            pnorm(0, slope_mu, slope_sd, lower.tail = FALSE, log.p = TRUE)
     }
-  }
+    
+    # phi: normal truncated to (-1, 1)
+    if (abs(phi) >= 1) return(-Inf)
+    lp <- lp + dnorm(phi, 0, ar_sd, log = TRUE) -
+        log(pnorm(1, 0, ar_sd) - pnorm(-1, 0, ar_sd))
+    
+    # sigma: half-t(3, 0, 10)
+    if (sigma <= 0) return(-Inf)
+    lp <- lp + dt(sigma / 10, df = 3, log = TRUE) - log(10) +
+        log(2)  # half-t normalization
+    
+    return(lp)
 }
-"
 
-cat("Compiling Stan models...\n")
-sm_lag  <- stan_model(model_code = stan_lag_code)
-sm_null <- stan_model(model_code = stan_null_code)
-cat("Compilation done.\n\n")
+#' Log-posterior (unnormalized)
+log_posterior <- function(y, X, b0, b, phi, sigma, K,
+                          slope_mu, slope_sd, intcpt_sd, ar_sd) {
+    lp <- log_prior(b0, b, phi, sigma, K, slope_mu, slope_sd, intcpt_sd, ar_sd)
+    if (is.infinite(lp)) return(-Inf)
+    lp + log_likelihood_ar1(y, X, b0, b, phi, sigma)
+}
+
+#' Run one chain of Metropolis-within-Gibbs
+#' Returns list with draws matrix and acceptance rates
+run_mcmc_chain <- function(y, X, K, n_iter, n_warmup, thin, seed,
+                           slope_mu, slope_sd, intcpt_sd, ar_sd,
+                           chain_id = 1, print_every = 500) {
+    set.seed(seed + chain_id)
+    
+    n_params <- 1 + K + 1 + 1   # b0, b[1..K], phi, sigma
+    param_names <- c("b0", paste0("b", 1:K), "phi", "sigma")
+    n_keep <- floor((n_iter - n_warmup) / thin)
+    
+    # Storage
+    draws <- matrix(NA_real_, nrow = n_keep, ncol = n_params)
+    colnames(draws) <- param_names
+    accept_count <- rep(0L, n_params)
+    total_count  <- rep(0L, n_params)
+    
+    # Initial values
+    b0    <- rnorm(1, 0, 1)
+    b     <- abs(rnorm(K, slope_mu, 0.5))  # start positive
+    phi   <- runif(1, -0.3, 0.3)
+    sigma <- abs(rnorm(1, sd(y) * 0.5, sd(y) * 0.1))
+    
+    # Proposal SDs (will be adapted during warmup)
+    prop_sd <- c(sd(y) * 0.01,            # b0
+                 rep(0.01, K),             # b[k]
+                 0.02,                     # phi
+                 sd(y) * 0.01)             # sigma
+    names(prop_sd) <- param_names
+    
+    # Adaptation tracking
+    adapt_accept <- rep(0L, n_params)
+    adapt_total  <- rep(0L, n_params)
+    
+    cur_lp <- log_posterior(y, X, b0, b, phi, sigma, K,
+                            slope_mu, slope_sd, intcpt_sd, ar_sd)
+    
+    draw_idx <- 0
+    
+    for (iter in 1:n_iter) {
+        
+        # --- Update b0 ---
+        b0_star <- rnorm(1, b0, prop_sd["b0"])
+        lp_star <- log_posterior(y, X, b0_star, b, phi, sigma, K,
+                                 slope_mu, slope_sd, intcpt_sd, ar_sd)
+        if (log(runif(1)) < (lp_star - cur_lp)) {
+            b0 <- b0_star; cur_lp <- lp_star
+            accept_count[1] <- accept_count[1] + 1
+            adapt_accept[1] <- adapt_accept[1] + 1
+        }
+        total_count[1] <- total_count[1] + 1
+        adapt_total[1] <- adapt_total[1] + 1
+        
+        # --- Update b[k] one at a time ---
+        for (k in 1:K) {
+            pidx <- 1 + k
+            b_star <- b
+            b_star[k] <- rnorm(1, b[k], prop_sd[pidx])
+            if (b_star[k] >= 0) {  # respect truncation
+                lp_star <- log_posterior(y, X, b0, b_star, phi, sigma, K,
+                                         slope_mu, slope_sd, intcpt_sd, ar_sd)
+                if (log(runif(1)) < (lp_star - cur_lp)) {
+                    b <- b_star; cur_lp <- lp_star
+                    accept_count[pidx] <- accept_count[pidx] + 1
+                    adapt_accept[pidx] <- adapt_accept[pidx] + 1
+                }
+            }
+            total_count[pidx] <- total_count[pidx] + 1
+            adapt_total[pidx] <- adapt_total[pidx] + 1
+        }
+        
+        # --- Update phi ---
+        pidx <- 1 + K + 1
+        phi_star <- rnorm(1, phi, prop_sd["phi"])
+        if (abs(phi_star) < 1) {
+            lp_star <- log_posterior(y, X, b0, b, phi_star, sigma, K,
+                                     slope_mu, slope_sd, intcpt_sd, ar_sd)
+            if (log(runif(1)) < (lp_star - cur_lp)) {
+                phi <- phi_star; cur_lp <- lp_star
+                accept_count[pidx] <- accept_count[pidx] + 1
+                adapt_accept[pidx] <- adapt_accept[pidx] + 1
+            }
+        }
+        total_count[pidx] <- total_count[pidx] + 1
+        adapt_total[pidx] <- adapt_total[pidx] + 1
+        
+        # --- Update sigma ---
+        pidx <- 1 + K + 2
+        sigma_star <- rnorm(1, sigma, prop_sd["sigma"])
+        if (sigma_star > 0) {
+            lp_star <- log_posterior(y, X, b0, b, phi, sigma_star, K,
+                                     slope_mu, slope_sd, intcpt_sd, ar_sd)
+            if (log(runif(1)) < (lp_star - cur_lp)) {
+                sigma <- sigma_star; cur_lp <- lp_star
+                accept_count[pidx] <- accept_count[pidx] + 1
+                adapt_accept[pidx] <- adapt_accept[pidx] + 1
+            }
+        }
+        total_count[pidx] <- total_count[pidx] + 1
+        adapt_total[pidx] <- adapt_total[pidx] + 1
+        
+        # --- Adapt proposal SDs during warmup ---
+        if (iter <= n_warmup && iter %% ADAPT_INTERVAL == 0) {
+            for (p in 1:n_params) {
+                rate <- adapt_accept[p] / max(adapt_total[p], 1)
+                if (rate < TARGET_ACCEPT * 0.8) {
+                    prop_sd[p] <- prop_sd[p] * 0.7   # shrink
+                } else if (rate > TARGET_ACCEPT * 1.5) {
+                    prop_sd[p] <- prop_sd[p] * 1.4   # expand
+                }
+            }
+            adapt_accept[] <- 0L
+            adapt_total[]  <- 0L
+        }
+        
+        # --- Store post-warmup ---
+        if (iter > n_warmup && (iter - n_warmup) %% thin == 0) {
+            draw_idx <- draw_idx + 1
+            draws[draw_idx, ] <- c(b0, b, phi, sigma)
+        }
+        
+        # --- Progress ---
+        if (iter %% print_every == 0) {
+            rates <- round(accept_count / pmax(total_count, 1) * 100, 1)
+            phase <- if (iter <= n_warmup) "warmup" else "sampling"
+            cat(sprintf("    chain %d | iter %5d / %d (%s) | accept%%: %s\n",
+                        chain_id, iter, n_iter, phase,
+                        paste(param_names, "=", rates, collapse = "  ")))
+        }
+    }
+    
+    list(
+        draws       = draws[1:draw_idx, , drop = FALSE],
+        accept_rate = accept_count / pmax(total_count, 1),
+        prop_sd     = prop_sd
+    )
+}
+
+#' Run multiple chains and combine
+#' Returns a list: draws (matrix), accept_rates (matrix)
+run_mcmc <- function(y, X, K, n_iter, n_warmup, chains, thin, seed,
+                     slope_mu, slope_sd, intcpt_sd, ar_sd,
+                     label = "", print_every = 500) {
+    cat(sprintf("  MCMC [%s]: %d iter × %d chains (warmup = %d, thin = %d)\n",
+                label, n_iter, chains, n_warmup, thin))
+    
+    all_draws  <- list()
+    all_accept <- list()
+    
+    for (ch in 1:chains) {
+        cat(sprintf("  -- Chain %d --\n", ch))
+        result <- run_mcmc_chain(y, X, K, n_iter, n_warmup, thin,
+                                 seed = seed, chain_id = ch,
+                                 slope_mu = slope_mu, slope_sd = slope_sd,
+                                 intcpt_sd = intcpt_sd, ar_sd = ar_sd,
+                                 print_every = print_every)
+        all_draws[[ch]]  <- result$draws
+        all_accept[[ch]] <- result$accept_rate
+        cat(sprintf("    chain %d done: %d post-warmup draws, final accept = %s\n",
+                    ch, nrow(result$draws),
+                    paste(names(result$accept_rate), "=",
+                          round(result$accept_rate * 100, 1), collapse = "  ")))
+    }
+    
+    combined <- do.call(rbind, all_draws)
+    accept_mat <- do.call(rbind, all_accept)
+    
+    cat(sprintf("  Combined: %d draws total\n", nrow(combined)))
+    cat(sprintf("  Mean accept rates: %s\n",
+                paste(colnames(combined), "=",
+                      round(colMeans(accept_mat) * 100, 1), collapse = "  ")))
+    
+    list(draws = combined, accept_rates = accept_mat)
+}
+
+#' Null model sampler (intercept + AR(1) only, no regressors)
+run_mcmc_null <- function(y, n_iter, n_warmup, chains, thin, seed,
+                          intcpt_sd, ar_sd, label = "", print_every = 500) {
+    # Treat as K = 0 case: parameters are b0, phi, sigma
+    N <- length(y)
+    
+    log_posterior_null <- function(b0, phi, sigma) {
+        if (sigma <= 0 || abs(phi) >= 1) return(-Inf)
+        # Prior
+        lp <- dnorm(b0, 0, intcpt_sd, log = TRUE)
+        lp <- lp + dnorm(phi, 0, ar_sd, log = TRUE) -
+            log(pnorm(1, 0, ar_sd) - pnorm(-1, 0, ar_sd))
+        lp <- lp + dt(sigma / 10, df = 3, log = TRUE) - log(10) + log(2)
+        # Likelihood
+        marg_var <- sigma^2 / (1 - phi^2)
+        res <- y - b0
+        lp <- lp + dnorm(res[1], 0, sqrt(marg_var), log = TRUE)
+        for (t in 2:N) {
+            lp <- lp + dnorm(res[t], phi * res[t - 1], sigma, log = TRUE)
+        }
+        return(lp)
+    }
+    
+    cat(sprintf("  MCMC [%s]: %d iter × %d chains (warmup = %d)\n",
+                label, n_iter, chains, n_warmup))
+    
+    all_draws <- list()
+    
+    for (ch in 1:chains) {
+        set.seed(seed + ch)
+        cat(sprintf("  -- Chain %d --\n", ch))
+        
+        n_keep <- floor((n_iter - n_warmup) / thin)
+        draws <- matrix(NA_real_, nrow = n_keep, ncol = 3)
+        colnames(draws) <- c("b0", "phi", "sigma")
+        
+        b0    <- rnorm(1, mean(y), sd(y) * 0.1)
+        phi   <- runif(1, -0.3, 0.3)
+        sigma <- sd(y) * 0.5
+        
+        prop_sd <- c(b0 = sd(y) * 0.01, phi = 0.02, sigma = sd(y) * 0.01)
+        accept_count <- c(b0 = 0L, phi = 0L, sigma = 0L)
+        total_count  <- c(b0 = 0L, phi = 0L, sigma = 0L)
+        adapt_acc    <- c(b0 = 0L, phi = 0L, sigma = 0L)
+        adapt_tot    <- c(b0 = 0L, phi = 0L, sigma = 0L)
+        
+        cur_lp <- log_posterior_null(b0, phi, sigma)
+        draw_idx <- 0
+        
+        for (iter in 1:n_iter) {
+            # b0
+            b0s <- rnorm(1, b0, prop_sd["b0"])
+            lps <- log_posterior_null(b0s, phi, sigma)
+            if (log(runif(1)) < (lps - cur_lp)) {
+                b0 <- b0s; cur_lp <- lps
+                accept_count["b0"] <- accept_count["b0"] + 1
+                adapt_acc["b0"] <- adapt_acc["b0"] + 1
+            }
+            total_count["b0"] <- total_count["b0"] + 1
+            adapt_tot["b0"] <- adapt_tot["b0"] + 1
+            
+            # phi
+            phis <- rnorm(1, phi, prop_sd["phi"])
+            if (abs(phis) < 1) {
+                lps <- log_posterior_null(b0, phis, sigma)
+                if (log(runif(1)) < (lps - cur_lp)) {
+                    phi <- phis; cur_lp <- lps
+                    accept_count["phi"] <- accept_count["phi"] + 1
+                    adapt_acc["phi"] <- adapt_acc["phi"] + 1
+                }
+            }
+            total_count["phi"] <- total_count["phi"] + 1
+            adapt_tot["phi"] <- adapt_tot["phi"] + 1
+            
+            # sigma
+            sigs <- rnorm(1, sigma, prop_sd["sigma"])
+            if (sigs > 0) {
+                lps <- log_posterior_null(b0, phi, sigs)
+                if (log(runif(1)) < (lps - cur_lp)) {
+                    sigma <- sigs; cur_lp <- lps
+                    accept_count["sigma"] <- accept_count["sigma"] + 1
+                    adapt_acc["sigma"] <- adapt_acc["sigma"] + 1
+                }
+            }
+            total_count["sigma"] <- total_count["sigma"] + 1
+            adapt_tot["sigma"] <- adapt_tot["sigma"] + 1
+            
+            # Adapt
+            if (iter <= n_warmup && iter %% ADAPT_INTERVAL == 0) {
+                for (p in names(prop_sd)) {
+                    rate <- adapt_acc[p] / max(adapt_tot[p], 1)
+                    if (rate < TARGET_ACCEPT * 0.8) prop_sd[p] <- prop_sd[p] * 0.7
+                    else if (rate > TARGET_ACCEPT * 1.5) prop_sd[p] <- prop_sd[p] * 1.4
+                }
+                adapt_acc[] <- 0L; adapt_tot[] <- 0L
+            }
+            
+            if (iter > n_warmup && (iter - n_warmup) %% thin == 0) {
+                draw_idx <- draw_idx + 1
+                draws[draw_idx, ] <- c(b0, phi, sigma)
+            }
+            
+            if (iter %% print_every == 0) {
+                rates <- round(accept_count / pmax(total_count, 1) * 100, 1)
+                phase <- if (iter <= n_warmup) "warmup" else "sampling"
+                cat(sprintf("    chain %d | iter %5d / %d (%s) | accept%%: b0=%s  phi=%s  sigma=%s\n",
+                            ch, iter, n_iter, phase, rates["b0"], rates["phi"], rates["sigma"]))
+            }
+        }
+        all_draws[[ch]] <- draws[1:draw_idx, , drop = FALSE]
+        cat(sprintf("    chain %d done: %d draws\n", ch, draw_idx))
+    }
+    
+    combined <- do.call(rbind, all_draws)
+    cat(sprintf("  Combined: %d draws total\n", nrow(combined)))
+    list(draws = combined)
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0. SIMULATE DATA (remove when using real files)
@@ -218,35 +455,35 @@ cat("Compilation done.\n\n")
 sim_q_dates <- seq(as.Date("2020-01-01"), as.Date("2025-10-01"), by = "3 months")
 sim_n_q     <- length(sim_q_dates)
 sim_pop     <- 38e6 * cumprod(c(1, rep(1 + 0.013 / 4, sim_n_q - 1))) +
-  cumsum(rnorm(sim_n_q, 0, 15000))
+    cumsum(rnorm(sim_n_q, 0, 15000))
 write.csv(data.frame(date = sim_q_dates, population = sim_pop),
           POP_FILE, row.names = FALSE)
 
 sim_m_dates <- seq(as.Date("2020-01-01"), as.Date("2025-10-01"), by = "month")
 sim_n_m     <- length(sim_m_dates)
 sim_pop_m   <- approx(as.numeric(sim_q_dates), sim_pop,
-                       xout = as.numeric(sim_m_dates), rule = 2)$y
+                      xout = as.numeric(sim_m_dates), rule = 2)$y
 sim_pop_sc  <- (sim_pop_m - mean(sim_pop_m)) / sd(sim_pop_m)
 
 sim_apple <- 30000 + 600 * c(rep(0, 3), sim_pop_sc[1:(sim_n_m - 3)]) +
-  400 * c(rep(0, 6), sim_pop_sc[1:(sim_n_m - 6)]) +
-  as.numeric(arima.sim(list(ar = 0.5, ma = 0.2), n = sim_n_m, sd = 300)) +
-  rnorm(sim_n_m, 0, 150)
+    400 * c(rep(0, 6), sim_pop_sc[1:(sim_n_m - 6)]) +
+    as.numeric(arima.sim(list(ar = 0.5, ma = 0.2), n = sim_n_m, sd = 300)) +
+    rnorm(sim_n_m, 0, 150)
 
 sim_banana <- 20000 + 500 * c(rep(0, 3), sim_pop_sc[1:(sim_n_m - 3)]) +
-  300 * c(rep(0, 6), sim_pop_sc[1:(sim_n_m - 6)]) +
-  200 * c(rep(0, 12), sim_pop_sc[1:(sim_n_m - 12)]) +
-  as.numeric(arima.sim(list(ar = 0.6, ma = 0.3), n = sim_n_m, sd = 350)) +
-  rnorm(sim_n_m, 0, 100)
+    300 * c(rep(0, 6), sim_pop_sc[1:(sim_n_m - 6)]) +
+    200 * c(rep(0, 12), sim_pop_sc[1:(sim_n_m - 12)]) +
+    as.numeric(arima.sim(list(ar = 0.6, ma = 0.3), n = sim_n_m, sd = 350)) +
+    rnorm(sim_n_m, 0, 100)
 
 sim_total <- sim_apple + sim_banana
 
 keep <- sim_m_dates >= as.Date("2020-04-01")
 write.csv(data.frame(
-  date         = sim_m_dates[keep],
-  apple_sales  = round(sim_apple[keep], 2),
-  banana_sales = round(sim_banana[keep], 2),
-  total_sales  = round(sim_total[keep], 2)
+    date         = sim_m_dates[keep],
+    apple_sales  = round(sim_apple[keep], 2),
+    banana_sales = round(sim_banana[keep], 2),
+    total_sales  = round(sim_total[keep], 2)
 ), DATA_FILE, row.names = FALSE)
 
 cat("Simulated data written.\n\n")
@@ -262,22 +499,20 @@ pop_q_df <- data.frame(date = as.Date(pop_raw[[POP_DATE_COL]]),
 data_raw <- read.csv(DATA_FILE, stringsAsFactors = FALSE)
 data_raw[[DATA_DATE_COL]] <- as.Date(data_raw[[DATA_DATE_COL]])
 
-# Compute apple share and logit transform
 data_raw$apple_share <- data_raw[[APPLE_COL]] / data_raw[[TOTAL_COL]]
 data_raw$apple_share <- pmin(pmax(data_raw$apple_share, 0.001), 0.999)
 data_raw$logit_share <- log(data_raw$apple_share / (1 - data_raw$apple_share))
 
-# Interpolate population to monthly
 monthly_dates <- seq(min(pop_q_df$date), max(pop_q_df$date), by = "month")
 known_pop     <- approx(as.numeric(pop_q_df$date), pop_q_df$pop,
-                         xout = as.numeric(monthly_dates), rule = 2)$y
+                        xout = as.numeric(monthly_dates), rule = 2)$y
 pop_m_df <- data.frame(date = monthly_dates, pop = known_pop)
 if (LOG_XREG) pop_m_df$pop <- log(pop_m_df$pop)
 
 cat("Data loaded:", nrow(data_raw), "monthly obs,", nrow(pop_q_df), "quarterly pop obs\n\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. BUILD FOLDS (fiscal-year expanding window)
+# 2. BUILD FOLDS
 # ══════════════════════════════════════════════════════════════════════════════
 
 all_dates  <- pop_m_df$date
@@ -295,36 +530,36 @@ fy_labels <- as.numeric(format(fy_starts, "%Y"))
 folds <- list(); fold_id <- 0; n_fy <- length(fy_starts)
 
 for (n_train_fy in MIN_TRAIN_YEARS:(n_fy - 1)) {
-  train_start <- fy_starts[1]
-  train_end   <- as.Date(paste0(fy_labels[n_train_fy] + 1, "-03-01"))
-  test_fy_idx <- n_train_fy + 1
-  if (test_fy_idx > n_fy) break
-  test_start  <- fy_starts[test_fy_idx]
-  test_end    <- as.Date(paste0(fy_labels[test_fy_idx] + 1, "-03-01"))
-  cap <- min(max(all_dates), data_max)
-  if (test_start > cap) break
-  if (test_end > cap) test_end <- cap
-  if (test_start < data_min) next
-  train_idx <- which(all_dates >= train_start & all_dates <= train_end)
-  test_idx  <- which(all_dates >= test_start  & all_dates <= test_end)
-  if (!all(all_dates[test_idx] %in% data_raw[[DATA_DATE_COL]])) next
-  fold_id <- fold_id + 1
-  folds[[fold_id]] <- list(
-    fold = fold_id, train_idx = train_idx, test_idx = test_idx,
-    train_start = train_start, train_end = train_end,
-    test_start = test_start, test_end = test_end,
-    test_fy = fy_labels[test_fy_idx],
-    partial = (test_end < as.Date(paste0(fy_labels[test_fy_idx] + 1, "-03-01")))
-  )
+    train_start <- fy_starts[1]
+    train_end   <- as.Date(paste0(fy_labels[n_train_fy] + 1, "-03-01"))
+    test_fy_idx <- n_train_fy + 1
+    if (test_fy_idx > n_fy) break
+    test_start  <- fy_starts[test_fy_idx]
+    test_end    <- as.Date(paste0(fy_labels[test_fy_idx] + 1, "-03-01"))
+    cap <- min(max(all_dates), data_max)
+    if (test_start > cap) break
+    if (test_end > cap) test_end <- cap
+    if (test_start < data_min) next
+    train_idx <- which(all_dates >= train_start & all_dates <= train_end)
+    test_idx  <- which(all_dates >= test_start  & all_dates <= test_end)
+    if (!all(all_dates[test_idx] %in% data_raw[[DATA_DATE_COL]])) next
+    fold_id <- fold_id + 1
+    folds[[fold_id]] <- list(
+        fold = fold_id, train_idx = train_idx, test_idx = test_idx,
+        train_start = train_start, train_end = train_end,
+        test_start = test_start, test_end = test_end,
+        test_fy = fy_labels[test_fy_idx],
+        partial = (test_end < as.Date(paste0(fy_labels[test_fy_idx] + 1, "-03-01")))
+    )
 }
 n_folds <- length(folds)
 
 cat("Folds:", n_folds, "\n")
 for (f in folds) {
-  tag <- if (f$partial) " ** PARTIAL **" else ""
-  cat(sprintf("  Fold %d: train %s–%s (%d mo) → FY%d %s–%s (%d mo)%s\n",
-              f$fold, format(f$train_start), format(f$train_end), length(f$train_idx),
-              f$test_fy, format(f$test_start), format(f$test_end), length(f$test_idx), tag))
+    tag <- if (f$partial) " ** PARTIAL **" else ""
+    cat(sprintf("  Fold %d: train %s–%s (%d mo) → FY%d %s–%s (%d mo)%s\n",
+                f$fold, format(f$train_start), format(f$train_end), length(f$train_idx),
+                f$test_fy, format(f$test_start), format(f$test_end), length(f$test_idx), tag))
 }
 cat("\n")
 
@@ -341,29 +576,70 @@ cat("Scenarios:", n_scenarios, "\n\n")
 # ══════════════════════════════════════════════════════════════════════════════
 
 build_xreg_mat <- function(pop_vec, lags) {
-  # Returns a matrix with lagged population columns
-  n <- length(pop_vec)
-  X <- matrix(NA_real_, nrow = n, ncol = length(lags))
-  colnames(X) <- paste0("pop_lag", lags)
-  for (k in seq_along(lags)) {
-    L <- lags[k]
-    X[, k] <- c(rep(NA_real_, L), pop_vec[1:(n - L)])
-  }
-  return(X)
+    n <- length(pop_vec)
+    X <- matrix(NA_real_, nrow = n, ncol = length(lags))
+    colnames(X) <- paste0("pop_lag", lags)
+    for (k in seq_along(lags)) {
+        L <- lags[k]
+        X[, k] <- c(rep(NA_real_, L), pop_vec[1:(n - L)])
+    }
+    return(X)
 }
 
 inv_logit <- function(x) 1 / (1 + exp(-x))
 
-# Helper to extract posterior draws of y_pred from stanfit
-# Returns matrix: (n_draws x H)
-extract_ypred <- function(stanfit) {
-  draws <- rstan::extract(stanfit, pars = "y_pred")$y_pred
-  return(draws)  # matrix: n_draws x H
+# Generate posterior predictive draws given parameter draws and X_new
+# draws_params: matrix with columns b0, b1..bK, phi, sigma
+# y_train: training y (to compute last residual)
+# X_train: training X
+# X_new: future X (h x K)
+# Returns matrix (n_draws x h)
+generate_predictions <- function(draws_params, y_train, X_train, X_new, K, h) {
+    n_draws  <- nrow(draws_params)
+    N_train  <- length(y_train)
+    y_pred   <- matrix(NA_real_, nrow = n_draws, ncol = h)
+    
+    for (d in 1:n_draws) {
+        b0    <- draws_params[d, 1]
+        b     <- draws_params[d, 2:(K + 1)]
+        phi   <- draws_params[d, K + 2]
+        sigma <- draws_params[d, K + 3]
+        
+        # Last training residual
+        mu_last    <- b0 + sum(X_train[N_train, ] * b)
+        last_resid <- y_train[N_train] - mu_last
+        
+        # Future mu
+        mu_new <- b0 + as.numeric(X_new %*% b)
+        
+        # AR(1) forward simulation
+        y_pred[d, 1] <- mu_new[1] + phi * last_resid + rnorm(1, 0, sigma)
+        for (t in 2:h) {
+            y_pred[d, t] <- mu_new[t] + phi * (y_pred[d, t - 1] - mu_new[t - 1]) +
+                rnorm(1, 0, sigma)
+        }
+    }
+    return(y_pred)
 }
 
-# Helper to extract slope draws from lag model
-extract_slopes <- function(stanfit, K) {
-  rstan::extract(stanfit, pars = "b")$b  # matrix: n_draws x K
+# Same for null model (no regressors)
+generate_predictions_null <- function(draws_null, y_train, h) {
+    n_draws <- nrow(draws_null)
+    N_train <- length(y_train)
+    y_pred  <- matrix(NA_real_, nrow = n_draws, ncol = h)
+    
+    for (d in 1:n_draws) {
+        b0    <- draws_null[d, "b0"]
+        phi   <- draws_null[d, "phi"]
+        sigma <- draws_null[d, "sigma"]
+        
+        last_resid <- y_train[N_train] - b0
+        y_pred[d, 1] <- b0 + phi * last_resid + rnorm(1, 0, sigma)
+        for (t in 2:h) {
+            y_pred[d, t] <- b0 + phi * (y_pred[d, t - 1] - b0) + rnorm(1, 0, sigma)
+        }
+    }
+    return(y_pred)
 }
 
 # Align values to pop dates
@@ -375,8 +651,6 @@ share_vals  <- data_raw$apple_share[match(all_dates, data_raw[[DATA_DATE_COL]])]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. MAIN LOOP
-#    For each fold: fit null + lag model for total & logit(share),
-#    forecast under each scenario, check monotonicity
 # ══════════════════════════════════════════════════════════════════════════════
 
 monthly_results <- vector("list", n_folds)
@@ -385,359 +659,231 @@ mono_results    <- vector("list", n_folds)
 t_start <- Sys.time()
 
 for (f_idx in seq_len(n_folds)) {
-
-  fold    <- folds[[f_idx]]
-  h       <- length(fold$test_idx)
-  n_train <- length(fold$train_idx)
-
-  pop_train   <- pop_m_df$pop[fold$train_idx]
-  train_dates <- all_dates[fold$train_idx]
-
-  actual_apple  <- apple_vals[fold$test_idx]
-  actual_banana <- banana_vals[fold$test_idx]
-  actual_total  <- total_vals[fold$test_idx]
-  actual_share  <- share_vals[fold$test_idx]
-
-  test_dates  <- all_dates[fold$test_idx]
-  test_months <- as.numeric(format(test_dates, "%m"))
-  test_years  <- as.numeric(format(test_dates, "%Y"))
-  test_fy     <- fold$test_fy
-
-  pop_test_true   <- pop_m_df$pop[fold$test_idx]
-  true_growth_pct <- round(((pop_test_true[h] / pop_test_true[1])^(12 / (h - 1)) - 1) * 100, 2)
-  last_train_pop  <- pop_train[n_train]
-
-  # Scenario pop paths
-  pop_scen_fold <- matrix(NA, nrow = h, ncol = n_scenarios)
-  for (s in seq_len(n_scenarios)) {
-    mr <- (1 + annual_rates[s])^(1 / 12) - 1
-    pop_scen_fold[, s] <- last_train_pop * (1 + mr)^(1:h)
-  }
-
-  cat(sprintf("\n══ Fold %d / %d  FY%d  (true growth: %.2f%%) ══\n",
-              f_idx, n_folds, test_fy, true_growth_pct))
-
-  fold_rows <- list()
-  row_idx   <- 0
-
-  # ── 5a. NULL MODEL (intercept + AR(1) only) ───────────────────────────────
-
-  cat("  Fitting null models (total + logit_share)...\n")
-
-  y_total_train <- total_vals[fold$train_idx]
-  y_logit_train <- logit_vals[fold$train_idx]
-
-  # We need to run null for each scenario to get the same y_pred draws,
-  # but null doesn't depend on scenario. Fit once, reuse draws.
-  null_data_total <- list(
-    N = n_train, H = h,
-    y = y_total_train,
-    intcpt_sd = INTCPT_PRIOR_SD,
-    ar_sd     = AR_PRIOR_SD
-  )
-  null_data_logit <- list(
-    N = n_train, H = h,
-    y = y_logit_train,
-    intcpt_sd = INTCPT_PRIOR_SD,
-    ar_sd     = AR_PRIOR_SD
-  )
-
-  fit_null_total <- tryCatch(
-    sampling(sm_null, data = null_data_total,
-             iter = STAN_ITER, warmup = STAN_WARMUP,
-             chains = STAN_CHAINS, seed = STAN_SEED,
-             control = list(adapt_delta = STAN_ADAPT),
-             show_messages = FALSE, refresh = 0),
-    error = function(e) { cat("    null total FAILED:", e$message, "\n"); NULL }
-  )
-
-  fit_null_logit <- tryCatch(
-    sampling(sm_null, data = null_data_logit,
-             iter = STAN_ITER, warmup = STAN_WARMUP,
-             chains = STAN_CHAINS, seed = STAN_SEED,
-             control = list(adapt_delta = STAN_ADAPT),
-             show_messages = FALSE, refresh = 0),
-    error = function(e) { cat("    null logit FAILED:", e$message, "\n"); NULL }
-  )
-
-  if (!is.null(fit_null_total) && !is.null(fit_null_logit)) {
-    cat("  Null models fitted. Forecasting...\n")
-
-    draws_null_total <- extract_ypred(fit_null_total)   # n_draws x H
-    draws_null_logit <- extract_ypred(fit_null_logit)
-
-    # Point estimates: posterior mean at each horizon
+    
+    fold    <- folds[[f_idx]]
+    h       <- length(fold$test_idx)
+    n_train <- length(fold$train_idx)
+    
+    pop_train   <- pop_m_df$pop[fold$train_idx]
+    train_dates <- all_dates[fold$train_idx]
+    
+    actual_apple  <- apple_vals[fold$test_idx]
+    actual_banana <- banana_vals[fold$test_idx]
+    actual_total  <- total_vals[fold$test_idx]
+    actual_share  <- share_vals[fold$test_idx]
+    
+    test_dates  <- all_dates[fold$test_idx]
+    test_months <- as.numeric(format(test_dates, "%m"))
+    test_years  <- as.numeric(format(test_dates, "%Y"))
+    test_fy     <- fold$test_fy
+    
+    pop_test_true   <- pop_m_df$pop[fold$test_idx]
+    true_growth_pct <- round(((pop_test_true[h] / pop_test_true[1])^(12 / (h - 1)) - 1) * 100, 2)
+    last_train_pop  <- pop_train[n_train]
+    
+    pop_scen_fold <- matrix(NA, nrow = h, ncol = n_scenarios)
+    for (s in seq_len(n_scenarios)) {
+        mr <- (1 + annual_rates[s])^(1 / 12) - 1
+        pop_scen_fold[, s] <- last_train_pop * (1 + mr)^(1:h)
+    }
+    
+    cat(sprintf("\n══════════════════════════════════════════════════════════\n"))
+    cat(sprintf("  Fold %d / %d  FY%d  (true growth: %.2f%%)\n",
+                f_idx, n_folds, test_fy, true_growth_pct))
+    cat(sprintf("══════════════════════════════════════════════════════════\n"))
+    
+    fold_rows <- list()
+    row_idx   <- 0
+    
+    y_total_train <- total_vals[fold$train_idx]
+    y_logit_train <- logit_vals[fold$train_idx]
+    
+    # ── 5a. NULL MODEL ────────────────────────────────────────────────────────
+    
+    mcmc_null_total <- run_mcmc_null(
+        y_total_train, MCMC_ITER, MCMC_WARMUP, MCMC_CHAINS, MCMC_THIN, MCMC_SEED,
+        INTCPT_PRIOR_SD, AR_PRIOR_SD, label = "null_total"
+    )
+    mcmc_null_logit <- run_mcmc_null(
+        y_logit_train, MCMC_ITER, MCMC_WARMUP, MCMC_CHAINS, MCMC_THIN, MCMC_SEED,
+        INTCPT_PRIOR_SD, AR_PRIOR_SD, label = "null_logit"
+    )
+    
+    set.seed(MCMC_SEED)
+    draws_null_total <- generate_predictions_null(mcmc_null_total$draws, y_total_train, h)
+    draws_null_logit <- generate_predictions_null(mcmc_null_logit$draws, y_logit_train, h)
+    
     fc_total_v  <- colMeans(draws_null_total)
     fc_share_v  <- colMeans(inv_logit(draws_null_logit))
     fc_apple_v  <- fc_total_v * fc_share_v
     fc_banana_v <- fc_total_v * (1 - fc_share_v)
-
-    # Null gives same forecast for all scenarios
+    
     for (s in seq_len(n_scenarios)) {
-      scen_pct <- round(annual_rates[s] * 100, 2)
-      row_idx  <- row_idx + 1
-      fold_rows[[row_idx]] <- data.frame(
-        fold = f_idx, fiscal_year = test_fy,
-        month = test_months, cal_year = test_years,
-        model = "null",
-        actual_total    = round(actual_total, 2),
-        forecast_total  = round(fc_total_v, 2),
-        actual_apple    = round(actual_apple, 2),
-        forecast_apple  = round(fc_apple_v, 2),
-        actual_banana   = round(actual_banana, 2),
-        forecast_banana = round(fc_banana_v, 2),
-        actual_share    = round(actual_share, 4),
-        forecast_share  = round(fc_share_v, 4),
-        mape_total  = round(abs(actual_total - fc_total_v) / abs(actual_total) * 100, 3),
-        mape_apple  = round(abs(actual_apple - fc_apple_v) / abs(actual_apple) * 100, 3),
-        mape_banana = round(abs(actual_banana - fc_banana_v) / abs(actual_banana) * 100, 3),
-        scenario      = scen_pct,
-        true_scenario = true_growth_pct,
-        scenario_diff = round(true_growth_pct - scen_pct, 2),
-        stringsAsFactors = FALSE
-      )
+        scen_pct <- round(annual_rates[s] * 100, 2)
+        row_idx  <- row_idx + 1
+        fold_rows[[row_idx]] <- data.frame(
+            fold = f_idx, fiscal_year = test_fy,
+            month = test_months, cal_year = test_years,
+            model = "null",
+            actual_total = round(actual_total, 2), forecast_total = round(fc_total_v, 2),
+            actual_apple = round(actual_apple, 2), forecast_apple = round(fc_apple_v, 2),
+            actual_banana = round(actual_banana, 2), forecast_banana = round(fc_banana_v, 2),
+            actual_share = round(actual_share, 4), forecast_share = round(fc_share_v, 4),
+            mape_total = round(abs(actual_total - fc_total_v) / abs(actual_total) * 100, 3),
+            mape_apple = round(abs(actual_apple - fc_apple_v) / abs(actual_apple) * 100, 3),
+            mape_banana = round(abs(actual_banana - fc_banana_v) / abs(actual_banana) * 100, 3),
+            scenario = scen_pct, true_scenario = true_growth_pct,
+            scenario_diff = round(true_growth_pct - scen_pct, 2),
+            stringsAsFactors = FALSE
+        )
     }
-    cat("  Null done.\n")
-  }
-
-  # ── 5b. LAG MODEL (lags 3, 6, 12 with truncated priors) ──────────────────
-
-  model_label <- paste(LAGS, collapse = ",")
-  cat("  Fitting lag model (", model_label, ")...\n")
-
-  max_lag_i   <- max(LAGS)
-  first_valid <- max_lag_i + 1
-  K           <- length(LAGS)
-
-  if (first_valid >= n_train) {
-    cat("  Not enough training data for lags. Skipping.\n")
-    monthly_results[[f_idx]] <- do.call(rbind, fold_rows)
-    next
-  }
-
-  # Build training xreg
-  X_train_full <- build_xreg_mat(pop_train, LAGS)
-  X_train      <- X_train_full[first_valid:n_train, , drop = FALSE]
-  y_total_trim <- y_total_train[first_valid:n_train]
-  y_logit_trim <- y_logit_train[first_valid:n_train]
-  N_trim       <- length(y_total_trim)
-
-  # We need to fit per-scenario because X_new changes.
-  # BUT: the training data is the same across scenarios, so fitting the
-  # model once per scenario is wasteful. Instead, we fit the model once
-  # with a dummy X_new, then generate predictions in R from the posterior
-  # draws of (b0, b, phi, sigma).
-  #
-  # Strategy: fit once (X_new = dummy), extract posterior (b0, b, phi, sigma),
-  # then for each scenario, compute predictions in R from the draws.
-
-  # Fit with a placeholder X_new (won't use the generated y_pred from Stan)
-  X_dummy_new <- matrix(0, nrow = h, ncol = K)
-
-  stan_data_total <- list(
-    N = N_trim, K = K, H = h,
-    X = X_train, y = y_total_trim,
-    X_new     = X_dummy_new,
-    slope_mu  = SLOPE_PRIOR_MU,
-    slope_sd  = SLOPE_PRIOR_SD,
-    intcpt_sd = INTCPT_PRIOR_SD,
-    ar_sd     = AR_PRIOR_SD
-  )
-
-  stan_data_logit <- list(
-    N = N_trim, K = K, H = h,
-    X = X_train, y = y_logit_trim,
-    X_new     = X_dummy_new,
-    slope_mu  = SLOPE_PRIOR_MU,
-    slope_sd  = SLOPE_PRIOR_SD,
-    intcpt_sd = INTCPT_PRIOR_SD,
-    ar_sd     = AR_PRIOR_SD
-  )
-
-  fit_lag_total <- tryCatch(
-    sampling(sm_lag, data = stan_data_total,
-             iter = STAN_ITER, warmup = STAN_WARMUP,
-             chains = STAN_CHAINS, seed = STAN_SEED,
-             control = list(adapt_delta = STAN_ADAPT),
-             show_messages = FALSE, refresh = 0),
-    error = function(e) { cat("    lag total FAILED:", e$message, "\n"); NULL }
-  )
-
-  fit_lag_logit <- tryCatch(
-    sampling(sm_lag, data = stan_data_logit,
-             iter = STAN_ITER, warmup = STAN_WARMUP,
-             chains = STAN_CHAINS, seed = STAN_SEED,
-             control = list(adapt_delta = STAN_ADAPT),
-             show_messages = FALSE, refresh = 0),
-    error = function(e) { cat("    lag logit FAILED:", e$message, "\n"); NULL }
-  )
-
-  if (is.null(fit_lag_total) || is.null(fit_lag_logit)) {
-    cat("  Lag model fitting failed. Skipping scenarios.\n")
-    monthly_results[[f_idx]] <- do.call(rbind, fold_rows)
-    next
-  }
-
-  cat("  Lag models fitted. Checking posterior non-negativity...\n")
-
-  # Extract posterior parameters
-  post_total <- rstan::extract(fit_lag_total)
-  post_logit <- rstan::extract(fit_lag_logit)
-
-  n_draws <- nrow(post_total$b)
-
-  for (k in seq_along(LAGS)) {
-    cat(sprintf("    Total  pop_lag%d: min = %.6f, mean = %.4f\n",
-                LAGS[k], min(post_total$b[, k]), mean(post_total$b[, k])))
-    cat(sprintf("    Logit  pop_lag%d: min = %.6f, mean = %.4f\n",
-                LAGS[k], min(post_logit$b[, k]), mean(post_logit$b[, k])))
-  }
-  cat("    (All should be >= 0 by construction of lower = 0 constraint)\n")
-
-  # ── Generate forecasts in R from posterior draws ──────────────────────────
-  # For each scenario s and each draw d:
-  #   mu_new[t] = b0[d] + X_new[t,] %*% b[d,]
-  #   y_pred[1] = mu_new[1] + phi[d] * last_resid[d] + rnorm(0, sigma[d])
-  #   y_pred[t] = mu_new[t] + phi[d] * (y_pred[t-1] - mu_new[t-1]) + noise
-
-  # Pre-compute training residuals at last time point for each draw
-  # mu_train_last = b0 + X_train[N_trim,] %*% b
-  mu_train_last_total <- post_total$b0 + as.vector(X_train[N_trim, , drop = FALSE] %*% t(post_total$b))
-  last_resid_total    <- y_total_trim[N_trim] - mu_train_last_total
-
-  mu_train_last_logit <- post_logit$b0 + as.vector(X_train[N_trim, , drop = FALSE] %*% t(post_logit$b))
-  last_resid_logit    <- y_logit_trim[N_trim] - mu_train_last_logit
-
-  # Function to generate posterior predictive draws for a given X_new
-  generate_predictions <- function(post_params, last_resid, X_new_s, h, n_draws) {
-    # post_params: list with b0 (vector), b (matrix n_draws x K), phi (vector), sigma (vector)
-    # Returns matrix n_draws x h
-    mu_new <- matrix(NA_real_, nrow = n_draws, ncol = h)
-    for (t in 1:h) {
-      mu_new[, t] <- post_params$b0 + as.vector(post_params$b %*% X_new_s[t, ])
+    cat("  Null model done.\n\n")
+    
+    # ── 5b. LAG MODEL ────────────────────────────────────────────────────────
+    
+    model_label <- paste(LAGS, collapse = ",")
+    K           <- length(LAGS)
+    max_lag_i   <- max(LAGS)
+    first_valid <- max_lag_i + 1
+    
+    if (first_valid >= n_train) {
+        cat("  Not enough training data for lags. Skipping.\n")
+        monthly_results[[f_idx]] <- do.call(rbind, fold_rows)
+        next
     }
-
-    y_pred <- matrix(NA_real_, nrow = n_draws, ncol = h)
-    set.seed(STAN_SEED)  # reproducibility across scenarios
-    noise <- matrix(rnorm(n_draws * h, 0, 1), nrow = n_draws, ncol = h)
-
-    y_pred[, 1] <- mu_new[, 1] + post_params$phi * last_resid +
-                    noise[, 1] * post_params$sigma
-    for (t in 2:h) {
-      y_pred[, t] <- mu_new[, t] + post_params$phi * (y_pred[, t-1] - mu_new[, t-1]) +
-                     noise[, t] * post_params$sigma
-    }
-    return(y_pred)
-  }
-
-  cat("  Forecasting across", n_scenarios, "scenarios...\n")
-
-  # Store posterior predictive draws per scenario for monotonicity check
-  scen_draws_total <- list()
-  scen_draws_logit <- list()
-
-  for (s in seq_len(n_scenarios)) {
-    # Extend pop with scenario path
-    pop_ext <- c(pop_train, pop_scen_fold[, s])
-
-    # Build xreg for full series, extract future rows
-    X_full   <- build_xreg_mat(pop_ext, LAGS)
-    X_new_s  <- X_full[(n_train + 1):(n_train + h), , drop = FALSE]
-
-    if (any(is.na(X_new_s))) next
-
-    # Generate draws
-    draws_total <- generate_predictions(post_total, last_resid_total, X_new_s, h, n_draws)
-    draws_logit <- generate_predictions(post_logit, last_resid_logit, X_new_s, h, n_draws)
-
-    scen_pct <- round(annual_rates[s] * 100, 2)
-    scen_draws_total[[as.character(scen_pct)]] <- draws_total
-    scen_draws_logit[[as.character(scen_pct)]] <- draws_logit
-
-    # Point estimates: posterior mean
-    fc_total_v  <- colMeans(draws_total)
-    fc_share_v  <- colMeans(inv_logit(draws_logit))
-    fc_apple_v  <- fc_total_v * fc_share_v
-    fc_banana_v <- fc_total_v * (1 - fc_share_v)
-
-    row_idx <- row_idx + 1
-    fold_rows[[row_idx]] <- data.frame(
-      fold = f_idx, fiscal_year = test_fy,
-      month = test_months, cal_year = test_years,
-      model = model_label,
-      actual_total    = round(actual_total, 2),
-      forecast_total  = round(fc_total_v, 2),
-      actual_apple    = round(actual_apple, 2),
-      forecast_apple  = round(fc_apple_v, 2),
-      actual_banana   = round(actual_banana, 2),
-      forecast_banana = round(fc_banana_v, 2),
-      actual_share    = round(actual_share, 4),
-      forecast_share  = round(fc_share_v, 4),
-      mape_total  = round(abs(actual_total - fc_total_v) / abs(actual_total) * 100, 3),
-      mape_apple  = round(abs(actual_apple - fc_apple_v) / abs(actual_apple) * 100, 3),
-      mape_banana = round(abs(actual_banana - fc_banana_v) / abs(actual_banana) * 100, 3),
-      scenario      = scen_pct,
-      true_scenario = true_growth_pct,
-      scenario_diff = round(true_growth_pct - scen_pct, 2),
-      stringsAsFactors = FALSE
+    
+    X_train_full <- build_xreg_mat(pop_train, LAGS)
+    X_train      <- X_train_full[first_valid:n_train, , drop = FALSE]
+    y_total_trim <- y_total_train[first_valid:n_train]
+    y_logit_trim <- y_logit_train[first_valid:n_train]
+    N_trim       <- length(y_total_trim)
+    
+    mcmc_lag_total <- run_mcmc(
+        y_total_trim, X_train, K, MCMC_ITER, MCMC_WARMUP, MCMC_CHAINS,
+        MCMC_THIN, MCMC_SEED,
+        SLOPE_PRIOR_MU, SLOPE_PRIOR_SD, INTCPT_PRIOR_SD, AR_PRIOR_SD,
+        label = "lag_total"
     )
-
-    if (s %% 10 == 0) {
-      cat(sprintf("    scenario %d / %d (%.0f%%)\n", s, n_scenarios,
-                  s / n_scenarios * 100))
+    mcmc_lag_logit <- run_mcmc(
+        y_logit_trim, X_train, K, MCMC_ITER, MCMC_WARMUP, MCMC_CHAINS,
+        MCMC_THIN, MCMC_SEED,
+        SLOPE_PRIOR_MU, SLOPE_PRIOR_SD, INTCPT_PRIOR_SD, AR_PRIOR_SD,
+        label = "lag_logit"
+    )
+    
+    # Verify non-negativity
+    cat("\n  Posterior slope summary (should all be >= 0):\n")
+    for (k in 1:K) {
+        col_idx <- 1 + k
+        cat(sprintf("    Total  pop_lag%d: min = %.6f, mean = %.4f, median = %.4f\n",
+                    LAGS[k],
+                    min(mcmc_lag_total$draws[, col_idx]),
+                    mean(mcmc_lag_total$draws[, col_idx]),
+                    median(mcmc_lag_total$draws[, col_idx])))
+        cat(sprintf("    Logit  pop_lag%d: min = %.6f, mean = %.4f, median = %.4f\n",
+                    LAGS[k],
+                    min(mcmc_lag_logit$draws[, col_idx]),
+                    mean(mcmc_lag_logit$draws[, col_idx]),
+                    median(mcmc_lag_logit$draws[, col_idx])))
     }
-  }
-
-  # ── 5c. MONOTONICITY CHECK (draw-by-draw) ────────────────────────────────
-
-  cat("\n  === Monotonicity Check (draw-by-draw) for Fold", f_idx, "===\n")
-
-  all_mono <- TRUE
-
-  # Check adjacent 1pp steps
-  check_scens <- seq(SCENARIO_MIN, SCENARIO_MAX, by = 1)
-  check_labels <- as.character(check_scens)
-
-  for (i in 2:length(check_labels)) {
-    lo <- check_labels[i - 1]
-    hi <- check_labels[i]
-    if (!(lo %in% names(scen_draws_total)) || !(hi %in% names(scen_draws_total))) next
-
-    # Total model draws
-    diff_mat_total <- scen_draws_total[[hi]] - scen_draws_total[[lo]]
-    n_viol_total   <- sum(diff_mat_total < 0)
-    total_cells    <- length(diff_mat_total)
-
-    # Apple forecast = total * inv_logit(logit_share), check draw-by-draw
-    draws_apple_hi <- scen_draws_total[[hi]] * inv_logit(scen_draws_logit[[hi]])
-    draws_apple_lo <- scen_draws_total[[lo]] * inv_logit(scen_draws_logit[[lo]])
-    diff_mat_apple <- draws_apple_hi - draws_apple_lo
-    n_viol_apple   <- sum(diff_mat_apple < 0)
-
-    cat(sprintf("    %3s%% vs %3s%%: total violations = %d / %d (%.2f%%), apple = %d / %d (%.2f%%)\n",
-                hi, lo,
-                n_viol_total, total_cells, 100 * n_viol_total / total_cells,
-                n_viol_apple, total_cells, 100 * n_viol_apple / total_cells))
-    if (n_viol_total > 0 || n_viol_apple > 0) all_mono <- FALSE
-  }
-
-  if (all_mono) {
-    cat("    PASS: Perfect monotonicity across all posterior draws.\n")
-  } else {
-    cat("    NOTE: Minor violations may occur from AR noise in generated quantities,\n")
-    cat("          but the EXPECTED value (mu) is guaranteed monotone by the prior.\n")
-  }
-
-  mono_results[[f_idx]] <- list(fold = f_idx, all_mono = all_mono)
-
-  fold_elapsed <- as.numeric(difftime(Sys.time(), t_start, units = "mins"))
-  cat(sprintf("  Fold %d done. Elapsed: %.1f min\n", f_idx, fold_elapsed))
-
-  monthly_results[[f_idx]] <- do.call(rbind, fold_rows)
+    
+    # Forecast per scenario
+    cat("\n  Forecasting across", n_scenarios, "scenarios...\n")
+    
+    scen_draws_total <- list()
+    scen_draws_logit <- list()
+    
+    for (s in seq_len(n_scenarios)) {
+        pop_ext  <- c(pop_train, pop_scen_fold[, s])
+        X_full   <- build_xreg_mat(pop_ext, LAGS)
+        X_new_s  <- X_full[(n_train + 1):(n_train + h), , drop = FALSE]
+        
+        if (any(is.na(X_new_s))) next
+        
+        set.seed(MCMC_SEED + s)
+        draws_total <- generate_predictions(mcmc_lag_total$draws, y_total_trim,
+                                            X_train, X_new_s, K, h)
+        draws_logit <- generate_predictions(mcmc_lag_logit$draws, y_logit_trim,
+                                            X_train, X_new_s, K, h)
+        
+        scen_pct <- round(annual_rates[s] * 100, 2)
+        scen_draws_total[[as.character(scen_pct)]] <- draws_total
+        scen_draws_logit[[as.character(scen_pct)]] <- draws_logit
+        
+        fc_total_v  <- colMeans(draws_total)
+        fc_share_v  <- colMeans(inv_logit(draws_logit))
+        fc_apple_v  <- fc_total_v * fc_share_v
+        fc_banana_v <- fc_total_v * (1 - fc_share_v)
+        
+        row_idx <- row_idx + 1
+        fold_rows[[row_idx]] <- data.frame(
+            fold = f_idx, fiscal_year = test_fy,
+            month = test_months, cal_year = test_years,
+            model = model_label,
+            actual_total = round(actual_total, 2), forecast_total = round(fc_total_v, 2),
+            actual_apple = round(actual_apple, 2), forecast_apple = round(fc_apple_v, 2),
+            actual_banana = round(actual_banana, 2), forecast_banana = round(fc_banana_v, 2),
+            actual_share = round(actual_share, 4), forecast_share = round(fc_share_v, 4),
+            mape_total = round(abs(actual_total - fc_total_v) / abs(actual_total) * 100, 3),
+            mape_apple = round(abs(actual_apple - fc_apple_v) / abs(actual_apple) * 100, 3),
+            mape_banana = round(abs(actual_banana - fc_banana_v) / abs(actual_banana) * 100, 3),
+            scenario = scen_pct, true_scenario = true_growth_pct,
+            scenario_diff = round(true_growth_pct - scen_pct, 2),
+            stringsAsFactors = FALSE
+        )
+        
+        if (s %% 10 == 0) {
+            cat(sprintf("    scenario %d / %d (%.0f%%)\n", s, n_scenarios,
+                        s / n_scenarios * 100))
+        }
+    }
+    
+    # ── 5c. MONOTONICITY CHECK ───────────────────────────────────────────────
+    
+    cat("\n  === Monotonicity Check (draw-by-draw) for Fold", f_idx, "===\n")
+    
+    all_mono <- TRUE
+    check_scens <- seq(SCENARIO_MIN, SCENARIO_MAX, by = 1)
+    check_labels <- as.character(check_scens)
+    
+    for (i in 2:length(check_labels)) {
+        lo <- check_labels[i - 1]
+        hi <- check_labels[i]
+        if (!(lo %in% names(scen_draws_total)) || !(hi %in% names(scen_draws_total))) next
+        
+        diff_mat_total <- scen_draws_total[[hi]] - scen_draws_total[[lo]]
+        n_viol_total   <- sum(diff_mat_total < 0)
+        total_cells    <- length(diff_mat_total)
+        
+        draws_apple_hi <- scen_draws_total[[hi]] * inv_logit(scen_draws_logit[[hi]])
+        draws_apple_lo <- scen_draws_total[[lo]] * inv_logit(scen_draws_logit[[lo]])
+        diff_mat_apple <- draws_apple_hi - draws_apple_lo
+        n_viol_apple   <- sum(diff_mat_apple < 0)
+        
+        cat(sprintf("    %3s%% vs %3s%%: total viol = %d / %d (%.2f%%), apple viol = %d / %d (%.2f%%)\n",
+                    hi, lo,
+                    n_viol_total, total_cells, 100 * n_viol_total / total_cells,
+                    n_viol_apple, total_cells, 100 * n_viol_apple / total_cells))
+        if (n_viol_total > 0 || n_viol_apple > 0) all_mono <- FALSE
+    }
+    
+    if (all_mono) {
+        cat("    PASS: Perfect monotonicity across all posterior draws.\n")
+    } else {
+        cat("    NOTE: Minor violations from AR noise; expected value (mu) is\n")
+        cat("          guaranteed monotone by the truncated prior.\n")
+    }
+    
+    mono_results[[f_idx]] <- list(fold = f_idx, all_mono = all_mono)
+    
+    fold_elapsed <- as.numeric(difftime(Sys.time(), t_start, units = "mins"))
+    cat(sprintf("\n  Fold %d done. Elapsed: %.1f min\n", f_idx, fold_elapsed))
+    
+    monthly_results[[f_idx]] <- do.call(rbind, fold_rows)
 }
 
 elapsed_total <- as.numeric(difftime(Sys.time(), t_start, units = "mins"))
-cat(sprintf("\nAll done. %d folds in %.1f min.\n\n", n_folds, elapsed_total))
+cat(sprintf("\n\nAll done. %d folds in %.1f min.\n\n", n_folds, elapsed_total))
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. BUILD TABLES
@@ -753,18 +899,18 @@ print(head(table1, 10), row.names = FALSE)
 
 # ── Table 2: Yearly detail ───────────────────────────────────────────────────
 table2 <- aggregate(
-  cbind(actual_total, forecast_total, actual_apple, forecast_apple,
-        actual_banana, forecast_banana) ~
-    fold + fiscal_year + model + scenario + true_scenario + scenario_diff,
-  data = table1, FUN = sum
+    cbind(actual_total, forecast_total, actual_apple, forecast_apple,
+          actual_banana, forecast_banana) ~
+        fold + fiscal_year + model + scenario + true_scenario + scenario_diff,
+    data = table1, FUN = sum
 )
 
 table2$yearly_mape_total  <- round(abs(table2$actual_total - table2$forecast_total) /
-                                     abs(table2$actual_total) * 100, 3)
+                                       abs(table2$actual_total) * 100, 3)
 table2$yearly_mape_apple  <- round(abs(table2$actual_apple - table2$forecast_apple) /
-                                     abs(table2$actual_apple) * 100, 3)
+                                       abs(table2$actual_apple) * 100, 3)
 table2$yearly_mape_banana <- round(abs(table2$actual_banana - table2$forecast_banana) /
-                                     abs(table2$actual_banana) * 100, 3)
+                                       abs(table2$actual_banana) * 100, 3)
 
 table2 <- table2[order(table2$yearly_mape_total), ]
 rownames(table2) <- NULL
@@ -777,77 +923,73 @@ print(head(table2, 10), row.names = FALSE)
 in_band <- table2[abs(table2$scenario_diff) <= TOLERANCE_PP, ]
 
 if (nrow(in_band) > 0) {
-
-  # Yearly MAPE
-  yearly_rank <- aggregate(
-    cbind(yearly_mape_total, yearly_mape_apple, yearly_mape_banana) ~ model,
-    data = in_band, FUN = mean, na.rm = TRUE
-  )
-  yearly_rank$yearly_mape_total  <- round(yearly_rank$yearly_mape_total, 3)
-  yearly_rank$yearly_mape_apple  <- round(yearly_rank$yearly_mape_apple, 3)
-  yearly_rank$yearly_mape_banana <- round(yearly_rank$yearly_mape_banana, 3)
-
-  # Monthly MAPE
-  t1_band <- table1[abs(table1$scenario_diff) <= TOLERANCE_PP, ]
-  monthly_rank <- aggregate(
-    cbind(mape_total, mape_apple, mape_banana) ~ model,
-    data = t1_band, FUN = mean, na.rm = TRUE
-  )
-  names(monthly_rank) <- c("model", "monthly_mape_total", "monthly_mape_apple",
-                           "monthly_mape_banana")
-  monthly_rank$monthly_mape_total  <- round(monthly_rank$monthly_mape_total, 3)
-  monthly_rank$monthly_mape_apple  <- round(monthly_rank$monthly_mape_apple, 3)
-  monthly_rank$monthly_mape_banana <- round(monthly_rank$monthly_mape_banana, 3)
-
-  table3 <- merge(yearly_rank, monthly_rank, by = "model")
-  table3 <- table3[order(table3$yearly_mape_total), ]
-  rownames(table3) <- NULL
-
-  cat(sprintf("\nTABLE 3: Model Ranking within +/- %.1f pp (%d models)\n",
-              TOLERANCE_PP, nrow(table3)))
-  print(table3, row.names = FALSE)
-
-  # Summary
-  cat("\n========== SUMMARY ==========\n")
-
-  best <- table3[1, ]
-  cat(sprintf("\n>>> Best model: %s\n", best$model))
-  cat(sprintf("    Yearly  — total: %.3f%%  apple: %.3f%%  banana: %.3f%%\n",
-              best$yearly_mape_total, best$yearly_mape_apple, best$yearly_mape_banana))
-  cat(sprintf("    Monthly — total: %.3f%%  apple: %.3f%%  banana: %.3f%%\n",
-              best$monthly_mape_total, best$monthly_mape_apple, best$monthly_mape_banana))
-
-  null_row <- table3[table3$model == "null", ]
-  if (nrow(null_row) > 0) {
-    null_rank <- which(table3$model == "null")
-    cat(sprintf("\n    Null model: #%d / %d\n", null_rank, nrow(table3)))
+    
+    yearly_rank <- aggregate(
+        cbind(yearly_mape_total, yearly_mape_apple, yearly_mape_banana) ~ model,
+        data = in_band, FUN = mean, na.rm = TRUE
+    )
+    yearly_rank$yearly_mape_total  <- round(yearly_rank$yearly_mape_total, 3)
+    yearly_rank$yearly_mape_apple  <- round(yearly_rank$yearly_mape_apple, 3)
+    yearly_rank$yearly_mape_banana <- round(yearly_rank$yearly_mape_banana, 3)
+    
+    t1_band <- table1[abs(table1$scenario_diff) <= TOLERANCE_PP, ]
+    monthly_rank <- aggregate(
+        cbind(mape_total, mape_apple, mape_banana) ~ model,
+        data = t1_band, FUN = mean, na.rm = TRUE
+    )
+    names(monthly_rank) <- c("model", "monthly_mape_total", "monthly_mape_apple",
+                             "monthly_mape_banana")
+    monthly_rank$monthly_mape_total  <- round(monthly_rank$monthly_mape_total, 3)
+    monthly_rank$monthly_mape_apple  <- round(monthly_rank$monthly_mape_apple, 3)
+    monthly_rank$monthly_mape_banana <- round(monthly_rank$monthly_mape_banana, 3)
+    
+    table3 <- merge(yearly_rank, monthly_rank, by = "model")
+    table3 <- table3[order(table3$yearly_mape_total), ]
+    rownames(table3) <- NULL
+    
+    cat(sprintf("\nTABLE 3: Model Ranking within +/- %.1f pp (%d models)\n",
+                TOLERANCE_PP, nrow(table3)))
+    print(table3, row.names = FALSE)
+    
+    cat("\n========== SUMMARY ==========\n")
+    
+    best <- table3[1, ]
+    cat(sprintf("\n>>> Best model: %s\n", best$model))
     cat(sprintf("    Yearly  — total: %.3f%%  apple: %.3f%%  banana: %.3f%%\n",
-                null_row$yearly_mape_total, null_row$yearly_mape_apple,
-                null_row$yearly_mape_banana))
-    if (null_rank == 1) {
-      cat("    *** Population lags do NOT improve over Bayesian null ***\n")
-    } else {
-      improv <- round((null_row$yearly_mape_total - best$yearly_mape_total) /
-                        null_row$yearly_mape_total * 100, 1)
-      cat(sprintf("    Best model improves total yearly MAPE by %.1f%% vs null\n", improv))
+                best$yearly_mape_total, best$yearly_mape_apple, best$yearly_mape_banana))
+    cat(sprintf("    Monthly — total: %.3f%%  apple: %.3f%%  banana: %.3f%%\n",
+                best$monthly_mape_total, best$monthly_mape_apple, best$monthly_mape_banana))
+    
+    null_row <- table3[table3$model == "null", ]
+    if (nrow(null_row) > 0) {
+        null_rank <- which(table3$model == "null")
+        cat(sprintf("\n    Null model: #%d / %d\n", null_rank, nrow(table3)))
+        cat(sprintf("    Yearly  — total: %.3f%%  apple: %.3f%%  banana: %.3f%%\n",
+                    null_row$yearly_mape_total, null_row$yearly_mape_apple,
+                    null_row$yearly_mape_banana))
+        if (null_rank == 1) {
+            cat("    *** Population lags do NOT improve over Bayesian null ***\n")
+        } else {
+            improv <- round((null_row$yearly_mape_total - best$yearly_mape_total) /
+                                null_row$yearly_mape_total * 100, 1)
+            cat(sprintf("    Best model improves total yearly MAPE by %.1f%% vs null\n", improv))
+        }
     }
-  }
-
-  # Monotonicity summary
-  cat("\n========== MONOTONICITY ==========\n")
-  for (mr in mono_results) {
-    if (!is.null(mr)) {
-      cat(sprintf("  Fold %d: %s\n", mr$fold,
-                  if (mr$all_mono) "PASS (perfect)" else "Minor violations (see above)"))
+    
+    cat("\n========== MONOTONICITY ==========\n")
+    for (mr in mono_results) {
+        if (!is.null(mr)) {
+            cat(sprintf("  Fold %d: %s\n", mr$fold,
+                        if (mr$all_mono) "PASS (perfect)" else "Minor violations (see above)"))
+        }
     }
-  }
-  cat("\n  Key insight: The <lower=0> constraint on slope parameters in Stan ensures\n")
-  cat("  that EVERY posterior draw has non-negative population effects, so the\n")
-  cat("  expected forecast (mu) is guaranteed monotone across growth scenarios.\n")
-  cat("  Minor violations in y_pred come only from the random AR noise term.\n")
-
+    cat("\n  Key insight: The truncated proposal (reject b[k] < 0) ensures EVERY\n")
+    cat("  posterior draw has non-negative population effects, so the expected\n")
+    cat("  forecast (mu) is guaranteed monotone across growth scenarios.\n")
+    cat("  Minor violations in y_pred come only from the random AR noise term.\n")
+    
 } else {
-  cat(sprintf("\nNo scenarios within +/- %.1f pp.\n", TOLERANCE_PP))
+    cat(sprintf("\nNo scenarios within +/- %.1f pp.\n", TOLERANCE_PP))
 }
 
 cat("\nScript complete.\n")
