@@ -1,0 +1,540 @@
+################################################################################
+# ARIMAX Rolling-Origin CV: Total + Logit(Apple Share)
+#
+# Approach:
+#   Model 1: ARIMAX on total_sales ~ lagged population
+#   Model 2: ARIMAX on logit(apple_share) ~ lagged population
+#   Then:
+#     apple_forecast  = total_forecast × inv_logit(share_forecast)
+#     banana_forecast = total_forecast × (1 − inv_logit(share_forecast))
+#   Coherence guaranteed: apple + banana = total by construction.
+#
+# Fiscal year: April 1 – March 31 (partial last FY allowed)
+# Includes null model (no xreg — pure ARIMA)
+#
+# Output:
+#   Table 1 — Monthly detail
+#   Table 2 — Yearly detail (fiscal year)
+#   Table 3 — Model ranking within ±TOLERANCE_PP
+#
+# Dependencies: forecast, zoo
+################################################################################
+
+library(forecast)
+library(zoo)
+
+set.seed(42)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 0. SIMULATE DATA (remove when using real files)
+# ══════════════════════════════════════════════════════════════════════════════
+
+sim_q_dates <- seq(as.Date("2020-01-01"), as.Date("2025-10-01"), by = "3 months")
+sim_n_q     <- length(sim_q_dates)
+sim_pop     <- 38e6 * cumprod(c(1, rep(1 + 0.013/4, sim_n_q - 1))) +
+  cumsum(rnorm(sim_n_q, 0, 15000))
+write.csv(data.frame(date = sim_q_dates, population = sim_pop),
+          "quarterly_population.csv", row.names = FALSE)
+
+sim_m_dates <- seq(as.Date("2020-01-01"), as.Date("2025-10-01"), by = "month")
+sim_n_m     <- length(sim_m_dates)
+sim_pop_m   <- approx(as.numeric(sim_q_dates), sim_pop,
+                      xout = as.numeric(sim_m_dates), rule = 2)$y
+sim_pop_sc  <- (sim_pop_m - mean(sim_pop_m)) / sd(sim_pop_m)
+
+sim_apple <- 30000 + 600 * c(rep(0,3), sim_pop_sc[1:(sim_n_m-3)]) +
+  400 * c(rep(0,6), sim_pop_sc[1:(sim_n_m-6)]) +
+  as.numeric(arima.sim(list(ar=0.5, ma=0.2), n=sim_n_m, sd=300)) + rnorm(sim_n_m, 0, 150)
+
+sim_banana <- 20000 + 500 * c(rep(0,3), sim_pop_sc[1:(sim_n_m-3)]) +
+  300 * c(rep(0,6), sim_pop_sc[1:(sim_n_m-6)]) +
+  200 * c(rep(0,12), sim_pop_sc[1:(sim_n_m-12)]) +
+  as.numeric(arima.sim(list(ar=0.6, ma=0.3), n=sim_n_m, sd=350)) + rnorm(sim_n_m, 0, 100)
+
+sim_total <- sim_apple + sim_banana
+
+keep <- sim_m_dates >= as.Date("2020-04-01")
+write.csv(data.frame(
+  date         = sim_m_dates[keep],
+  apple_sales  = round(sim_apple[keep], 2),
+  banana_sales = round(sim_banana[keep], 2),
+  total_sales  = round(sim_total[keep], 2)
+), "monthly_data.csv", row.names = FALSE)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+# --- Data sources ------------------------------------------------------------
+POP_FILE        <- "quarterly_population.csv"
+POP_DATE_COL    <- "date"
+POP_VALUE_COL   <- "population"
+
+DATA_FILE       <- "monthly_data.csv"
+DATA_DATE_COL   <- "date"
+
+# --- Target columns ----------------------------------------------------------
+APPLE_COL       <- "apple_sales"
+BANANA_COL      <- "banana_sales"
+TOTAL_COL       <- "total_sales"
+
+# --- Fiscal year -------------------------------------------------------------
+FY_START_MONTH  <- 4
+FORECAST_MONTHS <- 12
+
+# --- Cross-validation --------------------------------------------------------
+MIN_TRAIN_YEARS <- 2
+
+# --- Lag structure -----------------------------------------------------------
+MAX_LAG         <- 12
+MAX_N_LAGS      <- 6
+
+# --- Transform ---------------------------------------------------------------
+LOG_XREG        <- FALSE
+
+# --- Scenario grid -----------------------------------------------------------
+SCENARIO_MIN    <- -3
+SCENARIO_MAX    <-  3
+SCENARIO_STEP   <-  0.1
+
+# --- Evaluation --------------------------------------------------------------
+TOLERANCE_PP    <- 1.0
+
+# --- ARIMAX fitting ----------------------------------------------------------
+MAX_AR          <- 3
+MAX_MA          <- 3
+MAX_DIFF        <- 1
+
+cat("=== Configuration ===\n")
+cat("  Approach:    total + logit(apple_share) → derive components\n")
+cat("  Fiscal year: Apr 1 – Mar 31\n")
+cat("  CV:          train", MIN_TRAIN_YEARS, "FY expanding\n")
+cat("  Lags:        1–", MAX_LAG, ", max", MAX_N_LAGS, " (+null)\n")
+cat("  Scenarios:   ", SCENARIO_MIN, "% to", SCENARIO_MAX, "% by", SCENARIO_STEP, "pp\n")
+cat("  Tolerance:   ±", TOLERANCE_PP, "pp\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. IMPORT DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
+pop_raw  <- read.csv(POP_FILE, stringsAsFactors = FALSE)
+pop_q_df <- data.frame(date = as.Date(pop_raw[[POP_DATE_COL]]),
+                       pop  = as.numeric(pop_raw[[POP_VALUE_COL]]))
+
+data_raw <- read.csv(DATA_FILE, stringsAsFactors = FALSE)
+data_raw[[DATA_DATE_COL]] <- as.Date(data_raw[[DATA_DATE_COL]])
+
+# Compute apple share and logit transform
+data_raw$apple_share <- data_raw[[APPLE_COL]] / data_raw[[TOTAL_COL]]
+
+# Clamp to (0.001, 0.999) to avoid logit(0) or logit(1)
+data_raw$apple_share <- pmin(pmax(data_raw$apple_share, 0.001), 0.999)
+data_raw$logit_share <- log(data_raw$apple_share / (1 - data_raw$apple_share))
+
+# Interpolate population
+monthly_dates <- seq(min(pop_q_df$date), max(pop_q_df$date), by = "month")
+known_pop     <- approx(as.numeric(pop_q_df$date), pop_q_df$pop,
+                        xout = as.numeric(monthly_dates), rule = 2)$y
+pop_m_df <- data.frame(date = monthly_dates, pop = known_pop)
+if (LOG_XREG) pop_m_df$pop <- log(pop_m_df$pop)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. FOLDS
+# ══════════════════════════════════════════════════════════════════════════════
+
+all_dates  <- pop_m_df$date
+all_months <- as.numeric(format(all_dates, "%m"))
+data_min   <- min(data_raw[[DATA_DATE_COL]])
+data_max   <- max(data_raw[[DATA_DATE_COL]])
+
+first_april_idx <- which(all_months == FY_START_MONTH)[1]
+first_fy_start  <- all_dates[first_april_idx]
+
+fy_starts <- seq(first_fy_start, max(all_dates), by = "year")
+fy_starts <- fy_starts[as.numeric(format(fy_starts, "%m")) == FY_START_MONTH]
+fy_labels <- as.numeric(format(fy_starts, "%Y"))
+
+folds <- list(); fold_id <- 0; n_fy <- length(fy_starts)
+
+for (n_train_fy in MIN_TRAIN_YEARS:(n_fy - 1)) {
+  train_start <- fy_starts[1]
+  train_end   <- as.Date(paste0(fy_labels[n_train_fy] + 1, "-03-01"))
+  test_fy_idx <- n_train_fy + 1
+  if (test_fy_idx > n_fy) break
+  test_start  <- fy_starts[test_fy_idx]
+  test_end    <- as.Date(paste0(fy_labels[test_fy_idx] + 1, "-03-01"))
+  cap <- min(max(all_dates), data_max)
+  if (test_start > cap) break
+  if (test_end > cap) test_end <- cap
+  if (test_start < data_min) next
+  train_idx <- which(all_dates >= train_start & all_dates <= train_end)
+  test_idx  <- which(all_dates >= test_start  & all_dates <= test_end)
+  if (!all(all_dates[test_idx] %in% data_raw[[DATA_DATE_COL]])) next
+  fold_id <- fold_id + 1
+  folds[[fold_id]] <- list(
+    fold = fold_id, train_idx = train_idx, test_idx = test_idx,
+    train_start = train_start, train_end = train_end,
+    test_start = test_start, test_end = test_end,
+    test_fy = fy_labels[test_fy_idx],
+    partial = (test_end < as.Date(paste0(fy_labels[test_fy_idx] + 1, "-03-01")))
+  )
+}
+n_folds <- length(folds)
+
+cat("Folds:", n_folds, "\n")
+for (f in folds) {
+  tag <- if (f$partial) " ** PARTIAL **" else ""
+  cat(sprintf("  Fold %d: train %s–%s (%dmo) → FY%d %s–%s (%dmo)%s\n",
+              f$fold, format(f$train_start), format(f$train_end), length(f$train_idx),
+              f$test_fy, format(f$test_start), format(f$test_end), length(f$test_idx), tag))
+}
+cat("\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. LAG COMBOS + SCENARIOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+all_combos <- list(); combo_labels <- character()
+all_combos[[1]] <- integer(0); combo_labels[1] <- "null"
+for (k in 1:MAX_N_LAGS) {
+  ck <- combn(1:MAX_LAG, k, simplify = FALSE)
+  all_combos <- c(all_combos, ck)
+  combo_labels <- c(combo_labels, sapply(ck, function(x) paste(x, collapse = ",")))
+}
+n_combos <- length(all_combos)
+
+annual_rates <- seq(SCENARIO_MIN, SCENARIO_MAX, by = SCENARIO_STEP) / 100
+n_scenarios  <- length(annual_rates)
+
+cat("Combos:", n_combos, "(incl. null) | Scenarios:", n_scenarios, "\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+build_xreg <- function(pv, lags) {
+  n <- length(pv)
+  X <- matrix(NA, nrow = n, ncol = length(lags))
+  colnames(X) <- paste0("lag", lags)
+  for (k in seq_along(lags)) {
+    L <- lags[k]; X[, k] <- c(rep(NA, L), pv[1:(n - L)])
+  }
+  return(X)
+}
+
+inv_logit <- function(x) 1 / (1 + exp(-x))
+
+# Align values to pop dates
+total_vals  <- data_raw[[TOTAL_COL]][match(all_dates, data_raw[[DATA_DATE_COL]])]
+apple_vals  <- data_raw[[APPLE_COL]][match(all_dates, data_raw[[DATA_DATE_COL]])]
+banana_vals <- data_raw[[BANANA_COL]][match(all_dates, data_raw[[DATA_DATE_COL]])]
+logit_vals  <- data_raw$logit_share[match(all_dates, data_raw[[DATA_DATE_COL]])]
+share_vals  <- data_raw$apple_share[match(all_dates, data_raw[[DATA_DATE_COL]])]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. MAIN LOOP
+#    For each fold × combo: fit total + logit(share), forecast per scenario
+# ══════════════════════════════════════════════════════════════════════════════
+
+monthly_results <- vector("list", n_folds)
+
+model_count <- 0; fail_count <- 0
+t_start <- Sys.time()
+
+for (f_idx in seq_len(n_folds)) {
+
+  fold    <- folds[[f_idx]]
+  h       <- length(fold$test_idx)
+  n_train <- length(fold$train_idx)
+
+  pop_train   <- pop_m_df$pop[fold$train_idx]
+  train_dates <- all_dates[fold$train_idx]
+  ts_start    <- c(as.numeric(format(train_dates[1], "%Y")),
+                   as.numeric(format(train_dates[1], "%m")))
+
+  y_total_ts <- ts(total_vals[fold$train_idx], frequency = 12, start = ts_start)
+  y_logit_ts <- ts(logit_vals[fold$train_idx], frequency = 12, start = ts_start)
+
+  actual_apple  <- apple_vals[fold$test_idx]
+  actual_banana <- banana_vals[fold$test_idx]
+  actual_total  <- total_vals[fold$test_idx]
+  actual_share  <- share_vals[fold$test_idx]
+
+  test_dates  <- all_dates[fold$test_idx]
+  test_months <- as.numeric(format(test_dates, "%m"))
+  test_years  <- as.numeric(format(test_dates, "%Y"))
+  test_fy     <- fold$test_fy
+
+  pop_test_true   <- pop_m_df$pop[fold$test_idx]
+  true_growth_pct <- round(((pop_test_true[h] / pop_test_true[1])^(12/(h-1)) - 1) * 100, 2)
+  last_train_pop  <- pop_train[n_train]
+
+  # Scenario pop paths
+  pop_scen_fold <- matrix(NA, nrow = h, ncol = n_scenarios)
+  for (s in seq_len(n_scenarios)) {
+    mr <- (1 + annual_rates[s])^(1/12) - 1
+    pop_scen_fold[, s] <- last_train_pop * (1 + mr)^(1:h)
+  }
+
+  cat(sprintf("\n── Fold %d / %d  FY%d  (true growth: %.2f%%) ──\n",
+              f_idx, n_folds, test_fy, true_growth_pct))
+
+  fold_fit <- 0; fold_fail <- 0; fold_start <- Sys.time()
+  fold_rows <- vector("list", n_combos * n_scenarios)
+  row_idx   <- 0
+
+  for (i in seq_len(n_combos)) {
+
+    lags_i  <- all_combos[[i]]
+    is_null <- (length(lags_i) == 0)
+
+    if (is_null) {
+      # ── Null: pure ARIMA on total + logit(share) ──
+      fit_total <- tryCatch(
+        auto.arima(y_total_ts, seasonal = FALSE,
+                   max.p=MAX_AR, max.q=MAX_MA, max.d=MAX_DIFF,
+                   stepwise=TRUE, approximation=TRUE, trace=FALSE),
+        error = function(e) NULL)
+      fit_logit <- tryCatch(
+        auto.arima(y_logit_ts, seasonal = FALSE,
+                   max.p=MAX_AR, max.q=MAX_MA, max.d=MAX_DIFF,
+                   stepwise=TRUE, approximation=TRUE, trace=FALSE),
+        error = function(e) NULL)
+
+      if (is.null(fit_total) || is.null(fit_logit)) {
+        fail_count <- fail_count+1; fold_fail <- fold_fail+1; next
+      }
+
+      fc_total <- tryCatch(forecast(fit_total, h=h), error=function(e) NULL)
+      fc_logit <- tryCatch(forecast(fit_logit, h=h), error=function(e) NULL)
+
+      if (is.null(fc_total) || is.null(fc_logit)) {
+        fail_count <- fail_count+1; fold_fail <- fold_fail+1; next
+      }
+
+      fc_total_v <- as.numeric(fc_total$mean)
+      fc_share_v <- inv_logit(as.numeric(fc_logit$mean))
+      fc_apple_v <- fc_total_v * fc_share_v
+      fc_banana_v <- fc_total_v * (1 - fc_share_v)
+
+      # Same forecast for all scenarios (null ignores pop)
+      for (s in seq_len(n_scenarios)) {
+        scen_pct <- round(annual_rates[s] * 100, 2)
+        row_idx <- row_idx + 1
+        fold_rows[[row_idx]] <- data.frame(
+          fold = f_idx, fiscal_year = test_fy,
+          month = test_months, cal_year = test_years,
+          model = "null",
+          actual_total = round(actual_total, 2),
+          forecast_total = round(fc_total_v, 2),
+          actual_apple = round(actual_apple, 2),
+          forecast_apple = round(fc_apple_v, 2),
+          actual_banana = round(actual_banana, 2),
+          forecast_banana = round(fc_banana_v, 2),
+          actual_share = round(actual_share, 4),
+          forecast_share = round(fc_share_v, 4),
+          mape_total = round(abs(actual_total - fc_total_v) / abs(actual_total) * 100, 3),
+          mape_apple = round(abs(actual_apple - fc_apple_v) / abs(actual_apple) * 100, 3),
+          mape_banana = round(abs(actual_banana - fc_banana_v) / abs(actual_banana) * 100, 3),
+          scenario = scen_pct, true_scenario = true_growth_pct,
+          scenario_diff = round(true_growth_pct - scen_pct, 2),
+          stringsAsFactors = FALSE
+        )
+      }
+
+    } else {
+      # ── ARIMAX: total + logit(share) with lagged pop ──
+      max_lag_i <- max(lags_i)
+      X_train_full <- build_xreg(pop_train, lags_i)
+      first_valid  <- max_lag_i + 1
+
+      if (first_valid >= n_train) {
+        fail_count <- fail_count+1; fold_fail <- fold_fail+1; next
+      }
+
+      X_train <- X_train_full[first_valid:n_train, , drop = FALSE]
+
+      sy <- as.numeric(format(train_dates[first_valid], "%Y"))
+      sm <- as.numeric(format(train_dates[first_valid], "%m"))
+
+      y_total_trim <- ts(y_total_ts[first_valid:length(y_total_ts)],
+                         frequency = 12, start = c(sy, sm))
+      y_logit_trim <- ts(y_logit_ts[first_valid:length(y_logit_ts)],
+                         frequency = 12, start = c(sy, sm))
+
+      fit_total <- tryCatch(
+        auto.arima(y_total_trim, xreg = X_train, seasonal = FALSE,
+                   max.p=MAX_AR, max.q=MAX_MA, max.d=MAX_DIFF,
+                   stepwise=TRUE, approximation=TRUE, trace=FALSE),
+        error = function(e) NULL)
+      fit_logit <- tryCatch(
+        auto.arima(y_logit_trim, xreg = X_train, seasonal = FALSE,
+                   max.p=MAX_AR, max.q=MAX_MA, max.d=MAX_DIFF,
+                   stepwise=TRUE, approximation=TRUE, trace=FALSE),
+        error = function(e) NULL)
+
+      if (is.null(fit_total) || is.null(fit_logit)) {
+        fail_count <- fail_count+1; fold_fail <- fold_fail+1; next
+      }
+
+      for (s in seq_len(n_scenarios)) {
+        pop_ext  <- c(pop_train, pop_scen_fold[, s])
+        X_ext    <- build_xreg(pop_ext, lags_i)
+        X_future <- X_ext[(n_train + 1):(n_train + h), , drop = FALSE]
+        if (any(is.na(X_future))) next
+
+        fc_t <- tryCatch(forecast(fit_total, xreg=X_future, h=h), error=function(e) NULL)
+        fc_l <- tryCatch(forecast(fit_logit, xreg=X_future, h=h), error=function(e) NULL)
+        if (is.null(fc_t) || is.null(fc_l)) next
+
+        fc_total_v  <- as.numeric(fc_t$mean)
+        fc_share_v  <- inv_logit(as.numeric(fc_l$mean))
+        fc_apple_v  <- fc_total_v * fc_share_v
+        fc_banana_v <- fc_total_v * (1 - fc_share_v)
+
+        scen_pct <- round(annual_rates[s] * 100, 2)
+
+        row_idx <- row_idx + 1
+        fold_rows[[row_idx]] <- data.frame(
+          fold = f_idx, fiscal_year = test_fy,
+          month = test_months, cal_year = test_years,
+          model = combo_labels[i],
+          actual_total = round(actual_total, 2),
+          forecast_total = round(fc_total_v, 2),
+          actual_apple = round(actual_apple, 2),
+          forecast_apple = round(fc_apple_v, 2),
+          actual_banana = round(actual_banana, 2),
+          forecast_banana = round(fc_banana_v, 2),
+          actual_share = round(actual_share, 4),
+          forecast_share = round(fc_share_v, 4),
+          mape_total = round(abs(actual_total - fc_total_v) / abs(actual_total) * 100, 3),
+          mape_apple = round(abs(actual_apple - fc_apple_v) / abs(actual_apple) * 100, 3),
+          mape_banana = round(abs(actual_banana - fc_banana_v) / abs(actual_banana) * 100, 3),
+          scenario = scen_pct, true_scenario = true_growth_pct,
+          scenario_diff = round(true_growth_pct - scen_pct, 2),
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+
+    model_count <- model_count + 1; fold_fit <- fold_fit + 1
+    fold_elapsed <- as.numeric(difftime(Sys.time(), fold_start, units = "mins"))
+    rate <- fold_fit / max(fold_elapsed, 0.001)
+    remaining <- (n_combos - fold_fit - fold_fail) / max(rate, 0.001)
+    cat(sprintf("   [%4d / %d]  %.0f%%  |  %.1f min  |  ~%.1f min left  |  %s\n",
+                fold_fit, n_combos, fold_fit/n_combos*100,
+                fold_elapsed, remaining, combo_labels[i]))
+  }
+
+  fold_elapsed <- as.numeric(difftime(Sys.time(), fold_start, units = "mins"))
+  cat(sprintf("   Fold %d done: %d fitted, %d failed, %.1f min\n",
+              f_idx, fold_fit, fold_fail, fold_elapsed))
+
+  monthly_results[[f_idx]] <- do.call(rbind, fold_rows[1:row_idx])
+}
+
+elapsed_total <- as.numeric(difftime(Sys.time(), t_start, units = "mins"))
+cat(sprintf("\nAll done. %d fits (%d failures) across %d folds in %.1f min.\n\n",
+            model_count, fail_count, n_folds, elapsed_total))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. BUILD TABLES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Table 1: Monthly detail ──────────────────────────────────────────────────
+table1 <- do.call(rbind, monthly_results)
+rownames(table1) <- NULL
+
+cat("TABLE 1 (monthly):", nrow(table1), "rows\n")
+# write.csv(table1, "table1_monthly.csv", row.names = FALSE)
+
+cat("\n  Sample (first 10):\n")
+print(head(table1, 10), row.names = FALSE)
+
+# ── Table 2: Yearly detail ───────────────────────────────────────────────────
+table2 <- aggregate(
+  cbind(actual_total, forecast_total, actual_apple, forecast_apple,
+        actual_banana, forecast_banana) ~
+    fold + fiscal_year + model + scenario + true_scenario + scenario_diff,
+  data = table1, FUN = sum
+)
+
+table2$yearly_mape_total  <- round(abs(table2$actual_total - table2$forecast_total) /
+                                     abs(table2$actual_total) * 100, 3)
+table2$yearly_mape_apple  <- round(abs(table2$actual_apple - table2$forecast_apple) /
+                                     abs(table2$actual_apple) * 100, 3)
+table2$yearly_mape_banana <- round(abs(table2$actual_banana - table2$forecast_banana) /
+                                     abs(table2$actual_banana) * 100, 3)
+
+table2 <- table2[order(table2$yearly_mape_total), ]
+rownames(table2) <- NULL
+
+cat("\nTABLE 2 (yearly):", nrow(table2), "rows\n")
+# write.csv(table2, "table2_yearly.csv", row.names = FALSE)
+
+cat("\n  Sample (first 10):\n")
+print(head(table2, 10), row.names = FALSE)
+
+# ── Table 3: Model ranking within ±TOLERANCE_PP ─────────────────────────────
+in_band <- table2[abs(table2$scenario_diff) <= TOLERANCE_PP, ]
+
+if (nrow(in_band) > 0) {
+
+  # Yearly MAPE
+  yearly_rank <- aggregate(
+    cbind(yearly_mape_total, yearly_mape_apple, yearly_mape_banana) ~ model,
+    data = in_band, FUN = mean, na.rm = TRUE
+  )
+  yearly_rank$yearly_mape_total  <- round(yearly_rank$yearly_mape_total, 3)
+  yearly_rank$yearly_mape_apple  <- round(yearly_rank$yearly_mape_apple, 3)
+  yearly_rank$yearly_mape_banana <- round(yearly_rank$yearly_mape_banana, 3)
+
+  # Monthly MAPE
+  t1_band <- table1[abs(table1$scenario_diff) <= TOLERANCE_PP, ]
+  monthly_rank <- aggregate(
+    cbind(mape_total, mape_apple, mape_banana) ~ model,
+    data = t1_band, FUN = mean, na.rm = TRUE
+  )
+  names(monthly_rank) <- c("model", "monthly_mape_total", "monthly_mape_apple", "monthly_mape_banana")
+  monthly_rank$monthly_mape_total  <- round(monthly_rank$monthly_mape_total, 3)
+  monthly_rank$monthly_mape_apple  <- round(monthly_rank$monthly_mape_apple, 3)
+  monthly_rank$monthly_mape_banana <- round(monthly_rank$monthly_mape_banana, 3)
+
+  table3 <- merge(yearly_rank, monthly_rank, by = "model")
+  table3 <- table3[order(table3$yearly_mape_total), ]
+  rownames(table3) <- NULL
+
+  cat(sprintf("\nTABLE 3: Model Ranking within +/- %.1f pp (%d models)\n", TOLERANCE_PP, nrow(table3)))
+  print(table3, row.names = FALSE)
+  # write.csv(table3, "table3_ranking.csv", row.names = FALSE)
+
+  # Summary
+  cat("\n========== SUMMARY ==========\n")
+
+  best <- table3[1, ]
+  cat(sprintf("\n>>> Best model: %s\n", best$model))
+  cat(sprintf("    Yearly  — total: %.3f%%  apple: %.3f%%  banana: %.3f%%\n",
+              best$yearly_mape_total, best$yearly_mape_apple, best$yearly_mape_banana))
+  cat(sprintf("    Monthly — total: %.3f%%  apple: %.3f%%  banana: %.3f%%\n",
+              best$monthly_mape_total, best$monthly_mape_apple, best$monthly_mape_banana))
+
+  null_row <- table3[table3$model == "null", ]
+  if (nrow(null_row) > 0) {
+    null_rank <- which(table3$model == "null")
+    cat(sprintf("\n    Null model: #%d / %d\n", null_rank, nrow(table3)))
+    cat(sprintf("    Yearly  — total: %.3f%%  apple: %.3f%%  banana: %.3f%%\n",
+                null_row$yearly_mape_total, null_row$yearly_mape_apple, null_row$yearly_mape_banana))
+    if (null_rank == 1) {
+      cat("    *** Population lags do NOT improve over pure ARIMA ***\n")
+    } else {
+      improv <- round((null_row$yearly_mape_total - best$yearly_mape_total) /
+                        null_row$yearly_mape_total * 100, 1)
+      cat(sprintf("    Best model improves total yearly MAPE by %.1f%% vs null\n", improv))
+    }
+  }
+
+} else {
+  cat(sprintf("\nNo scenarios within +/- %.1f pp.\n", TOLERANCE_PP))
+}
+
+cat("\nScript complete.\n")
