@@ -1,23 +1,22 @@
 ################################################################################
 # Bayesian Monotonic Forecasting — Fruit Sales (Total + Logit Apple Share)
+# *** rstan version (no brms / no QuickJSR dependency) ***
 #
-# Strategy (from the Bayesian monotonic model):
-#   Place truncated-normal priors (lb = 0) on population-lag coefficients
-#   so that every posterior draw has non-negative effects of population
-#   on the outcome. This guarantees monotonicity: higher population growth
-#   scenario => higher forecast, for the ENTIRE posterior predictive
-#   distribution — not just point estimates.
+# Strategy:
+#   Place truncated-normal priors (lower = 0) on population-lag coefficients
+#   so every posterior draw has non-negative effects. Higher population growth
+#   scenario => higher forecast for the ENTIRE posterior — not just point est.
 #
-# Structure (from the ARIMAX rolling-CV script):
-#   Model 1: brms on total_sales ~ lagged population (lags 3, 6, 12)
-#   Model 2: brms on logit(apple_share) ~ lagged population (lags 3, 6, 12)
+# Structure:
+#   Model 1: Stan on total_sales ~ lagged population (lags 3, 6, 12) + AR(1)
+#   Model 2: Stan on logit(apple_share) ~ lagged population + AR(1)
 #   Then:
 #     apple_forecast  = total_forecast × inv_logit(share_forecast)
 #     banana_forecast = total_forecast × (1 − inv_logit(share_forecast))
 #   Coherence guaranteed: apple + banana = total by construction.
 #
 # CV: expanding-window fiscal-year folds (Apr 1 – Mar 31)
-# Includes null model (no xreg — intercept + AR(1) only)
+# Includes null model (intercept + AR(1) only)
 #
 # Output:
 #   Table 1 — Monthly detail
@@ -25,12 +24,15 @@
 #   Table 3 — Model ranking within ±TOLERANCE_PP
 #   Monotonicity check across population scenarios
 #
-# Dependencies: brms, tidyverse, zoo
+# Dependencies: rstan, tidyverse, zoo   (NO brms, NO QuickJSR)
 ################################################################################
 
-library(brms)
+library(rstan)
 library(tidyverse)
 library(zoo)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
 
 set.seed(42)
 
@@ -72,33 +74,142 @@ SCENARIO_STEP   <-  0.1
 # --- Evaluation --------------------------------------------------------------
 TOLERANCE_PP    <- 1.0
 
-# --- brms fitting ------------------------------------------------------------
-BRMS_ITER       <- 4000
-BRMS_WARMUP     <- 1000
-BRMS_CHAINS     <- 4
-BRMS_CORES      <- 4
-BRMS_ADAPT      <- 0.95
-BRMS_SEED       <- 123
+# --- Stan sampling -----------------------------------------------------------
+STAN_ITER       <- 4000
+STAN_WARMUP     <- 1000
+STAN_CHAINS     <- 4
+STAN_ADAPT      <- 0.95
+STAN_SEED       <- 123
 
 # --- Priors ------------------------------------------------------------------
-# Slopes on lagged population: truncated normal (lb = 0) => monotonicity
 SLOPE_PRIOR_MU  <- 0
 SLOPE_PRIOR_SD  <- 5
-# Intercept: weakly informative
 INTCPT_PRIOR_SD <- 100
-# AR(1) coefficient
 AR_PRIOR_SD     <- 0.5
 
 cat("=== Configuration ===\n")
-cat("  Approach:    Bayesian (brms) total + logit(apple_share) → derive components\n")
-cat("  Monotonicity: truncated-normal priors (lb = 0) on population-lag slopes\n")
-cat("  Lags:        ", paste(LAGS, collapse = ", "), "\n")
-cat("  Fiscal year: Apr 1 – Mar 31\n")
-cat("  CV:          train", MIN_TRAIN_YEARS, "FY expanding\n")
-cat("  Scenarios:   ", SCENARIO_MIN, "% to", SCENARIO_MAX, "% by", SCENARIO_STEP, "pp\n")
-cat("  Tolerance:   ±", TOLERANCE_PP, "pp\n")
-cat("  brms:        ", BRMS_ITER, "iter,", BRMS_WARMUP, "warmup,",
-    BRMS_CHAINS, "chains\n\n")
+cat("  Approach:     Bayesian (rstan) total + logit(apple_share) → derive components\n")
+cat("  Monotonicity: truncated-normal priors (lower = 0) on population-lag slopes\n")
+cat("  Lags:         ", paste(LAGS, collapse = ", "), "\n")
+cat("  Fiscal year:  Apr 1 – Mar 31\n")
+cat("  CV:           train", MIN_TRAIN_YEARS, "FY expanding\n")
+cat("  Scenarios:    ", SCENARIO_MIN, "% to", SCENARIO_MAX, "% by", SCENARIO_STEP, "pp\n")
+cat("  Tolerance:    ±", TOLERANCE_PP, "pp\n")
+cat("  Stan:         ", STAN_ITER, "iter,", STAN_WARMUP, "warmup,",
+    STAN_CHAINS, "chains\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAN MODELS (compiled once, reused across folds)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# --------------------------------------------------------------------------- #
+# Lag model: y = b0 + b[1..K]*X + AR(1) errors
+#   b[k] ~ normal(mu, sd) truncated below at 0   (monotonicity)
+#   phi  ~ normal(0, ar_sd)                       (stationarity)
+# --------------------------------------------------------------------------- #
+stan_lag_code <- "
+data {
+  int<lower=1> N;           // training obs
+  int<lower=1> K;           // number of lag regressors
+  int<lower=1> H;           // forecast horizon
+  matrix[N, K] X;           // training regressors
+  vector[N] y;              // training response
+  matrix[H, K] X_new;      // future regressors
+
+  // prior hyperparameters
+  real slope_mu;
+  real<lower=0> slope_sd;
+  real<lower=0> intcpt_sd;
+  real<lower=0> ar_sd;
+}
+
+parameters {
+  real b0;                          // intercept
+  vector<lower=0>[K] b;            // slopes, constrained >= 0
+  real<lower=-1, upper=1> phi;     // AR(1) coefficient
+  real<lower=0> sigma;             // residual SD
+}
+
+model {
+  // priors
+  b0    ~ normal(0, intcpt_sd);
+  b     ~ normal(slope_mu, slope_sd);   // truncation handled by <lower=0>
+  phi   ~ normal(0, ar_sd);
+  sigma ~ student_t(3, 0, 10);
+
+  // likelihood with AR(1) errors
+  {
+    vector[N] mu = b0 + X * b;
+    y[1] ~ normal(mu[1], sigma);
+    for (t in 2:N)
+      y[t] ~ normal(mu[t] + phi * (y[t-1] - mu[t-1]), sigma);
+  }
+}
+
+generated quantities {
+  vector[H] y_pred;       // posterior predictive mean trajectory
+  {
+    vector[N] mu_train = b0 + X * b;
+    vector[H] mu_new   = b0 + X_new * b;
+    real last_resid = y[N] - mu_train[N];
+
+    for (t in 1:H) {
+      if (t == 1)
+        y_pred[t] = mu_new[t] + phi * last_resid + normal_rng(0, sigma);
+      else
+        y_pred[t] = mu_new[t] + phi * (y_pred[t-1] - mu_new[t-1]) + normal_rng(0, sigma);
+    }
+  }
+}
+"
+
+# --------------------------------------------------------------------------- #
+# Null model: y = b0 + AR(1) errors  (no regressors)
+# --------------------------------------------------------------------------- #
+stan_null_code <- "
+data {
+  int<lower=1> N;
+  int<lower=1> H;
+  vector[N] y;
+
+  real<lower=0> intcpt_sd;
+  real<lower=0> ar_sd;
+}
+
+parameters {
+  real b0;
+  real<lower=-1, upper=1> phi;
+  real<lower=0> sigma;
+}
+
+model {
+  b0    ~ normal(0, intcpt_sd);
+  phi   ~ normal(0, ar_sd);
+  sigma ~ student_t(3, 0, 10);
+
+  y[1] ~ normal(b0, sigma);
+  for (t in 2:N)
+    y[t] ~ normal(b0 + phi * (y[t-1] - b0), sigma);
+}
+
+generated quantities {
+  vector[H] y_pred;
+  {
+    real last_resid = y[N] - b0;
+    for (t in 1:H) {
+      if (t == 1)
+        y_pred[t] = b0 + phi * last_resid + normal_rng(0, sigma);
+      else
+        y_pred[t] = b0 + phi * (y_pred[t-1] - b0) + normal_rng(0, sigma);
+    }
+  }
+}
+"
+
+cat("Compiling Stan models...\n")
+sm_lag  <- stan_model(model_code = stan_lag_code)
+sm_null <- stan_model(model_code = stan_null_code)
+cat("Compilation done.\n\n")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 0. SIMULATE DATA (remove when using real files)
@@ -229,18 +340,31 @@ cat("Scenarios:", n_scenarios, "\n\n")
 # 4. HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-build_xreg_df <- function(pop_vec, lags, time_vec) {
-  # Build a data frame with lagged population columns
+build_xreg_mat <- function(pop_vec, lags) {
+  # Returns a matrix with lagged population columns
   n <- length(pop_vec)
-  df <- data.frame(time = time_vec)
-  for (L in lags) {
-    col_name <- paste0("pop_lag", L)
-    df[[col_name]] <- c(rep(NA, L), pop_vec[1:(n - L)])
+  X <- matrix(NA_real_, nrow = n, ncol = length(lags))
+  colnames(X) <- paste0("pop_lag", lags)
+  for (k in seq_along(lags)) {
+    L <- lags[k]
+    X[, k] <- c(rep(NA_real_, L), pop_vec[1:(n - L)])
   }
-  return(df)
+  return(X)
 }
 
 inv_logit <- function(x) 1 / (1 + exp(-x))
+
+# Helper to extract posterior draws of y_pred from stanfit
+# Returns matrix: (n_draws x H)
+extract_ypred <- function(stanfit) {
+  draws <- rstan::extract(stanfit, pars = "y_pred")$y_pred
+  return(draws)  # matrix: n_draws x H
+}
+
+# Helper to extract slope draws from lag model
+extract_slopes <- function(stanfit, K) {
+  rstan::extract(stanfit, pars = "b")$b  # matrix: n_draws x K
+}
 
 # Align values to pop dates
 total_vals  <- data_raw[[TOTAL_COL]][match(all_dates, data_raw[[DATA_DATE_COL]])]
@@ -250,45 +374,7 @@ logit_vals  <- data_raw$logit_share[match(all_dates, data_raw[[DATA_DATE_COL]])]
 share_vals  <- data_raw$apple_share[match(all_dates, data_raw[[DATA_DATE_COL]])]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. BUILD brms PRIORS
-#    Key: lb = 0 on all "b" class slopes => non-negative population effects
-#    This guarantees monotonicity across every posterior draw.
-# ══════════════════════════════════════════════════════════════════════════════
-
-priors_total <- c(
-  prior_string(paste0("normal(", SLOPE_PRIOR_MU, ",", SLOPE_PRIOR_SD, ")"),
-               class = "b", lb = 0),
-  prior_string(paste0("normal(0,", INTCPT_PRIOR_SD, ")"),
-               class = "Intercept"),
-  prior(student_t(3, 0, 10), class = "sigma"),
-  prior_string(paste0("normal(0,", AR_PRIOR_SD, ")"),
-               class = "ar")
-)
-
-priors_logit <- c(
-  # For logit(share), population effect could be positive or negative in
-  # principle, but we keep lb = 0 so that higher pop => higher apple share.
-  # If you want to allow negative effects on share, remove lb = 0 here.
-  prior_string(paste0("normal(", SLOPE_PRIOR_MU, ",", SLOPE_PRIOR_SD, ")"),
-               class = "b", lb = 0),
-  prior_string(paste0("normal(0,", INTCPT_PRIOR_SD, ")"),
-               class = "Intercept"),
-  prior(student_t(3, 0, 10), class = "sigma"),
-  prior_string(paste0("normal(0,", AR_PRIOR_SD, ")"),
-               class = "ar")
-)
-
-# Null model priors (no slopes)
-priors_null <- c(
-  prior_string(paste0("normal(0,", INTCPT_PRIOR_SD, ")"),
-               class = "Intercept"),
-  prior(student_t(3, 0, 10), class = "sigma"),
-  prior_string(paste0("normal(0,", AR_PRIOR_SD, ")"),
-               class = "ar")
-)
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 6. MAIN LOOP
+# 5. MAIN LOOP
 #    For each fold: fit null + lag model for total & logit(share),
 #    forecast under each scenario, check monotonicity
 # ══════════════════════════════════════════════════════════════════════════════
@@ -334,62 +420,55 @@ for (f_idx in seq_len(n_folds)) {
   fold_rows <- list()
   row_idx   <- 0
 
-  # ── 6a. NULL MODEL (intercept + AR(1) only) ───────────────────────────────
+  # ── 5a. NULL MODEL (intercept + AR(1) only) ───────────────────────────────
 
   cat("  Fitting null models (total + logit_share)...\n")
 
-  # Build training data for null (just need y and time index)
-  null_train_total <- data.frame(
-    time = 1:n_train,
-    y    = total_vals[fold$train_idx]
+  y_total_train <- total_vals[fold$train_idx]
+  y_logit_train <- logit_vals[fold$train_idx]
+
+  # We need to run null for each scenario to get the same y_pred draws,
+  # but null doesn't depend on scenario. Fit once, reuse draws.
+  null_data_total <- list(
+    N = n_train, H = h,
+    y = y_total_train,
+    intcpt_sd = INTCPT_PRIOR_SD,
+    ar_sd     = AR_PRIOR_SD
   )
-  null_train_logit <- data.frame(
-    time = 1:n_train,
-    y    = logit_vals[fold$train_idx]
+  null_data_logit <- list(
+    N = n_train, H = h,
+    y = y_logit_train,
+    intcpt_sd = INTCPT_PRIOR_SD,
+    ar_sd     = AR_PRIOR_SD
   )
 
   fit_null_total <- tryCatch(
-    brm(bf(y ~ 1 + ar(time = time, p = 1)),
-        data    = null_train_total,
-        prior   = priors_null,
-        family  = gaussian(),
-        iter    = BRMS_ITER,
-        warmup  = BRMS_WARMUP,
-        chains  = BRMS_CHAINS,
-        cores   = BRMS_CORES,
-        seed    = BRMS_SEED,
-        control = list(adapt_delta = BRMS_ADAPT),
-        silent  = 2, refresh = 0),
+    sampling(sm_null, data = null_data_total,
+             iter = STAN_ITER, warmup = STAN_WARMUP,
+             chains = STAN_CHAINS, seed = STAN_SEED,
+             control = list(adapt_delta = STAN_ADAPT),
+             show_messages = FALSE, refresh = 0),
     error = function(e) { cat("    null total FAILED:", e$message, "\n"); NULL }
   )
 
   fit_null_logit <- tryCatch(
-    brm(bf(y ~ 1 + ar(time = time, p = 1)),
-        data    = null_train_logit,
-        prior   = priors_null,
-        family  = gaussian(),
-        iter    = BRMS_ITER,
-        warmup  = BRMS_WARMUP,
-        chains  = BRMS_CHAINS,
-        cores   = BRMS_CORES,
-        seed    = BRMS_SEED,
-        control = list(adapt_delta = BRMS_ADAPT),
-        silent  = 2, refresh = 0),
+    sampling(sm_null, data = null_data_logit,
+             iter = STAN_ITER, warmup = STAN_WARMUP,
+             chains = STAN_CHAINS, seed = STAN_SEED,
+             control = list(adapt_delta = STAN_ADAPT),
+             show_messages = FALSE, refresh = 0),
     error = function(e) { cat("    null logit FAILED:", e$message, "\n"); NULL }
   )
 
   if (!is.null(fit_null_total) && !is.null(fit_null_logit)) {
     cat("  Null models fitted. Forecasting...\n")
 
-    null_newdata <- data.frame(time = (n_train + 1):(n_train + h))
+    draws_null_total <- extract_ypred(fit_null_total)   # n_draws x H
+    draws_null_logit <- extract_ypred(fit_null_logit)
 
-    fc_null_total <- fitted(fit_null_total, newdata = null_newdata,
-                            allow_new_levels = TRUE)
-    fc_null_logit <- fitted(fit_null_logit, newdata = null_newdata,
-                            allow_new_levels = TRUE)
-
-    fc_total_v  <- fc_null_total[, "Estimate"]
-    fc_share_v  <- inv_logit(fc_null_logit[, "Estimate"])
+    # Point estimates: posterior mean at each horizon
+    fc_total_v  <- colMeans(draws_null_total)
+    fc_share_v  <- colMeans(inv_logit(draws_null_logit))
     fc_apple_v  <- fc_total_v * fc_share_v
     fc_banana_v <- fc_total_v * (1 - fc_share_v)
 
@@ -421,12 +500,14 @@ for (f_idx in seq_len(n_folds)) {
     cat("  Null done.\n")
   }
 
-  # ── 6b. LAG MODEL (lags 3, 6, 12 with truncated priors) ──────────────────
+  # ── 5b. LAG MODEL (lags 3, 6, 12 with truncated priors) ──────────────────
 
-  cat("  Fitting lag model (", paste(LAGS, collapse = ","), ")...\n")
+  model_label <- paste(LAGS, collapse = ",")
+  cat("  Fitting lag model (", model_label, ")...\n")
 
   max_lag_i   <- max(LAGS)
   first_valid <- max_lag_i + 1
+  K           <- length(LAGS)
 
   if (first_valid >= n_train) {
     cat("  Not enough training data for lags. Skipping.\n")
@@ -434,58 +515,60 @@ for (f_idx in seq_len(n_folds)) {
     next
   }
 
-  # Build training data with lagged pop columns
-  xreg_train_df <- build_xreg_df(pop_train, LAGS, time_vec = 1:n_train)
-  xreg_train_df$y_total <- total_vals[fold$train_idx]
-  xreg_train_df$y_logit <- logit_vals[fold$train_idx]
+  # Build training xreg
+  X_train_full <- build_xreg_mat(pop_train, LAGS)
+  X_train      <- X_train_full[first_valid:n_train, , drop = FALSE]
+  y_total_trim <- y_total_train[first_valid:n_train]
+  y_logit_trim <- y_logit_train[first_valid:n_train]
+  N_trim       <- length(y_total_trim)
 
-  # Trim to valid rows (no NA from lagging)
-  train_df <- xreg_train_df[first_valid:n_train, ]
-  # Reset time index for brms AR term
-  train_df$time <- 1:nrow(train_df)
+  # We need to fit per-scenario because X_new changes.
+  # BUT: the training data is the same across scenarios, so fitting the
+  # model once per scenario is wasteful. Instead, we fit the model once
+  # with a dummy X_new, then generate predictions in R from the posterior
+  # draws of (b0, b, phi, sigma).
+  #
+  # Strategy: fit once (X_new = dummy), extract posterior (b0, b, phi, sigma),
+  # then for each scenario, compute predictions in R from the draws.
 
-  # Build formula dynamically
-  lag_cols <- paste0("pop_lag", LAGS)
-  formula_str <- paste0("y ~ ", paste(lag_cols, collapse = " + "),
-                         " + ar(time = time, p = 1)")
+  # Fit with a placeholder X_new (won't use the generated y_pred from Stan)
+  X_dummy_new <- matrix(0, nrow = h, ncol = K)
 
-  # --- Fit total ---
-  train_total <- train_df %>%
-    rename(y = y_total) %>%
-    select(time, y, all_of(lag_cols))
+  stan_data_total <- list(
+    N = N_trim, K = K, H = h,
+    X = X_train, y = y_total_trim,
+    X_new     = X_dummy_new,
+    slope_mu  = SLOPE_PRIOR_MU,
+    slope_sd  = SLOPE_PRIOR_SD,
+    intcpt_sd = INTCPT_PRIOR_SD,
+    ar_sd     = AR_PRIOR_SD
+  )
+
+  stan_data_logit <- list(
+    N = N_trim, K = K, H = h,
+    X = X_train, y = y_logit_trim,
+    X_new     = X_dummy_new,
+    slope_mu  = SLOPE_PRIOR_MU,
+    slope_sd  = SLOPE_PRIOR_SD,
+    intcpt_sd = INTCPT_PRIOR_SD,
+    ar_sd     = AR_PRIOR_SD
+  )
 
   fit_lag_total <- tryCatch(
-    brm(bf(as.formula(formula_str)),
-        data    = train_total,
-        prior   = priors_total,
-        family  = gaussian(),
-        iter    = BRMS_ITER,
-        warmup  = BRMS_WARMUP,
-        chains  = BRMS_CHAINS,
-        cores   = BRMS_CORES,
-        seed    = BRMS_SEED,
-        control = list(adapt_delta = BRMS_ADAPT),
-        silent  = 2, refresh = 0),
+    sampling(sm_lag, data = stan_data_total,
+             iter = STAN_ITER, warmup = STAN_WARMUP,
+             chains = STAN_CHAINS, seed = STAN_SEED,
+             control = list(adapt_delta = STAN_ADAPT),
+             show_messages = FALSE, refresh = 0),
     error = function(e) { cat("    lag total FAILED:", e$message, "\n"); NULL }
   )
 
-  # --- Fit logit(share) ---
-  train_logit <- train_df %>%
-    rename(y = y_logit) %>%
-    select(time, y, all_of(lag_cols))
-
   fit_lag_logit <- tryCatch(
-    brm(bf(as.formula(formula_str)),
-        data    = train_logit,
-        prior   = priors_logit,
-        family  = gaussian(),
-        iter    = BRMS_ITER,
-        warmup  = BRMS_WARMUP,
-        chains  = BRMS_CHAINS,
-        cores   = BRMS_CORES,
-        seed    = BRMS_SEED,
-        control = list(adapt_delta = BRMS_ADAPT),
-        silent  = 2, refresh = 0),
+    sampling(sm_lag, data = stan_data_logit,
+             iter = STAN_ITER, warmup = STAN_WARMUP,
+             chains = STAN_CHAINS, seed = STAN_SEED,
+             control = list(adapt_delta = STAN_ADAPT),
+             show_messages = FALSE, refresh = 0),
     error = function(e) { cat("    lag logit FAILED:", e$message, "\n"); NULL }
   )
 
@@ -497,29 +580,57 @@ for (f_idx in seq_len(n_folds)) {
 
   cat("  Lag models fitted. Checking posterior non-negativity...\n")
 
-  # Verify all posterior draws of slopes >= 0
-  post_total <- as_draws_df(fit_lag_total)
-  post_logit <- as_draws_df(fit_lag_logit)
+  # Extract posterior parameters
+  post_total <- rstan::extract(fit_lag_total)
+  post_logit <- rstan::extract(fit_lag_logit)
 
-  for (lc in lag_cols) {
-    col_t <- paste0("b_", lc)
-    col_l <- paste0("b_", lc)
-    if (col_t %in% names(post_total)) {
-      cat(sprintf("    Total  %s: min = %.6f, mean = %.4f\n",
-                  lc, min(post_total[[col_t]]), mean(post_total[[col_t]])))
-    }
-    if (col_l %in% names(post_logit)) {
-      cat(sprintf("    Logit  %s: min = %.6f, mean = %.4f\n",
-                  lc, min(post_logit[[col_l]]), mean(post_logit[[col_l]])))
-    }
+  n_draws <- nrow(post_total$b)
+
+  for (k in seq_along(LAGS)) {
+    cat(sprintf("    Total  pop_lag%d: min = %.6f, mean = %.4f\n",
+                LAGS[k], min(post_total$b[, k]), mean(post_total$b[, k])))
+    cat(sprintf("    Logit  pop_lag%d: min = %.6f, mean = %.4f\n",
+                LAGS[k], min(post_logit$b[, k]), mean(post_logit$b[, k])))
   }
-  cat("    (All should be >= 0 by construction of lb = 0 prior)\n")
+  cat("    (All should be >= 0 by construction of lower = 0 constraint)\n")
 
-  # --- Forecast per scenario and collect posterior draws for monotonicity ---
+  # ── Generate forecasts in R from posterior draws ──────────────────────────
+  # For each scenario s and each draw d:
+  #   mu_new[t] = b0[d] + X_new[t,] %*% b[d,]
+  #   y_pred[1] = mu_new[1] + phi[d] * last_resid[d] + rnorm(0, sigma[d])
+  #   y_pred[t] = mu_new[t] + phi[d] * (y_pred[t-1] - mu_new[t-1]) + noise
+
+  # Pre-compute training residuals at last time point for each draw
+  # mu_train_last = b0 + X_train[N_trim,] %*% b
+  mu_train_last_total <- post_total$b0 + as.vector(X_train[N_trim, , drop = FALSE] %*% t(post_total$b))
+  last_resid_total    <- y_total_trim[N_trim] - mu_train_last_total
+
+  mu_train_last_logit <- post_logit$b0 + as.vector(X_train[N_trim, , drop = FALSE] %*% t(post_logit$b))
+  last_resid_logit    <- y_logit_trim[N_trim] - mu_train_last_logit
+
+  # Function to generate posterior predictive draws for a given X_new
+  generate_predictions <- function(post_params, last_resid, X_new_s, h, n_draws) {
+    # post_params: list with b0 (vector), b (matrix n_draws x K), phi (vector), sigma (vector)
+    # Returns matrix n_draws x h
+    mu_new <- matrix(NA_real_, nrow = n_draws, ncol = h)
+    for (t in 1:h) {
+      mu_new[, t] <- post_params$b0 + as.vector(post_params$b %*% X_new_s[t, ])
+    }
+
+    y_pred <- matrix(NA_real_, nrow = n_draws, ncol = h)
+    set.seed(STAN_SEED)  # reproducibility across scenarios
+    noise <- matrix(rnorm(n_draws * h, 0, 1), nrow = n_draws, ncol = h)
+
+    y_pred[, 1] <- mu_new[, 1] + post_params$phi * last_resid +
+                    noise[, 1] * post_params$sigma
+    for (t in 2:h) {
+      y_pred[, t] <- mu_new[, t] + post_params$phi * (y_pred[, t-1] - mu_new[, t-1]) +
+                     noise[, t] * post_params$sigma
+    }
+    return(y_pred)
+  }
+
   cat("  Forecasting across", n_scenarios, "scenarios...\n")
-
-  n_train_trimmed <- nrow(train_df)
-  model_label     <- paste(LAGS, collapse = ",")
 
   # Store posterior predictive draws per scenario for monotonicity check
   scen_draws_total <- list()
@@ -529,33 +640,25 @@ for (f_idx in seq_len(n_folds)) {
     # Extend pop with scenario path
     pop_ext <- c(pop_train, pop_scen_fold[, s])
 
-    # Build xreg for the full series then extract future rows
-    xreg_full <- build_xreg_df(pop_ext, LAGS, time_vec = 1:(n_train + h))
+    # Build xreg for full series, extract future rows
+    X_full   <- build_xreg_mat(pop_ext, LAGS)
+    X_new_s  <- X_full[(n_train + 1):(n_train + h), , drop = FALSE]
 
-    # Future rows
-    future_df <- xreg_full[(n_train + 1):(n_train + h), ]
-    future_df$time <- (n_train_trimmed + 1):(n_train_trimmed + h)
+    if (any(is.na(X_new_s))) next
 
-    if (any(is.na(future_df[lag_cols]))) next
-
-    # Get point estimates
-    fc_t <- fitted(fit_lag_total, newdata = future_df, allow_new_levels = TRUE)
-    fc_l <- fitted(fit_lag_logit, newdata = future_df, allow_new_levels = TRUE)
-
-    fc_total_v  <- fc_t[, "Estimate"]
-    fc_share_v  <- inv_logit(fc_l[, "Estimate"])
-    fc_apple_v  <- fc_total_v * fc_share_v
-    fc_banana_v <- fc_total_v * (1 - fc_share_v)
+    # Generate draws
+    draws_total <- generate_predictions(post_total, last_resid_total, X_new_s, h, n_draws)
+    draws_logit <- generate_predictions(post_logit, last_resid_logit, X_new_s, h, n_draws)
 
     scen_pct <- round(annual_rates[s] * 100, 2)
+    scen_draws_total[[as.character(scen_pct)]] <- draws_total
+    scen_draws_logit[[as.character(scen_pct)]] <- draws_logit
 
-    # Also get posterior draws for monotonicity check
-    draws_t <- posterior_epred(fit_lag_total, newdata = future_df,
-                               allow_new_levels = TRUE)
-    draws_l <- posterior_epred(fit_lag_logit, newdata = future_df,
-                               allow_new_levels = TRUE)
-    scen_draws_total[[as.character(scen_pct)]] <- draws_t
-    scen_draws_logit[[as.character(scen_pct)]] <- draws_l
+    # Point estimates: posterior mean
+    fc_total_v  <- colMeans(draws_total)
+    fc_share_v  <- colMeans(inv_logit(draws_logit))
+    fc_apple_v  <- fc_total_v * fc_share_v
+    fc_banana_v <- fc_total_v * (1 - fc_share_v)
 
     row_idx <- row_idx + 1
     fold_rows[[row_idx]] <- data.frame(
@@ -585,14 +688,13 @@ for (f_idx in seq_len(n_folds)) {
     }
   }
 
-  # ── 6c. MONOTONICITY CHECK (draw-by-draw) ────────────────────────────────
+  # ── 5c. MONOTONICITY CHECK (draw-by-draw) ────────────────────────────────
 
   cat("\n  === Monotonicity Check (draw-by-draw) for Fold", f_idx, "===\n")
 
-  sorted_scens <- sort(as.numeric(names(scen_draws_total)))
   all_mono <- TRUE
 
-  # Check a representative subset of adjacent scenarios (every 1pp)
+  # Check adjacent 1pp steps
   check_scens <- seq(SCENARIO_MIN, SCENARIO_MAX, by = 1)
   check_labels <- as.character(check_scens)
 
@@ -622,7 +724,8 @@ for (f_idx in seq_len(n_folds)) {
   if (all_mono) {
     cat("    PASS: Perfect monotonicity across all posterior draws.\n")
   } else {
-    cat("    NOTE: Minor violations may occur from AR uncertainty, but should be <1%.\n")
+    cat("    NOTE: Minor violations may occur from AR noise in generated quantities,\n")
+    cat("          but the EXPECTED value (mu) is guaranteed monotone by the prior.\n")
   }
 
   mono_results[[f_idx]] <- list(fold = f_idx, all_mono = all_mono)
@@ -637,7 +740,7 @@ elapsed_total <- as.numeric(difftime(Sys.time(), t_start, units = "mins"))
 cat(sprintf("\nAll done. %d folds in %.1f min.\n\n", n_folds, elapsed_total))
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. BUILD TABLES
+# 6. BUILD TABLES
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Table 1: Monthly detail ──────────────────────────────────────────────────
@@ -738,9 +841,10 @@ if (nrow(in_band) > 0) {
                   if (mr$all_mono) "PASS (perfect)" else "Minor violations (see above)"))
     }
   }
-  cat("\n  Key insight: The truncated prior (lb = 0) in brms ensures that EVERY\n")
-  cat("  posterior draw has non-negative population effects, so credible intervals\n")
-  cat("  are monotonically ordered across growth scenarios — not just point forecasts.\n")
+  cat("\n  Key insight: The <lower=0> constraint on slope parameters in Stan ensures\n")
+  cat("  that EVERY posterior draw has non-negative population effects, so the\n")
+  cat("  expected forecast (mu) is guaranteed monotone across growth scenarios.\n")
+  cat("  Minor violations in y_pred come only from the random AR noise term.\n")
 
 } else {
   cat(sprintf("\nNo scenarios within +/- %.1f pp.\n", TOLERANCE_PP))
