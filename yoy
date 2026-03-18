@@ -1,0 +1,306 @@
+library(dplyr)
+library(forecast)
+
+# =============================================================================
+# DATA SETUP
+# =============================================================================
+
+set.seed(42)
+dates <- seq.Date(from = as.Date("2020-04-01"), by = "month", length.out = 67)
+population <- cumsum(rnorm(67, mean = 0.5, sd = 1)) + 100
+apple_sales <- 500 + 2 * population + rnorm(67, sd = 10)
+
+mydf <- data.frame(
+  date = dates,
+  apple_sales = apple_sales,
+  population = population
+)
+
+# =============================================================================
+# COMPUTE YOY % CHANGE IN POPULATION
+# =============================================================================
+# For each month, compare population to 12 months prior.
+# The first 12 rows will be NA since there's no year-ago value.
+
+mydf <- mydf %>%
+  arrange(date) %>%
+  mutate(
+    pop_12m_ago = dplyr::lag(population, 12),
+    pop_yoy_pct = (population - pop_12m_ago) / pop_12m_ago * 100
+  )
+
+cat("Preview of data with YoY % change:\n")
+print(head(mydf, 20))
+cat("\n")
+
+# =============================================================================
+# PART 1: BULK VERSION (all models x all windows x all scenarios)
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 1: BULK VERSION                       #\n")
+cat("##############################################\n\n")
+
+fit_single_window <- function(df,
+                              train_start,
+                              train_end,
+                              test_start,
+                              test_end,
+                              target_col    = "apple_sales",
+                              pop_col       = "population",
+                              yoy_col       = "pop_yoy_pct",
+                              n_lags        = 4,
+                              scenario_min  = -3,
+                              scenario_max  = 3,
+                              scenario_step = 0.5) {
+
+  training_period <- paste(train_start, "to", train_end)
+  testing_period  <- paste(test_start, "to", test_end)
+
+  df <- df %>% arrange(date)
+
+  # -------------------------------------------------------------------------
+  # Create lags of the YoY % change variable (not raw population)
+  # -------------------------------------------------------------------------
+  for (i in 1:n_lags) {
+    col_name <- paste0("yoy_lag", i)
+    df <- df %>% mutate(!!col_name := dplyr::lag(.data[[yoy_col]], i))
+  }
+
+  lag_cols  <- paste0("yoy_lag", 1:n_lags)
+  scenarios <- seq(scenario_min, scenario_max, by = scenario_step)
+
+  train_df_all <- df %>%
+    filter(date >= as.Date(train_start) & date <= as.Date(train_end))
+
+  test_df_all <- df %>%
+    filter(date >= as.Date(test_start) & date <= as.Date(test_end))
+
+  # We also need the 12 months of actual population BEFORE the test period
+  # so that we can compute YoY % change for projected population in scenarios.
+  # Grab up to 12 months of history leading into the test window.
+  hist_start <- as.Date(test_start) %m-% months(12)
+  hist_df <- df %>%
+    filter(date >= hist_start & date < as.Date(test_start)) %>%
+    arrange(date)
+
+  cat("Window:", training_period, "->", testing_period, "\n")
+
+  all_combos <- lapply(1:n_lags, function(k) combn(lag_cols, k, simplify = FALSE))
+  all_combos <- unlist(all_combos, recursive = FALSE)
+
+  fit_single_model <- function(model_idx, xreg_cols) {
+
+    model_name <- paste(xreg_cols, collapse = "+")
+
+    train_df <- train_df_all %>%
+      filter(complete.cases(pick(all_of(xreg_cols))))
+
+    test_df <- test_df_all %>%
+      filter(complete.cases(pick(all_of(xreg_cols))))
+
+    n_train <- nrow(train_df)
+    n_test  <- nrow(test_df)
+
+    if (n_train < 10 || n_test < 1) return(NULL)
+
+    # True scenario: actual YoY pop change over the test period
+    test_pop  <- test_df[[pop_col]]
+    true_scenario <- ((test_pop[n_test] - test_pop[1]) / test_pop[1]) * 100
+    total_real <- sum(test_df[[target_col]])
+
+    xreg_train <- as.matrix(train_df[, xreg_cols, drop = FALSE])
+
+    arima_model <- tryCatch({
+      auto.arima(train_df[[target_col]], xreg = xreg_train)
+    }, error = function(e) NULL)
+
+    if (is.null(arima_model)) return(NULL)
+
+    coefs <- coef(arima_model)
+    xreg_coefs <- coefs[names(coefs) %in% xreg_cols]
+    if (length(xreg_coefs) == 0) return(NULL)
+
+    all_positive <- all(xreg_coefs > 0)
+    total_forecasts <- rep(NA_real_, length(scenarios))
+    scenario_rows <- list()
+
+    for (s_idx in seq_along(scenarios)) {
+
+      scenario_pct <- scenarios[s_idx]
+
+      # -------------------------------------------------------------------
+      # SCENARIO PROJECTION:
+      # 1. Grow raw population levels forward at scenario_pct growth rate
+      #    across the test period.
+      # 2. Recompute YoY % change by comparing projected pop to actual
+      #    historical pop from 12 months earlier.
+      # 3. Create lags of that projected YoY % change series.
+      # -------------------------------------------------------------------
+
+      # Starting population = last actual population before test period
+      last_hist_pop <- hist_df[[pop_col]][nrow(hist_df)]
+
+      # Build projected population for the test period
+      if (n_test == 1) {
+        growth_factors <- 1 + scenario_pct / 100
+      } else {
+        growth_factors <- 1 + (scenario_pct / 100) * (0:(n_test - 1)) / (n_test - 1)
+      }
+      projected_pop <- last_hist_pop * growth_factors
+
+      # Historical population for the 12 months before the test period
+      hist_pop <- hist_df[[pop_col]]
+      hist_dates <- hist_df$date
+
+      # Combined series: history + projected test period
+      combined_pop   <- c(hist_pop, projected_pop)
+      combined_dates <- c(hist_dates, test_df$date)
+
+      # Compute YoY % change on the combined series
+      n_combined <- length(combined_pop)
+      combined_yoy <- rep(NA_real_, n_combined)
+      for (t in 1:n_combined) {
+        # Find the observation ~12 months ago in the full original data
+        target_date_12m_ago <- combined_dates[t] %m-% months(12)
+
+        # Look for exact match in full df (actual historical data)
+        match_idx_full <- which(df$date == target_date_12m_ago)
+
+        if (length(match_idx_full) == 1) {
+          pop_12m_ago <- df[[pop_col]][match_idx_full]
+          combined_yoy[t] <- (combined_pop[t] - pop_12m_ago) / pop_12m_ago * 100
+        } else {
+          # Also check within the combined series itself
+          match_idx_comb <- which(combined_dates == target_date_12m_ago)
+          if (length(match_idx_comb) == 1) {
+            pop_12m_ago <- combined_pop[match_idx_comb]
+            combined_yoy[t] <- (combined_pop[t] - pop_12m_ago) / pop_12m_ago * 100
+          }
+        }
+      }
+
+      # Now extract the YoY values for just the test period rows,
+      # plus enough preceding rows to form lags.
+      # The combined series has length(hist_pop) history rows, then n_test rows.
+      n_hist <- length(hist_pop)
+
+      # We need up to n_lags rows before the test period for lagging
+      # Build a small data frame of (history tail + test) YoY values
+      lag_buffer_start <- max(1, n_hist - n_lags + 1)
+      buffer_yoy <- combined_yoy[lag_buffer_start:n_combined]
+
+      # Create lag columns on the buffer
+      buffer_df <- data.frame(yoy_val = buffer_yoy)
+      for (i in 1:n_lags) {
+        buffer_df[[paste0("yoy_lag", i)]] <- dplyr::lag(buffer_yoy, i)
+      }
+
+      # Extract just the test-period rows from the buffer
+      # The test rows are the last n_test rows of the buffer
+      buffer_n <- nrow(buffer_df)
+      test_rows <- buffer_df[(buffer_n - n_test + 1):buffer_n, , drop = FALSE]
+
+      # Build the xreg matrix for the scenario
+      xreg_test_scenario <- as.matrix(test_rows[, xreg_cols, drop = FALSE])
+
+      # Check for NAs in the xreg
+      if (any(is.na(xreg_test_scenario))) next
+
+      fc <- tryCatch({
+        forecast(arima_model, xreg = xreg_test_scenario)
+      }, error = function(e) NULL)
+
+      if (is.null(fc)) next
+
+      total_forecast <- sum(as.numeric(fc$mean))
+      total_forecasts[s_idx] <- total_forecast
+
+      year_mape <- (total_forecast - total_real) / total_real
+
+      scenario_rows[[s_idx]] <- data.frame(
+        model             = model_name,
+        n_lags_used       = length(xreg_cols),
+        scenario          = scenario_pct,
+        true_scenario     = true_scenario,
+        scenario_diff     = abs(true_scenario - scenario_pct),
+        total_real        = total_real,
+        total_forecast    = total_forecast,
+        year_mape         = year_mape,
+        all_coef_positive = all_positive,
+        training_period   = training_period,
+        testing_period    = testing_period,
+        stringsAsFactors  = FALSE
+      )
+    }
+
+    scenario_rows <- Filter(Negate(is.null), scenario_rows)
+    if (length(scenario_rows) == 0) return(NULL)
+
+    model_df <- do.call(rbind, scenario_rows)
+
+    valid_forecasts <- total_forecasts[!is.na(total_forecasts)]
+    is_monotonic <- length(valid_forecasts) > 1 && all(diff(valid_forecasts) > 0)
+    model_df$monotonic <- ifelse(is_monotonic, "yes", "no")
+
+    return(model_df)
+  }
+
+  all_results <- list()
+  for (i in seq_along(all_combos)) {
+    res <- fit_single_model(i, all_combos[[i]])
+    if (!is.null(res)) {
+      all_results[[length(all_results) + 1]] <- res
+    }
+  }
+
+  if (length(all_results) == 0) return(NULL)
+  do.call(rbind, all_results)
+}
+
+# =============================================================================
+# DEFINE WINDOWS AND RUN
+# =============================================================================
+
+windows <- list(
+  list(train_start = "2020-04-01", train_end = "2021-03-31",
+       test_start  = "2021-04-01", test_end  = "2022-03-31"),
+  list(train_start = "2020-04-01", train_end = "2022-03-31",
+       test_start  = "2022-04-01", test_end  = "2023-03-31"),
+  list(train_start = "2020-04-01", train_end = "2023-03-31",
+       test_start  = "2023-04-01", test_end  = "2024-03-31"),
+  list(train_start = "2020-04-01", train_end = "2024-03-31",
+       test_start  = "2024-04-01", test_end  = "2025-03-31"),
+  list(train_start = "2020-04-01", train_end = "2025-03-31",
+       test_start  = "2025-04-01", test_end  = "2025-10-01")
+)
+
+results_list <- list()
+for (w in windows) {
+  res <- fit_single_window(
+    df          = mydf,
+    train_start = w$train_start,
+    train_end   = w$train_end,
+    test_start  = w$test_start,
+    test_end    = w$test_end,
+    n_lags        = 4,
+    scenario_min  = -3,
+    scenario_max  = 3,
+    scenario_step = 0.5
+  )
+  if (!is.null(res)) {
+    results_list[[length(results_list) + 1]] <- res
+  }
+}
+
+if (length(results_list) == 0) stop("No results from bulk run\n")
+
+results_df <- do.call(rbind, results_list)
+
+cat("\nBulk run complete.\n")
+cat("Total rows:", nrow(results_df), "(one per model-window-scenario)\n")
+cat("Unique models:", length(unique(results_df$model)), "\n\n")
+
+# Preview
+print(head(results_df, 20))
+cat("\n")
