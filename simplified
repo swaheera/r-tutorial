@@ -60,6 +60,8 @@ fit_all_arimax_scenarios <- function(df,
   pop_end <- df %>% filter(date == as.Date(test_end)) %>% pull(!!sym(pop_col))
   true_scenario <- ((pop_end - pop_start) / pop_start) * 100
   
+  total_real <- sum(test_df[[target_col]])
+  
   all_combos <- lapply(1:n_lags, function(k) combn(lag_cols, k, simplify = FALSE))
   all_combos <- unlist(all_combos, recursive = FALSE)
   
@@ -77,7 +79,7 @@ fit_all_arimax_scenarios <- function(df,
       xreg_coefs <- coefs[names(coefs) %in% xreg_cols]
       all_positive <- all(xreg_coefs > 0)
       
-      cumulative_forecasts <- numeric(length(scenarios))
+      total_forecasts <- numeric(length(scenarios))
       
       scenario_results <- lapply(seq_along(scenarios), function(s_idx) {
         
@@ -100,9 +102,8 @@ fit_all_arimax_scenarios <- function(df,
         test_actual <- test_df[[target_col]]
         test_dates <- test_df$date
         
-        cumulative_forecasts[s_idx] <<- sum(test_forecast)
+        total_forecasts[s_idx] <<- sum(test_forecast)
         
-        # Test period MAPE
         monthly_ape <- abs((test_actual - test_forecast) / test_actual) * 100
         avg_monthly_mape <- mean(monthly_ape, na.rm = TRUE)
         
@@ -120,10 +121,12 @@ fit_all_arimax_scenarios <- function(df,
           n_lags_used = length(xreg_cols),
           scenario = scenario_pct,
           true_scenario = true_scenario,
+          scenario_diff = true_scenario - scenario_pct,
           month = test_dates,
           real = test_actual,
           forecast = test_forecast,
-          cumulative_forecast = sum(test_forecast),
+          total_real = total_real,
+          total_forecast = sum(test_forecast),
           avg_monthly_mape = avg_monthly_mape,
           avg_yearly_mape = avg_yearly_mape,
           all_coef_positive = all_positive,
@@ -135,7 +138,7 @@ fit_all_arimax_scenarios <- function(df,
       
       model_df <- do.call(rbind.data.frame, scenario_results)
       
-      is_monotonic <- all(diff(cumulative_forecasts) > 0)
+      is_monotonic <- all(diff(total_forecasts) > 0)
       model_df$monotonic <- ifelse(is_monotonic, "yes", "no")
       
       model_df
