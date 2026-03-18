@@ -48,7 +48,6 @@ fit_single_window <- function(df,
   lag_cols  <- paste0("pop_lag", 1:n_lags)
   scenarios <- seq(scenario_min, scenario_max, by = scenario_step)
 
-  # Pre-filter by date only — complete.cases happens per model inside
   train_df_all <- df %>%
     filter(date >= as.Date(train_start) & date <= as.Date(train_end))
 
@@ -65,7 +64,6 @@ fit_single_window <- function(df,
 
     model_name <- paste(xreg_cols, collapse = "+")
 
-    # Filter complete.cases only on THIS model's columns
     train_df <- train_df_all %>%
       filter(complete.cases(pick(all_of(xreg_cols))))
 
@@ -95,7 +93,7 @@ fit_single_window <- function(df,
 
     all_positive <- all(xreg_coefs > 0)
     total_forecasts <- rep(NA_real_, length(scenarios))
-    scenario_dfs <- list()
+    scenario_rows <- list()
 
     for (s_idx in seq_along(scenarios)) {
 
@@ -120,29 +118,21 @@ fit_single_window <- function(df,
 
       if (is.null(fc)) next
 
-      test_forecast <- as.numeric(fc$mean)
-      test_actual   <- test_df[[target_col]]
-      test_dates    <- test_df$date
+      total_forecast <- sum(as.numeric(fc$mean))
+      total_forecasts[s_idx] <- total_forecast
 
-      total_forecasts[s_idx] <- sum(test_forecast)
+      # year_mape: signed (forecast - actual) / actual
+      year_mape <- (total_forecast - total_real) / total_real
 
-      monthly_ape      <- abs((test_actual - test_forecast) / test_actual) * 100
-      avg_monthly_mape <- mean(monthly_ape, na.rm = TRUE)
-      total_year_mape  <- abs((sum(test_forecast) - total_real) / total_real) * 100
-
-      scenario_dfs[[s_idx]] <- data.frame(
+      scenario_rows[[s_idx]] <- data.frame(
         model             = model_name,
         n_lags_used       = length(xreg_cols),
         scenario          = scenario_pct,
         true_scenario     = true_scenario,
         scenario_diff     = abs(true_scenario - scenario_pct),
-        month             = test_dates,
-        real              = test_actual,
-        forecast          = test_forecast,
         total_real        = total_real,
-        total_forecast    = sum(test_forecast),
-        avg_monthly_mape  = avg_monthly_mape,
-        total_year_mape   = total_year_mape,
+        total_forecast    = total_forecast,
+        year_mape         = year_mape,
         all_coef_positive = all_positive,
         training_period   = training_period,
         testing_period    = testing_period,
@@ -150,10 +140,10 @@ fit_single_window <- function(df,
       )
     }
 
-    scenario_dfs <- Filter(Negate(is.null), scenario_dfs)
-    if (length(scenario_dfs) == 0) return(NULL)
+    scenario_rows <- Filter(Negate(is.null), scenario_rows)
+    if (length(scenario_rows) == 0) return(NULL)
 
-    model_df <- do.call(rbind, scenario_dfs)
+    model_df <- do.call(rbind, scenario_rows)
 
     valid_forecasts <- total_forecasts[!is.na(total_forecasts)]
     is_monotonic <- length(valid_forecasts) > 1 && all(diff(valid_forecasts) > 0)
@@ -209,8 +199,13 @@ if (length(results_list) == 0) stop("No results from bulk run\n")
 
 results_df <- do.call(rbind, results_list)
 
-cat("\nBulk run complete. Total rows:", nrow(results_df), "\n")
+cat("\nBulk run complete.\n")
+cat("Total rows:", nrow(results_df), "(one per model-window-scenario)\n")
 cat("Unique models:", length(unique(results_df$model)), "\n\n")
+
+# Preview
+print(head(results_df, 20))
+cat("\n")
 
 
 # =============================================================================
@@ -225,12 +220,10 @@ cat("##############################################\n\n")
 
 cat("--- CHECK 1: pop_lag1, scenario +1% ---\n\n")
 
-# Create lag
 df1 <- mydf %>%
   arrange(date) %>%
   mutate(pop_lag1 = dplyr::lag(population, 1))
 
-# Split and drop NAs on pop_lag1
 train1 <- df1 %>%
   filter(date >= "2020-04-01" & date <= "2022-03-31") %>%
   filter(!is.na(pop_lag1))
@@ -241,7 +234,6 @@ test1 <- df1 %>%
 
 cat("Train rows:", nrow(train1), "| Test rows:", nrow(test1), "\n")
 
-# Build scenario xreg: +1% growth
 scenario_pct_1 <- 1
 n_test_1 <- nrow(test1)
 growth_factors_1 <- 1 + (scenario_pct_1 / 100) * (0:(n_test_1 - 1)) / (n_test_1 - 1)
@@ -250,26 +242,22 @@ xreg_train_1 <- as.matrix(train1[, "pop_lag1", drop = FALSE])
 xreg_test_1  <- as.matrix(test1$pop_lag1[1] * growth_factors_1)
 colnames(xreg_test_1) <- "pop_lag1"
 
-# Fit and forecast
 model1 <- auto.arima(train1$apple_sales, xreg = xreg_train_1)
 fc1    <- forecast(model1, xreg = xreg_test_1)
 
-check1_result <- data.frame(
-  month    = test1$date,
-  real     = test1$apple_sales,
-  forecast = as.numeric(fc1$mean)
-)
+check1_total_forecast <- sum(as.numeric(fc1$mean))
+check1_total_real     <- sum(test1$apple_sales)
+check1_year_mape      <- (check1_total_forecast - check1_total_real) / check1_total_real
 
-print(check1_result)
-cat("Total real:    ", sum(check1_result$real), "\n")
-cat("Total forecast:", sum(check1_result$forecast), "\n\n")
+cat("Total real:    ", check1_total_real, "\n")
+cat("Total forecast:", check1_total_forecast, "\n")
+cat("Year MAPE:     ", check1_year_mape, "\n\n")
 
 
 # ----- CHECK 2: pop_lag1+pop_lag2+pop_lag3, same window, scenario +1% -----
 
 cat("--- CHECK 2: pop_lag1+pop_lag2+pop_lag3, scenario +1% ---\n\n")
 
-# Create lags
 df2 <- mydf %>%
   arrange(date) %>%
   mutate(
@@ -278,7 +266,6 @@ df2 <- mydf %>%
     pop_lag3 = dplyr::lag(population, 3)
   )
 
-# Split and drop NAs on the 3 lag columns
 train2 <- df2 %>%
   filter(date >= "2020-04-01" & date <= "2022-03-31") %>%
   filter(!is.na(pop_lag1) & !is.na(pop_lag2) & !is.na(pop_lag3))
@@ -289,7 +276,6 @@ test2 <- df2 %>%
 
 cat("Train rows:", nrow(train2), "| Test rows:", nrow(test2), "\n")
 
-# Build scenario xreg: +1% growth applied to all 3 lag columns
 scenario_pct_2 <- 1
 n_test_2 <- nrow(test2)
 growth_factors_2 <- 1 + (scenario_pct_2 / 100) * (0:(n_test_2 - 1)) / (n_test_2 - 1)
@@ -305,19 +291,16 @@ for (j in 1:3) {
   xreg_test_2[, j] <- xreg_test_base_2[j] * growth_factors_2
 }
 
-# Fit and forecast
 model2 <- auto.arima(train2$apple_sales, xreg = xreg_train_2)
 fc2    <- forecast(model2, xreg = xreg_test_2)
 
-check2_result <- data.frame(
-  month    = test2$date,
-  real     = test2$apple_sales,
-  forecast = as.numeric(fc2$mean)
-)
+check2_total_forecast <- sum(as.numeric(fc2$mean))
+check2_total_real     <- sum(test2$apple_sales)
+check2_year_mape      <- (check2_total_forecast - check2_total_real) / check2_total_real
 
-print(check2_result)
-cat("Total real:    ", sum(check2_result$real), "\n")
-cat("Total forecast:", sum(check2_result$forecast), "\n\n")
+cat("Total real:    ", check2_total_real, "\n")
+cat("Total forecast:", check2_total_forecast, "\n")
+cat("Year MAPE:     ", check2_year_mape, "\n\n")
 
 
 # =============================================================================
@@ -331,42 +314,32 @@ cat("##############################################\n\n")
 # --- Check 1 vs bulk ---
 cat("--- CHECK 1: pop_lag1 ---\n")
 
-bulk_slice_1 <- results_df %>%
+bulk1 <- results_df %>%
   filter(
     model           == "pop_lag1",
     training_period == "2020-04-01 to 2022-03-31",
     testing_period  == "2022-04-01 to 2023-03-31",
     scenario        == 1
-  ) %>%
-  select(month, real, forecast)
+  )
 
-cat("Bulk:\n")
-print(bulk_slice_1)
-cat("\nIndividual:\n")
-print(check1_result)
-
-match1 <- all.equal(bulk_slice_1$forecast, check1_result$forecast, tolerance = 1e-6)
-cat("\nMatch:", match1, "\n\n")
+cat("Bulk:       total_forecast =", bulk1$total_forecast, " year_mape =", bulk1$year_mape, "\n")
+cat("Individual: total_forecast =", check1_total_forecast, " year_mape =", check1_year_mape, "\n")
+cat("Match:", all.equal(bulk1$total_forecast, check1_total_forecast, tolerance = 1e-6), "\n\n")
 
 
 # --- Check 2 vs bulk ---
 cat("--- CHECK 2: pop_lag1+pop_lag2+pop_lag3 ---\n")
 
-bulk_slice_2 <- results_df %>%
+bulk2 <- results_df %>%
   filter(
     model           == "pop_lag1+pop_lag2+pop_lag3",
     training_period == "2020-04-01 to 2022-03-31",
     testing_period  == "2022-04-01 to 2023-03-31",
     scenario        == 1
-  ) %>%
-  select(month, real, forecast)
+  )
 
-cat("Bulk:\n")
-print(bulk_slice_2)
-cat("\nIndividual:\n")
-print(check2_result)
-
-match2 <- all.equal(bulk_slice_2$forecast, check2_result$forecast, tolerance = 1e-6)
-cat("\nMatch:", match2, "\n\n")
+cat("Bulk:       total_forecast =", bulk2$total_forecast, " year_mape =", bulk2$year_mape, "\n")
+cat("Individual: total_forecast =", check2_total_forecast, " year_mape =", check2_year_mape, "\n")
+cat("Match:", all.equal(bulk2$total_forecast, check2_total_forecast, tolerance = 1e-6), "\n\n")
 
 cat("Done!\n")
