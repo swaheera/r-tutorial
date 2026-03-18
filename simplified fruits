@@ -1,20 +1,12 @@
 library(dplyr)
 library(forecast)
 
+# --- Simulate data matching Apr 2020 to Oct 2025 ---
 set.seed(42)
+dates <- seq.Date(from = as.Date("2020-04-01"), by = "month", length.out = 67)
 
-# --- Simulate monthly data over 10 years ---
-n <- 120
-dates <- seq.Date(from = as.Date("2014-01-01"), by = "month", length.out = n)
-
-population <- arima.sim(model = list(ar = 0.7), n = n) + 100
-noise <- arima.sim(model = list(ar = 0.5, ma = 0.3), n = n)
-
-apple_sales <- numeric(n)
-apple_sales[1:12] <- NA
-for (i in 13:n) {
-  apple_sales[i] <- 500 + 0.8 * population[i-1] + 0.5 * population[i-3] + 0.3 * population[i-6] + noise[i]
-}
+population <- cumsum(rnorm(67, mean = 0.5, sd = 1)) + 100
+apple_sales <- 500 + 2 * population + rnorm(67, sd = 10)
 
 mydf <- data.frame(
   date = dates,
@@ -30,141 +22,177 @@ fit_single_window <- function(df,
                                test_end,
                                target_col = "apple_sales",
                                pop_col = "population",
-                               n_lags = 12,
+                               n_lags = 4,
                                scenario_min = -3,
                                scenario_max = 3,
-                               scenario_step = 0.1) {
+                               scenario_step = 0.5) {
   
   training_period <- paste(train_start, "to", train_end)
   testing_period <- paste(test_start, "to", test_end)
   
+  # Create lag columns on full data first
   df <- df %>% arrange(date)
   for (i in 1:n_lags) {
-    df[[paste0("pop_lag", i)]] <- lag(df[[pop_col]], i)
+    df[[paste0("pop_lag", i)]] <- dplyr::lag(df[[pop_col]], i)
   }
   
   lag_cols <- paste0("pop_lag", 1:n_lags)
   scenarios <- seq(scenario_min, scenario_max, by = scenario_step)
   
+  # Filter train and test
+
   train_df <- df %>%
     filter(date >= as.Date(train_start) & date <= as.Date(train_end)) %>%
-    filter(complete.cases(select(., all_of(lag_cols))))
+    filter(complete.cases(pick(all_of(lag_cols))))
   
   test_df <- df %>%
     filter(date >= as.Date(test_start) & date <= as.Date(test_end)) %>%
-    filter(complete.cases(select(., all_of(lag_cols))))
+    filter(complete.cases(pick(all_of(lag_cols))))
   
+  n_train <- nrow(train_df)
   n_test <- nrow(test_df)
   
-  if (n_test == 0) return(NULL)
+  cat("Window:", training_period, "->", testing_period, "\n")
+  cat("Train rows:", n_train, "| Test rows:", n_test, "\n")
   
-  pop_start <- df %>% filter(date == as.Date(test_start)) %>% pull(!!sym(pop_col))
-  pop_end <- df %>% filter(date == as.Date(test_end)) %>% pull(!!sym(pop_col))
-  true_scenario <- ((pop_end - pop_start) / pop_start) * 100
+  # Need enough data
+
+  if (n_train < 10 || n_test < 1) {
+    cat("Skipping - insufficient data\n\n")
+    return(NULL)
+  }
+  
+  # True scenario calculation
+  test_pop <- test_df[[pop_col]]
+  true_scenario <- ((test_pop[n_test] - test_pop[1]) / test_pop[1]) * 100
   
   total_real <- sum(test_df[[target_col]])
   
+  # Generate all lag combinations
   all_combos <- lapply(1:n_lags, function(k) combn(lag_cols, k, simplify = FALSE))
   all_combos <- unlist(all_combos, recursive = FALSE)
-  
   n_models <- length(all_combos)
   
+  # Fit single model
   fit_single_model <- function(model_idx, xreg_cols) {
     
     model_name <- paste(xreg_cols, collapse = "+")
     xreg_train <- as.matrix(train_df[, xreg_cols, drop = FALSE])
     
-    tryCatch({
-      model <- auto.arima(train_df[[target_col]], xreg = xreg_train)
+    # Fit ARIMA
+    model <- tryCatch({
+      auto.arima(train_df[[target_col]], xreg = xreg_train)
+    }, error = function(e) {
+      return(NULL)
+    })
+    
+    if (is.null(model)) return(NULL)
+    
+    # Get coefficients
+    coefs <- coef(model)
+    xreg_coefs <- coefs[names(coefs) %in% xreg_cols]
+    
+    if (length(xreg_coefs) == 0) return(NULL)
+    
+    all_positive <- all(xreg_coefs > 0)
+    
+    # Store forecasts for monotonicity check
+    total_forecasts <- numeric(length(scenarios))
+    
+    # Loop scenarios
+    scenario_dfs <- list()
+    
+    for (s_idx in seq_along(scenarios)) {
       
-      coefs <- coef(model)
-      xreg_coefs <- coefs[names(coefs) %in% xreg_cols]
-      all_positive <- all(xreg_coefs > 0)
+      scenario_pct <- scenarios[s_idx]
       
-      total_forecasts <- numeric(length(scenarios))
+      cat("Model", model_idx, "/", n_models, "| Scenario:", scenario_pct, "%\n")
       
-      scenario_results <- lapply(seq_along(scenarios), function(s_idx) {
-        
-        scenario_pct <- scenarios[s_idx]
-        
-        cat("Model", model_idx, "/", n_models, "| Scenario:", scenario_pct, "% | Window:", training_period, "\n")
-        
-        xreg_test_base <- as.matrix(test_df[1, xreg_cols, drop = FALSE])
-        
-        growth_factors <- 1 + (scenario_pct / 100) * ((1:n_test - 1) / (n_test - 1))
-        
-        xreg_test_scenario <- matrix(
-          rep(as.numeric(xreg_test_base), each = n_test) * growth_factors,
-          nrow = n_test,
-          ncol = length(xreg_cols)
-        )
-        colnames(xreg_test_scenario) <- xreg_cols
-        
-        test_forecast <- as.numeric(forecast(model, xreg = xreg_test_scenario)$mean)
-        test_actual <- test_df[[target_col]]
-        test_dates <- test_df$date
-        
-        total_forecasts[s_idx] <<- sum(test_forecast)
-        
-        monthly_ape <- abs((test_actual - test_forecast) / test_actual) * 100
-        avg_monthly_mape <- mean(monthly_ape, na.rm = TRUE)
-        
-        yearly_df <- data.frame(
-          year = format(test_dates, "%Y"),
-          forecast = test_forecast,
-          real = test_actual
-        ) %>%
-          group_by(year) %>%
-          summarise(
-            year_forecast = sum(forecast),
-            year_real = sum(real),
-            .groups = "drop"
-          ) %>%
-          mutate(yearly_pe = (year_forecast - year_real) / year_real * 100)
-        
-        avg_yearly_mape <- mean(abs(yearly_df$yearly_pe), na.rm = TRUE)
-        
-        data.frame(
-          model = model_name,
-          n_lags_used = length(xreg_cols),
-          scenario = scenario_pct,
-          true_scenario = true_scenario,
-          scenario_diff = true_scenario - scenario_pct,
-          month = test_dates,
-          real = test_actual,
-          forecast = test_forecast,
-          total_real = total_real,
-          total_forecast = sum(test_forecast),
-          avg_monthly_mape = avg_monthly_mape,
-          avg_yearly_mape = avg_yearly_mape,
-          all_coef_positive = all_positive,
-          training_period = training_period,
-          testing_period = testing_period,
-          stringsAsFactors = FALSE
-        )
+      # Build scenario xreg
+      xreg_test_base <- as.numeric(test_df[1, xreg_cols])
+      
+      # Growth factors: 1 at start, (1 + scenario_pct/100) at end
+      if (n_test == 1) {
+        growth_factors <- 1 + scenario_pct / 100
+      } else {
+        growth_factors <- 1 + (scenario_pct / 100) * (0:(n_test - 1)) / (n_test - 1)
+      }
+      
+      # Build xreg matrix
+      xreg_test_scenario <- matrix(NA, nrow = n_test, ncol = length(xreg_cols))
+      for (j in seq_along(xreg_cols)) {
+        xreg_test_scenario[, j] <- xreg_test_base[j] * growth_factors
+      }
+      colnames(xreg_test_scenario) <- xreg_cols
+      
+      # Forecast
+      fc <- tryCatch({
+        forecast(model, xreg = xreg_test_scenario)
+      }, error = function(e) {
+        return(NULL)
       })
       
-      model_df <- do.call(rbind.data.frame, scenario_results)
+      if (is.null(fc)) next
       
-      is_monotonic <- all(diff(total_forecasts) > 0)
-      model_df$monotonic <- ifelse(is_monotonic, "yes", "no")
+      test_forecast <- as.numeric(fc$mean)
+      test_actual <- test_df[[target_col]]
+      test_dates <- test_df$date
       
-      model_df
+      total_forecasts[s_idx] <- sum(test_forecast)
       
-    }, error = function(e) {
-      NULL
-    })
+      # Monthly MAPE
+      monthly_ape <- abs((test_actual - test_forecast) / test_actual) * 100
+      avg_monthly_mape <- mean(monthly_ape, na.rm = TRUE)
+      
+      # Total year MAPE
+      total_year_mape <- abs((sum(test_forecast) - total_real) / total_real) * 100
+      
+      scenario_dfs[[s_idx]] <- data.frame(
+        model = model_name,
+        n_lags_used = length(xreg_cols),
+        scenario = scenario_pct,
+        true_scenario = true_scenario,
+        scenario_diff = true_scenario - scenario_pct,
+        month = test_dates,
+        real = test_actual,
+        forecast = test_forecast,
+        total_real = total_real,
+        total_forecast = sum(test_forecast),
+        avg_monthly_mape = avg_monthly_mape,
+        total_year_mape = total_year_mape,
+        all_coef_positive = all_positive,
+        training_period = training_period,
+        testing_period = testing_period,
+        stringsAsFactors = FALSE
+      )
+    }
+    
+    # Combine scenarios
+    scenario_dfs <- Filter(Negate(is.null), scenario_dfs)
+    if (length(scenario_dfs) == 0) return(NULL)
+    
+    model_df <- do.call(rbind, scenario_dfs)
+    
+    # Monotonicity check
+    total_forecasts <- total_forecasts[total_forecasts != 0]
+    is_monotonic <- length(total_forecasts) > 1 && all(diff(total_forecasts) > 0)
+    model_df$monotonic <- ifelse(is_monotonic, "yes", "no")
+    
+    return(model_df)
   }
   
-  result_list <- lapply(seq_along(all_combos), function(i) {
-    fit_single_model(i, all_combos[[i]])
-  })
+  # Run all models
+  all_results <- list()
+  for (i in seq_along(all_combos)) {
+    res <- fit_single_model(i, all_combos[[i]])
+    if (!is.null(res)) {
+      all_results[[length(all_results) + 1]] <- res
+    }
+  }
   
-  result_list <- Filter(Negate(is.null), result_list)
+  if (length(all_results) == 0) return(NULL)
   
-  if (length(result_list) == 0) return(NULL)
-  
-  do.call(rbind.data.frame, result_list)
+  do.call(rbind, all_results)
 }
 
 # --- Define windows (April 2020 to Oct 2025) ---
@@ -177,8 +205,9 @@ windows <- list(
 )
 
 # --- Run all windows ---
-results_df <- do.call(rbind.data.frame, lapply(windows, function(w) {
-  fit_single_window(
+results_list <- list()
+for (w in windows) {
+  res <- fit_single_window(
     df = mydf,
     train_start = w$train_start,
     train_end = w$train_end,
@@ -189,30 +218,60 @@ results_df <- do.call(rbind.data.frame, lapply(windows, function(w) {
     scenario_max = 3,
     scenario_step = 0.5
   )
-}))
+  if (!is.null(res)) {
+    results_list[[length(results_list) + 1]] <- res
+  }
+}
 
-# --- Find models monotonic in ALL windows ---
-monotonic_all_windows <- results_df %>%
-  group_by(model, scenario, training_period, testing_period) %>%
-  slice(1) %>%
-  ungroup() %>%
-  group_by(model) %>%
-  filter(all(monotonic == "yes")) %>%
-  ungroup()
-
-# --- Final summary table ---
-summary_table <- monotonic_all_windows %>%
-  select(
-    model,
-    train_window = training_period,
-    test_window = testing_period,
-    total_year_actual = total_real,
-    total_year_forecast = total_forecast,
-    year_mape = avg_yearly_mape,
-    scenario,
-    true_scenario,
-    monotonic
-  ) %>%
-  arrange(model, test_window, scenario)
-
-print(summary_table)
+# Combine results
+if (length(results_list) == 0) {
+  cat("No results - check your data\n")
+} else {
+  results_df <- do.call(rbind, results_list)
+  
+  cat("\n=== Results ===\n")
+  cat("Total rows:", nrow(results_df), "\n")
+  
+  # --- Find models monotonic in ALL windows ---
+  n_windows <- length(windows)
+  
+  # One row per model-scenario-window
+  summary_all <- results_df %>%
+    group_by(model, scenario, training_period, testing_period) %>%
+    slice(1) %>%
+    ungroup()
+  
+  # Count how many windows each model is monotonic
+  monotonic_counts <- summary_all %>%
+    group_by(model) %>%
+    summarise(
+      n_monotonic = sum(monotonic == "yes"),
+      n_total = n(),
+      .groups = "drop"
+    )
+  
+  # Keep models monotonic in all their windows
+  always_monotonic <- monotonic_counts %>%
+    filter(n_monotonic == n_total) %>%
+    pull(model)
+  
+  cat("Models monotonic in all windows:", length(always_monotonic), "\n")
+  
+  # Final summary table
+  summary_table <- summary_all %>%
+    filter(model %in% always_monotonic) %>%
+    select(
+      model,
+      train_window = training_period,
+      test_window = testing_period,
+      total_year_actual = total_real,
+      total_year_forecast = total_forecast,
+      total_year_mape,
+      scenario,
+      true_scenario,
+      monotonic
+    ) %>%
+    arrange(model, test_window, scenario)
+  
+  print(summary_table)
+}
