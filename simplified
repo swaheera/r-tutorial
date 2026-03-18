@@ -104,17 +104,25 @@ fit_all_arimax_scenarios <- function(df,
         
         total_forecasts[s_idx] <<- sum(test_forecast)
         
+        # Monthly MAPE
         monthly_ape <- abs((test_actual - test_forecast) / test_actual) * 100
         avg_monthly_mape <- mean(monthly_ape, na.rm = TRUE)
         
-        yearly_mape_df <- data.frame(
+        # Yearly MAPE: (year_forecast - year_real) / year_real
+        yearly_df <- data.frame(
           year = format(test_dates, "%Y"),
-          ape = monthly_ape
+          forecast = test_forecast,
+          real = test_actual
         ) %>%
           group_by(year) %>%
-          summarise(yearly_mape = mean(ape, na.rm = TRUE), .groups = "drop")
+          summarise(
+            year_forecast = sum(forecast),
+            year_real = sum(real),
+            .groups = "drop"
+          ) %>%
+          mutate(yearly_pe = (year_forecast - year_real) / year_real * 100)
         
-        avg_yearly_mape <- mean(yearly_mape_df$yearly_mape, na.rm = TRUE)
+        avg_yearly_mape <- mean(abs(yearly_df$yearly_pe), na.rm = TRUE)
         
         data.frame(
           model = model_name,
@@ -173,3 +181,10 @@ results_df <- fit_all_arimax_scenarios(
   scenario_max = 3,
   scenario_step = 0.5
 )
+
+# --- One row per model-scenario ---
+summary_df <- results_df %>%
+  group_by(model, scenario) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-month, -real, -forecast)
