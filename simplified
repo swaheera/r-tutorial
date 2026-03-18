@@ -77,10 +77,6 @@ fit_all_arimax_scenarios <- function(df,
       xreg_coefs <- coefs[names(coefs) %in% xreg_cols]
       all_positive <- all(xreg_coefs > 0)
       
-      train_fitted <- as.numeric(fitted(model))
-      train_actual <- train_df[[target_col]]
-      train_dates <- train_df$date
-      
       cumulative_forecasts <- numeric(length(scenarios))
       
       scenario_results <- lapply(seq_along(scenarios), function(s_idx) {
@@ -106,16 +102,12 @@ fit_all_arimax_scenarios <- function(df,
         
         cumulative_forecasts[s_idx] <<- sum(test_forecast)
         
-        all_dates <- c(train_dates, test_dates)
-        all_actual <- c(train_actual, test_actual)
-        all_forecast <- c(train_fitted, test_forecast)
-        all_set <- c(rep("train", length(train_dates)), rep("test", length(test_dates)))
-        
-        monthly_ape <- abs((all_actual - all_forecast) / all_actual) * 100
+        # Test period MAPE
+        monthly_ape <- abs((test_actual - test_forecast) / test_actual) * 100
         avg_monthly_mape <- mean(monthly_ape, na.rm = TRUE)
         
         yearly_mape_df <- data.frame(
-          year = format(all_dates, "%Y"),
+          year = format(test_dates, "%Y"),
           ape = monthly_ape
         ) %>%
           group_by(year) %>%
@@ -128,10 +120,9 @@ fit_all_arimax_scenarios <- function(df,
           n_lags_used = length(xreg_cols),
           scenario = scenario_pct,
           true_scenario = true_scenario,
-          month = all_dates,
-          set = all_set,
-          real = all_actual,
-          forecast = all_forecast,
+          month = test_dates,
+          real = test_actual,
+          forecast = test_forecast,
           cumulative_forecast = sum(test_forecast),
           avg_monthly_mape = avg_monthly_mape,
           avg_yearly_mape = avg_yearly_mape,
@@ -161,7 +152,6 @@ fit_all_arimax_scenarios <- function(df,
   result_list <- Filter(Negate(is.null), result_list)
   final_df <- do.call(rbind.data.frame, result_list)
   
-  # Print monotonic results
   monotonic_df <- final_df %>% filter(monotonic == "yes")
   print(monotonic_df)
   
