@@ -1,0 +1,182 @@
+library(dplyr)
+library(forecast)
+
+set.seed(42)
+
+# --- Simulate monthly data over 10 years ---
+n <- 120
+dates <- seq.Date(from = as.Date("2014-01-01"), by = "month", length.out = n)
+
+population <- arima.sim(model = list(ar = 0.7), n = n) + 100
+noise <- arima.sim(model = list(ar = 0.5, ma = 0.3), n = n)
+
+apple_sales <- numeric(n)
+apple_sales[1:12] <- NA
+for (i in 13:n) {
+  apple_sales[i] <- 500 + 0.8 * population[i-1] + 0.5 * population[i-3] + 0.3 * population[i-6] + noise[i]
+}
+
+mydf <- data.frame(
+  date = dates,
+  apple_sales = apple_sales,
+  population = population
+)
+
+# --- Main function ---
+fit_all_arimax_scenarios <- function(df, 
+                                      train_start, 
+                                      train_end, 
+                                      test_start, 
+                                      test_end,
+                                      target_col = "apple_sales",
+                                      pop_col = "population",
+                                      n_lags = 12,
+                                      scenario_min = -3,
+                                      scenario_max = 3,
+                                      scenario_step = 0.1) {
+  
+  training_period <- paste(train_start, "to", train_end)
+  testing_period <- paste(test_start, "to", test_end)
+  
+  df <- df %>% arrange(date)
+  for (i in 1:n_lags) {
+    df[[paste0("pop_lag", i)]] <- lag(df[[pop_col]], i)
+  }
+  
+  lag_cols <- paste0("pop_lag", 1:n_lags)
+  scenarios <- seq(scenario_min, scenario_max, by = scenario_step)
+  
+  train_df <- df %>%
+    filter(date >= as.Date(train_start) & date <= as.Date(train_end)) %>%
+    filter(complete.cases(select(., all_of(lag_cols))))
+  
+  test_df <- df %>%
+    filter(date >= as.Date(test_start) & date <= as.Date(test_end)) %>%
+    filter(complete.cases(select(., all_of(lag_cols))))
+  
+  n_test <- nrow(test_df)
+  
+  pop_start <- df %>% filter(date == as.Date(test_start)) %>% pull(!!sym(pop_col))
+  pop_end <- df %>% filter(date == as.Date(test_end)) %>% pull(!!sym(pop_col))
+  true_scenario <- ((pop_end - pop_start) / pop_start) * 100
+  
+  all_combos <- lapply(1:n_lags, function(k) combn(lag_cols, k, simplify = FALSE))
+  all_combos <- unlist(all_combos, recursive = FALSE)
+  
+  n_models <- length(all_combos)
+  
+  fit_single_model <- function(model_idx, xreg_cols) {
+    
+    model_name <- paste(xreg_cols, collapse = "+")
+    xreg_train <- as.matrix(train_df[, xreg_cols, drop = FALSE])
+    
+    tryCatch({
+      model <- auto.arima(train_df[[target_col]], xreg = xreg_train)
+      
+      coefs <- coef(model)
+      xreg_coefs <- coefs[names(coefs) %in% xreg_cols]
+      all_positive <- all(xreg_coefs > 0)
+      
+      train_fitted <- as.numeric(fitted(model))
+      train_actual <- train_df[[target_col]]
+      train_dates <- train_df$date
+      
+      cumulative_forecasts <- numeric(length(scenarios))
+      
+      scenario_results <- lapply(seq_along(scenarios), function(s_idx) {
+        
+        scenario_pct <- scenarios[s_idx]
+        
+        cat("Model", model_idx, "/", n_models, "| Scenario:", scenario_pct, "%\n")
+        
+        xreg_test_base <- as.matrix(test_df[1, xreg_cols, drop = FALSE])
+        
+        growth_factors <- 1 + (scenario_pct / 100) * ((1:n_test - 1) / (n_test - 1))
+        
+        xreg_test_scenario <- matrix(
+          rep(as.numeric(xreg_test_base), each = n_test) * growth_factors,
+          nrow = n_test,
+          ncol = length(xreg_cols)
+        )
+        colnames(xreg_test_scenario) <- xreg_cols
+        
+        test_forecast <- as.numeric(forecast(model, xreg = xreg_test_scenario)$mean)
+        test_actual <- test_df[[target_col]]
+        test_dates <- test_df$date
+        
+        cumulative_forecasts[s_idx] <<- sum(test_forecast)
+        
+        all_dates <- c(train_dates, test_dates)
+        all_actual <- c(train_actual, test_actual)
+        all_forecast <- c(train_fitted, test_forecast)
+        all_set <- c(rep("train", length(train_dates)), rep("test", length(test_dates)))
+        
+        monthly_ape <- abs((all_actual - all_forecast) / all_actual) * 100
+        avg_monthly_mape <- mean(monthly_ape, na.rm = TRUE)
+        
+        yearly_mape_df <- data.frame(
+          year = format(all_dates, "%Y"),
+          ape = monthly_ape
+        ) %>%
+          group_by(year) %>%
+          summarise(yearly_mape = mean(ape, na.rm = TRUE), .groups = "drop")
+        
+        avg_yearly_mape <- mean(yearly_mape_df$yearly_mape, na.rm = TRUE)
+        
+        data.frame(
+          model = model_name,
+          n_lags_used = length(xreg_cols),
+          scenario = scenario_pct,
+          true_scenario = true_scenario,
+          month = all_dates,
+          set = all_set,
+          real = all_actual,
+          forecast = all_forecast,
+          cumulative_forecast = sum(test_forecast),
+          avg_monthly_mape = avg_monthly_mape,
+          avg_yearly_mape = avg_yearly_mape,
+          all_coef_positive = all_positive,
+          training_period = training_period,
+          testing_period = testing_period,
+          stringsAsFactors = FALSE
+        )
+      })
+      
+      model_df <- do.call(rbind.data.frame, scenario_results)
+      
+      is_monotonic <- all(diff(cumulative_forecasts) > 0)
+      model_df$monotonic <- ifelse(is_monotonic, "yes", "no")
+      
+      model_df
+      
+    }, error = function(e) {
+      NULL
+    })
+  }
+  
+  result_list <- lapply(seq_along(all_combos), function(i) {
+    fit_single_model(i, all_combos[[i]])
+  })
+  
+  result_list <- Filter(Negate(is.null), result_list)
+  final_df <- do.call(rbind.data.frame, result_list)
+  
+  # Print monotonic results
+  monotonic_df <- final_df %>% filter(monotonic == "yes")
+  print(monotonic_df)
+  
+  return(final_df)
+}
+
+# --- Run ---
+results_df <- fit_all_arimax_scenarios(
+  df = mydf,
+  train_start = "2015-04-01",
+  train_end = "2022-03-01",
+  test_start = "2022-04-01",
+  test_end = "2023-03-01",
+  n_lags = 4,
+  scenario_min = -3,
+  scenario_max = 3,
+  scenario_step = 0.5
+)
