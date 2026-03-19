@@ -1,0 +1,414 @@
+library(dplyr)
+library(forecast)
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+CONFIG <- list(
+  df_name            = "mydf",
+  date_col           = "date",
+  target_col         = "apple_sales",
+  pop_col            = "population",
+  n_lags             = 4,
+  scenario_min       = -3,
+  scenario_max       = 3,
+  scenario_step      = 0.5,
+  log_response       = FALSE,
+  log_all_predictors = FALSE
+)
+
+# =============================================================================
+# DATA SETUP (simulated — replace with your own)
+# =============================================================================
+
+set.seed(42)
+dates <- seq.Date(from = as.Date("2020-04-01"), by = "month", length.out = 67)
+population <- cumsum(rnorm(67, mean = 0.5, sd = 1)) + 100
+apple_sales <- 500 + 2 * population + rnorm(67, sd = 10)
+
+mydf <- data.frame(
+  date = dates,
+  apple_sales = apple_sales,
+  population = population
+)
+
+# =============================================================================
+# HELPER: back-transform if log was applied
+# =============================================================================
+
+back_transform <- function(x, is_logged) {
+  if (is_logged) exp(x) else x
+}
+
+# =============================================================================
+# PART 1: BULK VERSION
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 1: BULK VERSION                       #\n")
+cat("##############################################\n\n")
+
+fit_single_window <- function(config, train_start, train_end, test_start, test_end) {
+
+  # Unpack config
+  df         <- get(config$df_name, envir = parent.frame())
+  date_col   <- config$date_col
+  target_col <- config$target_col
+  pop_col    <- config$pop_col
+  n_lags     <- config$n_lags
+  scenario_min       <- config$scenario_min
+  scenario_max       <- config$scenario_max
+  scenario_step      <- config$scenario_step
+  log_response       <- config$log_response
+  log_all_predictors <- config$log_all_predictors
+
+  training_period <- paste(train_start, "to", train_end)
+  testing_period  <- paste(test_start, "to", test_end)
+
+  df <- df %>% arrange(.data[[date_col]])
+
+  # Apply log transforms before creating lags
+  if (log_response)       df[[target_col]] <- log(df[[target_col]])
+  if (log_all_predictors) df[[pop_col]]    <- log(df[[pop_col]])
+
+  # Create lags
+  for (i in 1:n_lags) {
+    df <- df %>% mutate(!!paste0("pop_lag", i) := dplyr::lag(.data[[pop_col]], i))
+  }
+
+  lag_cols  <- paste0("pop_lag", 1:n_lags)
+  scenarios <- seq(scenario_min, scenario_max, by = scenario_step)
+
+  train_df_all <- df %>% filter(.data[[date_col]] >= as.Date(train_start) &
+                                .data[[date_col]] <= as.Date(train_end))
+  test_df_all  <- df %>% filter(.data[[date_col]] >= as.Date(test_start) &
+                                .data[[date_col]] <= as.Date(test_end))
+
+  cat("Data:", config$df_name, "| Window:", training_period, "->", testing_period, "\n")
+
+  # ---- Pure ARIMA baseline (no xreg) ----
+  baseline_model <- tryCatch(auto.arima(train_df_all[[target_col]]), error = function(e) NULL)
+
+  n_test_full <- nrow(test_df_all)
+  # Back-transform total_real to original scale for MAPE
+  baseline_total_real <- sum(back_transform(test_df_all[[target_col]], log_response))
+
+  baseline_year_mape <- NA
+  if (!is.null(baseline_model)) {
+    baseline_fc <- tryCatch(forecast(baseline_model, h = n_test_full), error = function(e) NULL)
+    if (!is.null(baseline_fc)) {
+      # Back-transform forecast to original scale for MAPE
+      baseline_total_forecast <- sum(back_transform(as.numeric(baseline_fc$mean), log_response))
+      baseline_year_mape <- (baseline_total_forecast - baseline_total_real) / baseline_total_real
+    }
+  }
+
+  # ---- All lag combinations ----
+  all_combos <- lapply(1:n_lags, function(k) combn(lag_cols, k, simplify = FALSE))
+  all_combos <- unlist(all_combos, recursive = FALSE)
+
+  fit_single_model <- function(xreg_cols) {
+
+    model_name <- paste(xreg_cols, collapse = "+")
+
+    train_df <- train_df_all %>% filter(complete.cases(pick(all_of(xreg_cols))))
+    test_df  <- test_df_all %>% filter(complete.cases(pick(all_of(xreg_cols))))
+
+    n_train <- nrow(train_df)
+    n_test  <- nrow(test_df)
+    if (n_train < 10 || n_test < 1) return(NULL)
+
+    test_pop <- test_df[[pop_col]]
+    true_scenario <- ((test_pop[n_test] - test_pop[1]) / test_pop[1]) * 100
+    # Back-transform total_real to original scale for MAPE
+    total_real <- sum(back_transform(test_df[[target_col]], log_response))
+
+    xreg_train <- as.matrix(train_df[, xreg_cols, drop = FALSE])
+
+    arima_model <- tryCatch(auto.arima(train_df[[target_col]], xreg = xreg_train),
+                            error = function(e) NULL)
+    if (is.null(arima_model)) return(NULL)
+
+    coefs <- coef(arima_model)
+    xreg_coefs <- coefs[names(coefs) %in% xreg_cols]
+    if (length(xreg_coefs) == 0) return(NULL)
+
+    all_positive <- all(xreg_coefs > 0)
+
+    # Scenario loop
+    total_forecasts <- rep(NA_real_, length(scenarios))
+    scenario_rows   <- list()
+
+    for (s_idx in seq_along(scenarios)) {
+
+      scenario_pct <- scenarios[s_idx]
+      xreg_test_base <- as.numeric(test_df[1, xreg_cols])
+
+      xreg_test_scenario <- matrix(NA, nrow = n_test, ncol = length(xreg_cols))
+      colnames(xreg_test_scenario) <- xreg_cols
+
+      if (log_all_predictors) {
+        log_growth <- log(1 + scenario_pct / 100)
+        if (n_test == 1) {
+          additive_factors <- log_growth
+        } else {
+          additive_factors <- log_growth * (0:(n_test - 1)) / (n_test - 1)
+        }
+        for (j in seq_along(xreg_cols)) {
+          xreg_test_scenario[, j] <- xreg_test_base[j] + additive_factors
+        }
+      } else {
+        if (n_test == 1) {
+          growth_factors <- 1 + scenario_pct / 100
+        } else {
+          growth_factors <- 1 + (scenario_pct / 100) * (0:(n_test - 1)) / (n_test - 1)
+        }
+        for (j in seq_along(xreg_cols)) {
+          xreg_test_scenario[, j] <- xreg_test_base[j] * growth_factors
+        }
+      }
+
+      fc <- tryCatch(forecast(arima_model, xreg = xreg_test_scenario),
+                     error = function(e) NULL)
+      if (is.null(fc)) next
+
+      # Back-transform forecast to original scale for MAPE
+      total_forecast <- sum(back_transform(as.numeric(fc$mean), log_response))
+      total_forecasts[s_idx] <- total_forecast
+      year_mape <- (total_forecast - total_real) / total_real
+
+      scenario_rows[[s_idx]] <- data.frame(
+        response           = target_col,
+        model              = model_name,
+        n_lags_used        = length(xreg_cols),
+        scenario           = scenario_pct,
+        true_scenario      = true_scenario,
+        scenario_diff      = abs(true_scenario - scenario_pct),
+        total_real         = total_real,
+        total_forecast     = total_forecast,
+        year_mape          = year_mape,
+        baseline_year_mape = baseline_year_mape,
+        all_coef_positive  = all_positive,
+        log_response       = log_response,
+        log_predictors     = log_all_predictors,
+        training_period    = training_period,
+        testing_period     = testing_period,
+        stringsAsFactors   = FALSE
+      )
+    }
+
+    scenario_rows <- Filter(Negate(is.null), scenario_rows)
+    if (length(scenario_rows) == 0) return(NULL)
+
+    out <- do.call(rbind, scenario_rows)
+
+    valid <- total_forecasts[!is.na(total_forecasts)]
+    out$monotonic <- ifelse(length(valid) > 1 && all(diff(valid) > 0), "yes", "no")
+
+    return(out)
+  }
+
+  all_results <- list()
+  for (i in seq_along(all_combos)) {
+    res <- fit_single_model(all_combos[[i]])
+    if (!is.null(res)) all_results[[length(all_results) + 1]] <- res
+  }
+
+  if (length(all_results) == 0) return(NULL)
+  do.call(rbind, all_results)
+}
+
+# --- Define windows ---
+windows <- list(
+  list(train_start = "2020-04-01", train_end = "2021-03-31",
+       test_start  = "2021-04-01", test_end  = "2022-03-31"),
+  list(train_start = "2020-04-01", train_end = "2022-03-31",
+       test_start  = "2022-04-01", test_end  = "2023-03-31"),
+  list(train_start = "2020-04-01", train_end = "2023-03-31",
+       test_start  = "2023-04-01", test_end  = "2024-03-31"),
+  list(train_start = "2020-04-01", train_end = "2024-03-31",
+       test_start  = "2024-04-01", test_end  = "2025-03-31"),
+  list(train_start = "2020-04-01", train_end = "2025-03-31",
+       test_start  = "2025-04-01", test_end  = "2025-10-01")
+)
+
+# --- Run all windows ---
+results_list <- list()
+for (w in windows) {
+  res <- fit_single_window(
+    config      = CONFIG,
+    train_start = w$train_start,
+    train_end   = w$train_end,
+    test_start  = w$test_start,
+    test_end    = w$test_end
+  )
+  if (!is.null(res)) results_list[[length(results_list) + 1]] <- res
+}
+
+if (length(results_list) == 0) stop("No results from bulk run\n")
+
+results_df <- do.call(rbind, results_list)
+
+cat("\nBulk run complete. Total rows:", nrow(results_df), "\n")
+cat("Columns:", paste(colnames(results_df), collapse = ", "), "\n\n")
+print(head(results_df, 20))
+cat("\n")
+
+
+# =============================================================================
+# PART 2: INDIVIDUAL CHECKS
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 2: INDIVIDUAL CHECKS                  #\n")
+cat("##############################################\n\n")
+
+# ----- CHECK 1: pop_lag1, scenario +1% -----
+
+cat("--- CHECK 1: pop_lag1, scenario +1% ---\n\n")
+
+df1 <- mydf %>%
+  arrange(date)
+
+# Apply log transforms to match CONFIG
+if (CONFIG$log_response)       df1$apple_sales <- log(df1$apple_sales)
+if (CONFIG$log_all_predictors) df1$population  <- log(df1$population)
+
+df1 <- df1 %>%
+  mutate(pop_lag1 = dplyr::lag(population, 1))
+
+train1 <- df1 %>%
+  filter(date >= "2020-04-01" & date <= "2022-03-31") %>%
+  filter(!is.na(pop_lag1))
+
+test1 <- df1 %>%
+  filter(date >= "2022-04-01" & date <= "2023-03-31") %>%
+  filter(!is.na(pop_lag1))
+
+cat("Train rows:", nrow(train1), "| Test rows:", nrow(test1), "\n")
+
+scenario_pct_1 <- 1
+n_test_1 <- nrow(test1)
+
+xreg_train_1 <- as.matrix(train1[, "pop_lag1", drop = FALSE])
+
+if (CONFIG$log_all_predictors) {
+  log_growth_1 <- log(1 + scenario_pct_1 / 100)
+  additive_factors_1 <- log_growth_1 * (0:(n_test_1 - 1)) / (n_test_1 - 1)
+  xreg_test_1 <- as.matrix(test1$pop_lag1[1] + additive_factors_1)
+} else {
+  growth_factors_1 <- 1 + (scenario_pct_1 / 100) * (0:(n_test_1 - 1)) / (n_test_1 - 1)
+  xreg_test_1 <- as.matrix(test1$pop_lag1[1] * growth_factors_1)
+}
+colnames(xreg_test_1) <- "pop_lag1"
+
+model1 <- auto.arima(train1$apple_sales, xreg = xreg_train_1)
+fc1    <- forecast(model1, xreg = xreg_test_1)
+
+# Back-transform for MAPE
+check1_total_forecast <- sum(back_transform(as.numeric(fc1$mean), CONFIG$log_response))
+check1_total_real     <- sum(back_transform(test1$apple_sales, CONFIG$log_response))
+check1_year_mape      <- (check1_total_forecast - check1_total_real) / check1_total_real
+
+cat("Total real:    ", check1_total_real, "\n")
+cat("Total forecast:", check1_total_forecast, "\n")
+cat("Year MAPE:     ", check1_year_mape, "\n\n")
+
+
+# ----- CHECK 2: pop_lag1+pop_lag2+pop_lag3, scenario +1% -----
+
+cat("--- CHECK 2: pop_lag1+pop_lag2+pop_lag3, scenario +1% ---\n\n")
+
+df2 <- mydf %>%
+  arrange(date)
+
+# Apply log transforms to match CONFIG
+if (CONFIG$log_response)       df2$apple_sales <- log(df2$apple_sales)
+if (CONFIG$log_all_predictors) df2$population  <- log(df2$population)
+
+df2 <- df2 %>%
+  mutate(
+    pop_lag1 = dplyr::lag(population, 1),
+    pop_lag2 = dplyr::lag(population, 2),
+    pop_lag3 = dplyr::lag(population, 3)
+  )
+
+train2 <- df2 %>%
+  filter(date >= "2020-04-01" & date <= "2022-03-31") %>%
+  filter(!is.na(pop_lag1) & !is.na(pop_lag2) & !is.na(pop_lag3))
+
+test2 <- df2 %>%
+  filter(date >= "2022-04-01" & date <= "2023-03-31") %>%
+  filter(!is.na(pop_lag1) & !is.na(pop_lag2) & !is.na(pop_lag3))
+
+cat("Train rows:", nrow(train2), "| Test rows:", nrow(test2), "\n")
+
+scenario_pct_2 <- 1
+n_test_2 <- nrow(test2)
+
+lag_cols_2 <- c("pop_lag1", "pop_lag2", "pop_lag3")
+
+xreg_train_2 <- as.matrix(train2[, lag_cols_2, drop = FALSE])
+
+xreg_test_base_2 <- as.numeric(test2[1, lag_cols_2])
+xreg_test_2 <- matrix(NA, nrow = n_test_2, ncol = 3)
+colnames(xreg_test_2) <- lag_cols_2
+
+if (CONFIG$log_all_predictors) {
+  log_growth_2 <- log(1 + scenario_pct_2 / 100)
+  additive_factors_2 <- log_growth_2 * (0:(n_test_2 - 1)) / (n_test_2 - 1)
+  for (j in 1:3) {
+    xreg_test_2[, j] <- xreg_test_base_2[j] + additive_factors_2
+  }
+} else {
+  growth_factors_2 <- 1 + (scenario_pct_2 / 100) * (0:(n_test_2 - 1)) / (n_test_2 - 1)
+  for (j in 1:3) {
+    xreg_test_2[, j] <- xreg_test_base_2[j] * growth_factors_2
+  }
+}
+
+model2 <- auto.arima(train2$apple_sales, xreg = xreg_train_2)
+fc2    <- forecast(model2, xreg = xreg_test_2)
+
+# Back-transform for MAPE
+check2_total_forecast <- sum(back_transform(as.numeric(fc2$mean), CONFIG$log_response))
+check2_total_real     <- sum(back_transform(test2$apple_sales, CONFIG$log_response))
+check2_year_mape      <- (check2_total_forecast - check2_total_real) / check2_total_real
+
+cat("Total real:    ", check2_total_real, "\n")
+cat("Total forecast:", check2_total_forecast, "\n")
+cat("Year MAPE:     ", check2_year_mape, "\n\n")
+
+
+# =============================================================================
+# PART 3: COMPARISON
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 3: COMPARISON                         #\n")
+cat("##############################################\n\n")
+
+bulk1 <- results_df %>%
+  filter(model == "pop_lag1",
+         training_period == "2020-04-01 to 2022-03-31",
+         testing_period  == "2022-04-01 to 2023-03-31",
+         scenario == 1)
+
+cat("--- CHECK 1: pop_lag1 ---\n")
+cat("Bulk:       total_forecast =", bulk1$total_forecast, " year_mape =", bulk1$year_mape, "\n")
+cat("Individual: total_forecast =", check1_total_forecast, " year_mape =", check1_year_mape, "\n")
+cat("Match:", all.equal(bulk1$total_forecast, check1_total_forecast, tolerance = 1e-6), "\n\n")
+
+bulk2 <- results_df %>%
+  filter(model == "pop_lag1+pop_lag2+pop_lag3",
+         training_period == "2020-04-01 to 2022-03-31",
+         testing_period  == "2022-04-01 to 2023-03-31",
+         scenario == 1)
+
+cat("--- CHECK 2: pop_lag1+pop_lag2+pop_lag3 ---\n")
+cat("Bulk:       total_forecast =", bulk2$total_forecast, " year_mape =", bulk2$year_mape, "\n")
+cat("Individual: total_forecast =", check2_total_forecast, " year_mape =", check2_year_mape, "\n")
+cat("Match:", all.equal(bulk2$total_forecast, check2_total_forecast, tolerance = 1e-6), "\n\n")
+
+cat("Done!\n")
