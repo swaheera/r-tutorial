@@ -7,8 +7,9 @@ library(forecast)
 # df_name:            name of the data frame in your environment
 # date_col:           name of the date column
 # target_col:         name of the response variable (what you're forecasting)
-# pop_col:            name of the RAW population column (not a derived column)
-#                     the function creates all lags from this internally
+# pop_col:            name of the RAW population column (lags are created from this)
+# yoy_col:            name of the pre-computed YoY % change column in your data
+#                     this is used as the "true scenario" — no calculation done
 # n_lags:             how many lags to create (1 to n_lags)
 # scenario_min/max/step: range of growth scenarios to test (in %)
 # log_response:       log-transform the response before fitting?
@@ -19,6 +20,7 @@ CONFIG <- list(
   date_col           = "date",
   target_col         = "apple_sales",
   pop_col            = "population",
+  yoy_col            = "YOY_CHANGE",
   n_lags             = 4,
   scenario_min       = -3,
   scenario_max       = 3,
@@ -30,21 +32,21 @@ CONFIG <- list(
 # =============================================================================
 # DATA SETUP (simulated — replace with your own)
 # =============================================================================
-# Your data frame needs exactly 3 columns:
-#   1. a date column (monthly)
-#   2. the response variable
-#   3. the raw population variable
-# Nothing else. No lags, no YoY, no derived columns.
 
 set.seed(42)
 dates <- seq.Date(from = as.Date("2020-04-01"), by = "month", length.out = 67)
 population <- cumsum(rnorm(67, mean = 0.5, sd = 1)) + 100
 apple_sales <- 500 + 2 * population + rnorm(67, sd = 10)
 
+# Simulated YoY — in your real data this column already exists
+pop_12m_ago <- dplyr::lag(population, 12)
+yoy_change  <- (population - pop_12m_ago) / pop_12m_ago * 100
+
 mydf <- data.frame(
   date = dates,
   apple_sales = apple_sales,
-  population = population
+  population = population,
+  YOY_CHANGE = yoy_change
 )
 
 # =============================================================================
@@ -62,6 +64,7 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
   date_col   <- config$date_col
   target_col <- config$target_col
   pop_col    <- config$pop_col
+  yoy_col    <- config$yoy_col
   n_lags     <- config$n_lags
   scenario_min       <- config$scenario_min
   scenario_max       <- config$scenario_max
@@ -73,7 +76,7 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
   df <- get(df_name, envir = parent.frame())
 
   # Validate columns exist
-  required_cols <- c(date_col, target_col, pop_col)
+  required_cols <- c(date_col, target_col, pop_col, yoy_col)
   missing_cols <- setdiff(required_cols, colnames(df))
   if (length(missing_cols) > 0) {
     stop("Columns not found in '", df_name, "': ", paste(missing_cols, collapse = ", "),
@@ -83,15 +86,13 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
   training_period <- paste(train_start, "to", train_end)
   testing_period  <- paste(test_start, "to", test_end)
 
-  # ---- Sort by date ----
   df <- df %>% arrange(.data[[date_col]])
 
-  # ---- Apply log transforms BEFORE creating lags ----
+  # ---- Log transforms before creating lags ----
   if (log_response)       df[[target_col]] <- log(df[[target_col]])
   if (log_all_predictors) df[[pop_col]]    <- log(df[[pop_col]])
 
   # ---- Create lags from pop_col ----
-  # These are the ONLY derived columns. Nothing needs to exist beforehand.
   for (i in 1:n_lags) {
     df <- df %>% mutate(!!paste0("pop_lag", i) := dplyr::lag(.data[[pop_col]], i))
   }
@@ -106,6 +107,9 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
                                 .data[[date_col]] <= as.Date(test_end))
 
   cat("Data:", df_name, "| Window:", training_period, "->", testing_period, "\n")
+
+  # ---- True scenario: average YoY over test window ----
+  true_scenario <- mean(test_df_all[[yoy_col]], na.rm = TRUE)
 
   # ---- Pure ARIMA baseline (no xreg) ----
   baseline_model <- tryCatch(auto.arima(train_df_all[[target_col]]), error = function(e) NULL)
@@ -126,22 +130,16 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
   all_combos <- lapply(1:n_lags, function(k) combn(lag_cols, k, simplify = FALSE))
   all_combos <- unlist(all_combos, recursive = FALSE)
 
-  # ---- Fit one model (one lag combination) ----
   fit_single_model <- function(xreg_cols) {
 
     model_name <- paste(xreg_cols, collapse = "+")
 
-    # Filter complete cases only on THIS model's lag columns
     train_df <- train_df_all %>% filter(complete.cases(pick(all_of(xreg_cols))))
     test_df  <- test_df_all %>% filter(complete.cases(pick(all_of(xreg_cols))))
 
     n_train <- nrow(train_df)
     n_test  <- nrow(test_df)
     if (n_train < 10 || n_test < 1) return(NULL)
-
-    # True scenario: % change in pop_col from first to last test month
-    test_pop <- test_df[[pop_col]]
-    true_scenario <- ((test_pop[n_test] - test_pop[1]) / test_pop[1]) * 100
 
     total_real <- sum(test_df[[target_col]])
 
@@ -166,12 +164,10 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
       scenario_pct <- scenarios[s_idx]
       xreg_test_base <- as.numeric(test_df[1, xreg_cols])
 
-      # Build scenario xreg for the full test window
       xreg_test_scenario <- matrix(NA, nrow = n_test, ncol = length(xreg_cols))
       colnames(xreg_test_scenario) <- xreg_cols
 
       if (log_all_predictors) {
-        # In log space: log(pop * (1+g)) = log(pop) + log(1+g)
         log_growth <- log(1 + scenario_pct / 100)
         if (n_test == 1) {
           additive_factors <- log_growth
@@ -182,7 +178,6 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
           xreg_test_scenario[, j] <- xreg_test_base[j] + additive_factors
         }
       } else {
-        # In level space: pop * (1+g)
         if (n_test == 1) {
           growth_factors <- 1 + scenario_pct / 100
         } else {
@@ -193,7 +188,6 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
         }
       }
 
-      # Forecast full test window at once
       fc <- tryCatch(forecast(arima_model, xreg = xreg_test_scenario),
                      error = function(e) NULL)
       if (is.null(fc)) next
@@ -233,7 +227,6 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
     return(out)
   }
 
-  # ---- Run all models ----
   all_results <- list()
   for (i in seq_along(all_combos)) {
     res <- fit_single_model(all_combos[[i]])
