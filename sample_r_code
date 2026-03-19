@@ -1,21 +1,7 @@
 library(dplyr)
 library(forecast)
-
-# =============================================================================
-# CONFIG — change everything here, nowhere else
-# =============================================================================
-
-CONFIG <- list(
-  date_col           = "date",
-  target_col         = "apple_sales",
-  pop_col            = "population",
-  n_lags             = 4,
-  scenario_min       = -3,
-  scenario_max       = 3,
-  scenario_step      = 0.5,
-  log_response       = FALSE,
-  log_all_predictors = FALSE
-)
+library(tseries)
+library(lmtest)
 
 # =============================================================================
 # DATA SETUP
@@ -40,17 +26,21 @@ cat("##############################################\n")
 cat("# PART 1: BULK VERSION                       #\n")
 cat("##############################################\n\n")
 
-fit_single_window <- function(df, train_start, train_end, test_start, test_end, cfg) {
+fit_single_window <- function(df_name,
+                              train_start, train_end,
+                              test_start, test_end,
+                              date_col = "date",
+                              target_col = "apple_sales",
+                              pop_col = "population",
+                              n_lags = 4,
+                              scenario_min = -3,
+                              scenario_max = 3,
+                              scenario_step = 0.5,
+                              log_response = FALSE,
+                              log_all_predictors = FALSE) {
 
-  date_col           <- cfg$date_col
-  target_col         <- cfg$target_col
-  pop_col            <- cfg$pop_col
-  n_lags             <- cfg$n_lags
-  scenario_min       <- cfg$scenario_min
-  scenario_max       <- cfg$scenario_max
-  scenario_step      <- cfg$scenario_step
-  log_response       <- cfg$log_response
-  log_all_predictors <- cfg$log_all_predictors
+  # Retrieve the data frame by name from the calling environment
+  df <- get(df_name, envir = parent.frame())
 
   training_period <- paste(train_start, "to", train_end)
   testing_period  <- paste(test_start, "to", test_end)
@@ -58,10 +48,14 @@ fit_single_window <- function(df, train_start, train_end, test_start, test_end, 
   df <- df %>% arrange(.data[[date_col]])
 
   # Apply log transforms before creating lags
-  if (log_response)       df[[target_col]] <- log(df[[target_col]])
-  if (log_all_predictors) df[[pop_col]]    <- log(df[[pop_col]])
+  if (log_response) {
+    df[[target_col]] <- log(df[[target_col]])
+  }
+  if (log_all_predictors) {
+    df[[pop_col]] <- log(df[[pop_col]])
+  }
 
-  # Create lags
+  # Create lags (inherit log if applied)
   for (i in 1:n_lags) {
     df <- df %>% mutate(!!paste0("pop_lag", i) := dplyr::lag(.data[[pop_col]], i))
   }
@@ -74,9 +68,25 @@ fit_single_window <- function(df, train_start, train_end, test_start, test_end, 
   test_df_all  <- df %>% filter(.data[[date_col]] >= as.Date(test_start) &
                                 .data[[date_col]] <= as.Date(test_end))
 
-  cat("Window:", training_period, "->", testing_period, "\n")
+  cat("Data:", df_name, "| Window:", training_period, "->", testing_period, "\n")
 
-  # All lag combinations
+  # ---- Pure ARIMA baseline ----
+  baseline_model <- tryCatch(auto.arima(train_df_all[[target_col]]), error = function(e) NULL)
+  baseline_aic <- if (!is.null(baseline_model)) AIC(baseline_model) else NA
+  baseline_bic <- if (!is.null(baseline_model)) BIC(baseline_model) else NA
+
+  n_test_full <- nrow(test_df_all)
+  baseline_fc <- if (!is.null(baseline_model)) {
+    tryCatch(forecast(baseline_model, h = n_test_full), error = function(e) NULL)
+  } else NULL
+
+  baseline_total_forecast <- if (!is.null(baseline_fc)) sum(as.numeric(baseline_fc$mean)) else NA
+  baseline_total_real     <- sum(test_df_all[[target_col]])
+  baseline_year_mape      <- if (!is.na(baseline_total_forecast)) {
+    (baseline_total_forecast - baseline_total_real) / baseline_total_real
+  } else NA
+
+  # ---- All lag combinations ----
   all_combos <- lapply(1:n_lags, function(k) combn(lag_cols, k, simplify = FALSE))
   all_combos <- unlist(all_combos, recursive = FALSE)
 
@@ -96,9 +106,9 @@ fit_single_window <- function(df, train_start, train_end, test_start, test_end, 
     total_real <- sum(test_df[[target_col]])
 
     xreg_train <- as.matrix(train_df[, xreg_cols, drop = FALSE])
+    y_train    <- train_df[[target_col]]
 
-    arima_model <- tryCatch(auto.arima(train_df[[target_col]], xreg = xreg_train),
-                            error = function(e) NULL)
+    arima_model <- tryCatch(auto.arima(y_train, xreg = xreg_train), error = function(e) NULL)
     if (is.null(arima_model)) return(NULL)
 
     coefs <- coef(arima_model)
@@ -107,6 +117,29 @@ fit_single_window <- function(df, train_start, train_end, test_start, test_end, 
 
     all_positive <- all(xreg_coefs > 0)
 
+    # Diagnostics
+    resids <- residuals(arima_model)
+    adf_pval     <- tryCatch(adf.test(resids)$p.value, error = function(e) NA)
+    shapiro_pval <- tryCatch(shapiro.test(resids)$p.value, error = function(e) NA)
+    bp_pval <- tryCatch({
+      bp_lm <- lm(I(resids^2) ~ as.numeric(fitted(arima_model)))
+      bptest(bp_lm)$p.value
+    }, error = function(e) NA)
+    kpss_pval <- tryCatch(kpss.test(y_train)$p.value, error = function(e) NA)
+
+    model_aic <- AIC(arima_model)
+    model_bic <- BIC(arima_model)
+
+    coef_pvals <- tryCatch({
+      ct <- coeftest(arima_model)
+      pv <- ct[, 4]
+      pv[names(pv) %in% xreg_cols]
+    }, error = function(e) rep(NA, length(xreg_cols)))
+
+    all_xreg_significant <- all(coef_pvals < 0.05, na.rm = TRUE)
+    max_xreg_pval        <- max(coef_pvals, na.rm = TRUE)
+
+    # ---- Scenario loop ----
     total_forecasts <- rep(NA_real_, length(scenarios))
     scenario_rows   <- list()
 
@@ -121,26 +154,25 @@ fit_single_window <- function(df, train_start, train_end, test_start, test_end, 
       if (log_all_predictors) {
         log_growth <- log(1 + scenario_pct / 100)
         if (n_test == 1) {
-          add_factors <- log_growth
+          additive_factors <- log_growth
         } else {
-          add_factors <- log_growth * (0:(n_test - 1)) / (n_test - 1)
+          additive_factors <- log_growth * (0:(n_test - 1)) / (n_test - 1)
         }
         for (j in seq_along(xreg_cols)) {
-          xreg_test_scenario[, j] <- xreg_test_base[j] + add_factors
+          xreg_test_scenario[, j] <- xreg_test_base[j] + additive_factors
         }
       } else {
         if (n_test == 1) {
-          gf <- 1 + scenario_pct / 100
+          growth_factors <- 1 + scenario_pct / 100
         } else {
-          gf <- 1 + (scenario_pct / 100) * (0:(n_test - 1)) / (n_test - 1)
+          growth_factors <- 1 + (scenario_pct / 100) * (0:(n_test - 1)) / (n_test - 1)
         }
         for (j in seq_along(xreg_cols)) {
-          xreg_test_scenario[, j] <- xreg_test_base[j] * gf
+          xreg_test_scenario[, j] <- xreg_test_base[j] * growth_factors
         }
       }
 
-      fc <- tryCatch(forecast(arima_model, xreg = xreg_test_scenario),
-                     error = function(e) NULL)
+      fc <- tryCatch(forecast(arima_model, xreg = xreg_test_scenario), error = function(e) NULL)
       if (is.null(fc)) next
 
       total_forecast <- sum(as.numeric(fc$mean))
@@ -148,20 +180,34 @@ fit_single_window <- function(df, train_start, train_end, test_start, test_end, 
       year_mape <- (total_forecast - total_real) / total_real
 
       scenario_rows[[s_idx]] <- data.frame(
-        model            = model_name,
-        n_lags_used      = length(xreg_cols),
-        scenario         = scenario_pct,
-        true_scenario    = true_scenario,
-        scenario_diff    = abs(true_scenario - scenario_pct),
-        total_real       = total_real,
-        total_forecast   = total_forecast,
-        year_mape        = year_mape,
-        all_coef_positive = all_positive,
-        log_response     = log_response,
-        log_predictors   = log_all_predictors,
-        training_period  = training_period,
-        testing_period   = testing_period,
-        stringsAsFactors = FALSE
+        data_source          = df_name,
+        model                = model_name,
+        n_lags_used          = length(xreg_cols),
+        scenario             = scenario_pct,
+        true_scenario        = true_scenario,
+        scenario_diff        = abs(true_scenario - scenario_pct),
+        total_real           = total_real,
+        total_forecast       = total_forecast,
+        year_mape            = year_mape,
+        all_coef_positive    = all_positive,
+        all_xreg_significant = all_xreg_significant,
+        max_xreg_pval        = max_xreg_pval,
+        model_aic            = model_aic,
+        model_bic            = model_bic,
+        baseline_aic         = baseline_aic,
+        baseline_bic         = baseline_bic,
+        baseline_year_mape   = baseline_year_mape,
+        aic_improvement      = baseline_aic - model_aic,
+        bic_improvement      = baseline_bic - model_bic,
+        adf_resid_pval       = adf_pval,
+        shapiro_resid_pval   = shapiro_pval,
+        bp_resid_pval        = bp_pval,
+        kpss_level_pval      = kpss_pval,
+        log_response         = log_response,
+        log_predictors       = log_all_predictors,
+        training_period      = training_period,
+        testing_period       = testing_period,
+        stringsAsFactors     = FALSE
       )
     }
 
@@ -203,8 +249,22 @@ windows <- list(
 # --- Run all windows ---
 results_list <- list()
 for (w in windows) {
-  res <- fit_single_window(mydf, w$train_start, w$train_end,
-                           w$test_start, w$test_end, CONFIG)
+  res <- fit_single_window(
+    df_name     = "mydf",
+    train_start = w$train_start,
+    train_end   = w$train_end,
+    test_start  = w$test_start,
+    test_end    = w$test_end,
+    date_col    = "date",
+    target_col  = "apple_sales",
+    pop_col     = "population",
+    n_lags      = 4,
+    scenario_min       = -3,
+    scenario_max       = 3,
+    scenario_step      = 0.5,
+    log_response       = FALSE,
+    log_all_predictors = FALSE
+  )
   if (!is.null(res)) results_list[[length(results_list) + 1]] <- res
 }
 
@@ -244,8 +304,9 @@ test1 <- df1 %>%
 
 cat("Train rows:", nrow(train1), "| Test rows:", nrow(test1), "\n")
 
+scenario_pct_1 <- 1
 n_test_1 <- nrow(test1)
-growth_factors_1 <- 1 + (1 / 100) * (0:(n_test_1 - 1)) / (n_test_1 - 1)
+growth_factors_1 <- 1 + (scenario_pct_1 / 100) * (0:(n_test_1 - 1)) / (n_test_1 - 1)
 
 xreg_train_1 <- as.matrix(train1[, "pop_lag1", drop = FALSE])
 xreg_test_1  <- as.matrix(test1$pop_lag1[1] * growth_factors_1)
@@ -285,10 +346,12 @@ test2 <- df2 %>%
 
 cat("Train rows:", nrow(train2), "| Test rows:", nrow(test2), "\n")
 
+scenario_pct_2 <- 1
 n_test_2 <- nrow(test2)
-growth_factors_2 <- 1 + (1 / 100) * (0:(n_test_2 - 1)) / (n_test_2 - 1)
+growth_factors_2 <- 1 + (scenario_pct_2 / 100) * (0:(n_test_2 - 1)) / (n_test_2 - 1)
 
 lag_cols_2 <- c("pop_lag1", "pop_lag2", "pop_lag3")
+
 xreg_train_2 <- as.matrix(train2[, lag_cols_2, drop = FALSE])
 
 xreg_test_base_2 <- as.numeric(test2[1, lag_cols_2])
