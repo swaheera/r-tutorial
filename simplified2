@@ -47,13 +47,48 @@ forecast_banana <- sum(exp(as.numeric(fc_banana$mean)))
 # --- BANANA (residual: total - apples) ---
 forecast_banana_residual <- forecast_total - forecast_apples
 
+# MONTHLY vectors (back-transformed to original scale)
+monthly_real_total    <- exp(test$log_total)
+monthly_real_apples   <- exp(test$log_apples)
+monthly_real_banana   <- exp(test$log_banana)
+
+monthly_fc_total      <- exp(as.numeric(fc_total$mean))
+monthly_fc_apples     <- exp(as.numeric(fc_apples$mean))
+monthly_fc_banana     <- exp(as.numeric(fc_banana$mean))
+monthly_fc_banana_res <- monthly_fc_total - monthly_fc_apples
+
+avg_month_mape_signed <- c(
+  mean((monthly_fc_total  - monthly_real_total)  / monthly_real_total),
+  mean((monthly_fc_apples - monthly_real_apples) / monthly_real_apples),
+  mean((monthly_fc_banana - monthly_real_banana) / monthly_real_banana),
+  mean((monthly_fc_banana_res - monthly_real_banana) / monthly_real_banana)
+)
+
+avg_month_mape_abs <- c(
+  mean(abs((monthly_fc_total  - monthly_real_total)  / monthly_real_total)),
+  mean(abs((monthly_fc_apples - monthly_real_apples) / monthly_real_apples)),
+  mean(abs((monthly_fc_banana - monthly_real_banana) / monthly_real_banana)),
+  mean(abs((monthly_fc_banana_res - monthly_real_banana) / monthly_real_banana))
+)
+
+# TRUE POP GROWTH in test period (on original scale)
+true_pop_growth <- ((test$population[n_test] - test$population[1]) / test$population[1]) * 100
+
 # RESULTS
+total_real_vec     <- c(real_total, real_apples, real_banana, real_banana)
+total_forecast_vec <- c(forecast_total, forecast_apples, forecast_banana, forecast_banana_residual)
+
 results <- data.frame(
-  response       = c("total", "apples", "banana_direct", "banana_residual"),
-  total_real     = c(real_total, real_apples, real_banana, real_banana),
-  total_forecast = c(forecast_total, forecast_apples, forecast_banana, forecast_banana_residual),
-  stringsAsFactors = FALSE
-) %>%
-  mutate(year_mape = (total_forecast - total_real) / total_real)
+  response            = c("total", "apples", "banana_method1", "banana_method2"),
+  total_real          = total_real_vec,
+  total_forecast      = total_forecast_vec,
+  true_pop_growth     = true_pop_growth,
+  scenario            = scenario_pct,
+  year_mape_signed    = (total_forecast_vec - total_real_vec) / total_real_vec,
+  year_mape_abs       = abs((total_forecast_vec - total_real_vec) / total_real_vec),
+  avg_month_mape_signed = avg_month_mape_signed,
+  avg_month_mape_abs    = avg_month_mape_abs,
+  stringsAsFactors    = FALSE
+)
 
 print(results)
