@@ -1,0 +1,198 @@
+library(dplyr)
+library(forecast)
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+CONFIG <- list(
+  df_name    = "mydf",
+  date_col   = "date",
+  target_col = "prop",        # will be created as apple / total
+  min_train  = 24,            # start with 24 months of training
+  h          = 12             # always forecast 12 months ahead
+)
+
+# =============================================================================
+# DATA SETUP (simulated — replace with your own)
+# =============================================================================
+
+set.seed(42)
+n <- 67
+dates <- seq.Date(from = as.Date("2020-04-01"), by = "month", length.out = n)
+total <- rpois(n, 1000)
+apple <- rbinom(n, size = total, prob = 0.3 + cumsum(rnorm(n, 0, 0.005)))
+
+mydf <- data.frame(
+  date  = dates,
+  apple = apple,
+  banana = total - apple,
+  total = total
+)
+
+# Create prop
+mydf$prop <- mydf$apple / mydf$total
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+logit     <- function(p) log(p / (1 - p))
+inv_logit <- function(x) 1 / (1 + exp(-x))
+
+# =============================================================================
+# PART 1: EXPANDING-WINDOW FORECAST
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 1: EXPANDING-WINDOW FORECAST          #\n")
+cat("##############################################\n\n")
+
+df        <- get(CONFIG$df_name)
+df        <- df %>% arrange(.data[[CONFIG$date_col]])
+min_train <- CONFIG$min_train
+h         <- CONFIG$h
+n_total   <- nrow(df)
+
+max_train_end <- n_total - 1
+
+results <- list()
+
+for (train_end in min_train:max_train_end) {
+
+  test_start <- train_end + 1
+  test_end   <- min(train_end + h, n_total)
+  n_test     <- test_end - test_start + 1
+
+  train_data <- df[1:train_end, ]
+  test_data  <- df[test_start:test_end, ]
+
+  y_train <- logit(train_data[[CONFIG$target_col]])
+
+  fit <- tryCatch(auto.arima(y_train), error = function(e) NULL)
+  if (is.null(fit)) next
+
+  fc <- tryCatch(forecast(fit, h = n_test), error = function(e) NULL)
+  if (is.null(fc)) next
+
+  pred_prop <- inv_logit(as.numeric(fc$mean))
+  real_prop <- test_data[[CONFIG$target_col]]
+
+  avg_mape <- mean(abs((pred_prop - real_prop) / real_prop))
+
+  train_window <- paste(train_data[[CONFIG$date_col]][1], "to",
+                        train_data[[CONFIG$date_col]][train_end])
+  test_window  <- paste(test_data[[CONFIG$date_col]][1], "to",
+                        test_data[[CONFIG$date_col]][n_test])
+
+  results[[length(results) + 1]] <- data.frame(
+    train_window = train_window,
+    test_window  = test_window,
+    avg_mape     = avg_mape,
+    stringsAsFactors = FALSE
+  )
+}
+
+if (length(results) == 0) stop("No results produced.\n")
+
+results_df <- do.call(rbind, results)
+
+cat("Expanding-window forecast complete. Total rows:", nrow(results_df), "\n\n")
+print(results_df)
+cat("\n")
+
+# =============================================================================
+# PART 2: INDIVIDUAL CHECKS
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 2: INDIVIDUAL CHECKS                  #\n")
+cat("##############################################\n\n")
+
+# ----- CHECK 1: Train on first 24 months, test next 12 -----
+
+cat("--- CHECK 1: train months 1-24, test months 25-36 ---\n\n")
+
+train_c1 <- df[1:24, ]
+test_c1  <- df[25:36, ]
+
+y_c1     <- logit(train_c1$prop)
+fit_c1   <- auto.arima(y_c1)
+fc_c1    <- forecast(fit_c1, h = 12)
+
+pred_c1  <- inv_logit(as.numeric(fc_c1$mean))
+real_c1  <- test_c1$prop
+mape_c1  <- mean(abs((pred_c1 - real_c1) / real_c1))
+
+cat("Predicted props:", round(pred_c1, 4), "\n")
+cat("Real props:     ", round(real_c1, 4), "\n")
+cat("Avg MAPE:       ", mape_c1, "\n\n")
+
+# ----- CHECK 2: Train on first 30 months, test next 12 -----
+
+cat("--- CHECK 2: train months 1-30, test months 31-42 ---\n\n")
+
+train_c2 <- df[1:30, ]
+test_c2  <- df[31:42, ]
+
+y_c2     <- logit(train_c2$prop)
+fit_c2   <- auto.arima(y_c2)
+fc_c2    <- forecast(fit_c2, h = 12)
+
+pred_c2  <- inv_logit(as.numeric(fc_c2$mean))
+real_c2  <- test_c2$prop
+mape_c2  <- mean(abs((pred_c2 - real_c2) / real_c2))
+
+cat("Predicted props:", round(pred_c2, 4), "\n")
+cat("Real props:     ", round(real_c2, 4), "\n")
+cat("Avg MAPE:       ", mape_c2, "\n\n")
+
+# ----- CHECK 3: Train on first 40 months, test next 12 -----
+
+cat("--- CHECK 3: train months 1-40, test months 41-52 ---\n\n")
+
+train_c3 <- df[1:40, ]
+test_c3  <- df[41:52, ]
+
+y_c3     <- logit(train_c3$prop)
+fit_c3   <- auto.arima(y_c3)
+fc_c3    <- forecast(fit_c3, h = 12)
+
+pred_c3  <- inv_logit(as.numeric(fc_c3$mean))
+real_c3  <- test_c3$prop
+mape_c3  <- mean(abs((pred_c3 - real_c3) / real_c3))
+
+cat("Predicted props:", round(pred_c3, 4), "\n")
+cat("Real props:     ", round(real_c3, 4), "\n")
+cat("Avg MAPE:       ", mape_c3, "\n\n")
+
+# =============================================================================
+# PART 3: COMPARISON
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 3: COMPARISON                         #\n")
+cat("##############################################\n\n")
+
+# Match check 1: train_end=24 is the 1st row in results_df
+bulk_c1 <- results_df[results_df$train_window == paste(df$date[1], "to", df$date[24]), ]
+cat("--- CHECK 1: train 1-24 ---\n")
+cat("Bulk avg_mape:      ", bulk_c1$avg_mape, "\n")
+cat("Individual avg_mape:", mape_c1, "\n")
+cat("Match:", all.equal(bulk_c1$avg_mape, mape_c1, tolerance = 1e-6), "\n\n")
+
+# Match check 2: train_end=30
+bulk_c2 <- results_df[results_df$train_window == paste(df$date[1], "to", df$date[30]), ]
+cat("--- CHECK 2: train 1-30 ---\n")
+cat("Bulk avg_mape:      ", bulk_c2$avg_mape, "\n")
+cat("Individual avg_mape:", mape_c2, "\n")
+cat("Match:", all.equal(bulk_c2$avg_mape, mape_c2, tolerance = 1e-6), "\n\n")
+
+# Match check 3: train_end=40
+bulk_c3 <- results_df[results_df$train_window == paste(df$date[1], "to", df$date[40]), ]
+cat("--- CHECK 3: train 1-40 ---\n")
+cat("Bulk avg_mape:      ", bulk_c3$avg_mape, "\n")
+cat("Individual avg_mape:", mape_c3, "\n")
+cat("Match:", all.equal(bulk_c3$avg_mape, mape_c3, tolerance = 1e-6), "\n\n")
+
+cat("Done!\n")
