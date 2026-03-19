@@ -92,3 +92,111 @@ results <- data.frame(
 )
 
 print(results)
+#################################################
+library(dplyr)
+library(forecast)
+
+# ── DEFINE YOUR GRID ──
+windows <- data.frame(
+  window_id   = c("w1", "w2", "w3"),
+  train_start = as.Date(c("2019-04-01", "2020-04-01", "2021-04-01")),
+  train_end   = as.Date(c("2022-03-31", "2023-03-31", "2024-03-31")),
+  test_start  = as.Date(c("2022-04-01", "2023-04-01", "2024-04-01")),
+  test_end    = as.Date(c("2023-03-31", "2024-03-31", "2025-03-31"))
+)
+
+scenarios <- c(0, 1, 2, 5)
+
+param_grid <- merge(windows, data.frame(scenario_pct = scenarios), all = TRUE)
+
+# ── PREP DATA ONCE ──
+df <- mydf %>%
+  arrange(date) %>%
+  mutate(log_total  = log(total),
+         log_apples = log(apples),
+         log_banana = log(banana),
+         log_pop    = log(population),
+         pop_lag1   = dplyr::lag(log_pop, 1))
+
+# ── WORKER FUNCTION ──
+run_one <- function(train_start, train_end, test_start, test_end,
+                    scenario_pct, window_id) {
+
+  train <- df %>% filter(date >= train_start & date <= train_end & !is.na(pop_lag1))
+  test  <- df %>% filter(date >= test_start  & date <= test_end  & !is.na(pop_lag1))
+
+  n_test     <- nrow(test)
+  if (n_test == 0) return(NULL)
+
+  factors    <- log(1 + scenario_pct / 100) * (0:(n_test - 1)) / (n_test - 1)
+  xreg_train <- as.matrix(train$pop_lag1)
+  xreg_test  <- as.matrix(test$pop_lag1[1] + factors)
+
+  # --- fit three models ---
+  model_total  <- auto.arima(train$log_total,  xreg = xreg_train)
+  model_apples <- auto.arima(train$log_apples, xreg = xreg_train)
+  model_banana <- auto.arima(train$log_banana, xreg = xreg_train)
+
+  fc_total  <- forecast(model_total,  xreg = xreg_test)
+  fc_apples <- forecast(model_apples, xreg = xreg_test)
+  fc_banana <- forecast(model_banana, xreg = xreg_test)
+
+  # monthly back-transformed
+  m_real_total  <- exp(test$log_total)
+  m_real_apples <- exp(test$log_apples)
+  m_real_banana <- exp(test$log_banana)
+  m_fc_total    <- exp(as.numeric(fc_total$mean))
+  m_fc_apples   <- exp(as.numeric(fc_apples$mean))
+  m_fc_banana   <- exp(as.numeric(fc_banana$mean))
+  m_fc_ban_res  <- m_fc_total - m_fc_apples
+
+  # annual totals
+  real_vec <- c(sum(m_real_total), sum(m_real_apples),
+                sum(m_real_banana), sum(m_real_banana))
+  fc_vec   <- c(sum(m_fc_total), sum(m_fc_apples),
+                sum(m_fc_banana), sum(m_fc_total) - sum(m_fc_apples))
+
+  avg_month_mape_signed <- c(
+    mean((m_fc_total    - m_real_total)  / m_real_total),
+    mean((m_fc_apples   - m_real_apples) / m_real_apples),
+    mean((m_fc_banana   - m_real_banana) / m_real_banana),
+    mean((m_fc_ban_res  - m_real_banana) / m_real_banana)
+  )
+  avg_month_mape_abs <- c(
+    mean(abs((m_fc_total    - m_real_total)  / m_real_total)),
+    mean(abs((m_fc_apples   - m_real_apples) / m_real_apples)),
+    mean(abs((m_fc_banana   - m_real_banana) / m_real_banana)),
+    mean(abs((m_fc_ban_res  - m_real_banana) / m_real_banana))
+  )
+
+  true_pop_growth <- ((test$population[n_test] - test$population[1]) /
+                        test$population[1]) * 100
+
+  data.frame(
+    window_id             = window_id,
+    response              = c("total", "apples", "banana_method1", "banana_method2"),
+    total_real            = real_vec,
+    total_forecast        = fc_vec,
+    true_pop_growth       = true_pop_growth,
+    scenario              = scenario_pct,
+    year_mape_signed      = (fc_vec - real_vec) / real_vec,
+    year_mape_abs         = abs((fc_vec - real_vec) / real_vec),
+    avg_month_mape_signed = avg_month_mape_signed,
+    avg_month_mape_abs    = avg_month_mape_abs,
+    stringsAsFactors      = FALSE
+  )
+}
+
+# ── RUN OVER ALL COMBOS ──
+results <- do.call(rbind, Map(
+  run_one,
+  train_start  = param_grid$train_start,
+  train_end    = param_grid$train_end,
+  test_start   = param_grid$test_start,
+  test_end     = param_grid$test_end,
+  scenario_pct = param_grid$scenario_pct,
+  window_id    = param_grid$window_id
+))
+
+rownames(results) <- NULL
+print(results)
