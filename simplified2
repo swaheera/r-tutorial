@@ -1,0 +1,59 @@
+library(dplyr)
+library(forecast)
+
+# CONFIG
+train_start  <- "2020-04-01"
+train_end    <- "2023-03-31"
+test_start   <- "2023-04-01"
+test_end     <- "2024-03-31"
+scenario_pct <- 1
+
+# PREP — one df with all log columns and lag
+df <- mydf %>%
+  arrange(date) %>%
+  mutate(log_total  = log(total),
+         log_apples = log(apples),
+         log_banana = log(banana),
+         log_pop    = log(population),
+         pop_lag1   = dplyr::lag(log_pop, 1))
+
+train <- df %>% filter(date >= train_start & date <= train_end & !is.na(pop_lag1))
+test  <- df %>% filter(date >= test_start  & date <= test_end  & !is.na(pop_lag1))
+
+# SCENARIO XREG (same for all models)
+n_test    <- nrow(test)
+factors   <- log(1 + scenario_pct / 100) * (0:(n_test - 1)) / (n_test - 1)
+xreg_train <- as.matrix(train$pop_lag1)
+xreg_test  <- as.matrix(test$pop_lag1[1] + factors)
+
+# --- TOTAL ---
+model_total <- auto.arima(train$log_total, xreg = xreg_train)
+fc_total    <- forecast(model_total, xreg = xreg_test)
+real_total     <- sum(exp(test$log_total))
+forecast_total <- sum(exp(as.numeric(fc_total$mean)))
+
+# --- APPLES ---
+model_apples <- auto.arima(train$log_apples, xreg = xreg_train)
+fc_apples    <- forecast(model_apples, xreg = xreg_test)
+real_apples     <- sum(exp(test$log_apples))
+forecast_apples <- sum(exp(as.numeric(fc_apples$mean)))
+
+# --- BANANA (direct) ---
+model_banana <- auto.arima(train$log_banana, xreg = xreg_train)
+fc_banana    <- forecast(model_banana, xreg = xreg_test)
+real_banana     <- sum(exp(test$log_banana))
+forecast_banana <- sum(exp(as.numeric(fc_banana$mean)))
+
+# --- BANANA (residual: total - apples) ---
+forecast_banana_residual <- forecast_total - forecast_apples
+
+# RESULTS
+results <- data.frame(
+  response       = c("total", "apples", "banana_direct", "banana_residual"),
+  total_real     = c(real_total, real_apples, real_banana, real_banana),
+  total_forecast = c(forecast_total, forecast_apples, forecast_banana, forecast_banana_residual),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(year_mape = (total_forecast - total_real) / total_real)
+
+print(results)
