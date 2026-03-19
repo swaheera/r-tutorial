@@ -1,0 +1,37 @@
+library(dplyr)
+library(forecast)
+
+# CONFIG
+train_start  <- "2020-04-01"
+train_end    <- "2023-03-31"
+test_start   <- "2023-04-01"
+test_end     <- "2024-03-31"
+scenario_pct <- 1
+
+# PREP
+df <- mydf %>%
+  arrange(date) %>%
+  mutate(log_sales = log(apple_sales),
+         log_pop   = log(population),
+         pop_lag1  = dplyr::lag(log_pop, 1))
+
+train <- df %>% filter(date >= train_start & date <= train_end & !is.na(pop_lag1))
+test  <- df %>% filter(date >= test_start  & date <= test_end  & !is.na(pop_lag1))
+
+# FIT
+model <- auto.arima(train$log_sales, xreg = as.matrix(train$pop_lag1))
+
+# SCENARIO XREG
+n_test  <- nrow(test)
+factors <- log(1 + scenario_pct / 100) * (0:(n_test - 1)) / (n_test - 1)
+xreg_test <- as.matrix(test$pop_lag1[1] + factors)
+
+# FORECAST & MAPE (back-transformed to original scale)
+fc             <- forecast(model, xreg = xreg_test)
+total_real     <- sum(exp(test$log_sales))
+total_forecast <- sum(exp(as.numeric(fc$mean)))
+year_mape      <- (total_forecast - total_real) / total_real
+
+cat("Total real:    ", total_real, "\n")
+cat("Total forecast:", total_forecast, "\n")
+cat("Year MAPE:     ", year_mape, "\n")
