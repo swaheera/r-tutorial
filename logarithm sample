@@ -15,7 +15,9 @@ CONFIG <- list(
   scenario_max       = 3,
   scenario_step      = 0.5,
   log_response       = FALSE,
-  log_all_predictors = FALSE
+  log_all_predictors = FALSE,
+  min_train_months   = 48,
+  forecast_horizon   = 12
 )
 
 # =============================================================================
@@ -42,14 +44,14 @@ back_transform <- function(x, is_logged) {
 }
 
 # =============================================================================
-# PART 1: BULK VERSION
+# PART 1: EXPANDING WINDOW VERSION
 # =============================================================================
 
 cat("##############################################\n")
-cat("# PART 1: BULK VERSION                       #\n")
+cat("# PART 1: EXPANDING WINDOW VERSION           #\n")
 cat("##############################################\n\n")
 
-fit_single_window <- function(config, train_start, train_end, test_start, test_end) {
+fit_single_window <- function(config, train_end_idx, forecast_horizon) {
 
   # Unpack config
   df         <- get(config$df_name, envir = parent.frame())
@@ -63,10 +65,21 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
   log_response       <- config$log_response
   log_all_predictors <- config$log_all_predictors
 
+  df <- df %>% arrange(.data[[date_col]])
+
+  # Determine train/test date ranges from indices
+  train_start <- df[[date_col]][1]
+  train_end   <- df[[date_col]][train_end_idx]
+  test_start_idx <- train_end_idx + 1
+  test_end_idx   <- min(train_end_idx + forecast_horizon, nrow(df))
+
+  if (test_start_idx > nrow(df)) return(NULL)
+
+  test_start <- df[[date_col]][test_start_idx]
+  test_end   <- df[[date_col]][test_end_idx]
+
   training_period <- paste(train_start, "to", train_end)
   testing_period  <- paste(test_start, "to", test_end)
-
-  df <- df %>% arrange(.data[[date_col]])
 
   # Apply log transforms before creating lags
   if (log_response)       df[[target_col]] <- log(df[[target_col]])
@@ -80,12 +93,12 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
   lag_cols  <- paste0("pop_lag", 1:n_lags)
   scenarios <- seq(scenario_min, scenario_max, by = scenario_step)
 
-  train_df_all <- df %>% filter(.data[[date_col]] >= as.Date(train_start) &
-                                .data[[date_col]] <= as.Date(train_end))
-  test_df_all  <- df %>% filter(.data[[date_col]] >= as.Date(test_start) &
-                                .data[[date_col]] <= as.Date(test_end))
+  train_df_all <- df[1:train_end_idx, ]
+  test_df_all  <- df[test_start_idx:test_end_idx, ]
 
-  cat("Data:", config$df_name, "| Window:", training_period, "->", testing_period, "\n")
+  cat("Data:", config$df_name,
+      "| Train:", training_period, "(", train_end_idx, "months)",
+      "-> Test:", testing_period, "(", nrow(test_df_all), "months)\n")
 
   # ---- Pure ARIMA baseline (no xreg) ----
   baseline_model <- tryCatch(auto.arima(train_df_all[[target_col]]), error = function(e) NULL)
@@ -194,6 +207,8 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
         log_predictors     = log_all_predictors,
         training_period    = training_period,
         testing_period     = testing_period,
+        train_months       = train_end_idx,
+        test_months        = n_test,
         stringsAsFactors   = FALSE
       )
     }
@@ -219,38 +234,29 @@ fit_single_window <- function(config, train_start, train_end, test_start, test_e
   do.call(rbind, all_results)
 }
 
-# --- Define windows ---
-windows <- list(
-  list(train_start = "2020-04-01", train_end = "2021-03-31",
-       test_start  = "2021-04-01", test_end  = "2022-03-31"),
-  list(train_start = "2020-04-01", train_end = "2022-03-31",
-       test_start  = "2022-04-01", test_end  = "2023-03-31"),
-  list(train_start = "2020-04-01", train_end = "2023-03-31",
-       test_start  = "2023-04-01", test_end  = "2024-03-31"),
-  list(train_start = "2020-04-01", train_end = "2024-03-31",
-       test_start  = "2024-04-01", test_end  = "2025-03-31"),
-  list(train_start = "2020-04-01", train_end = "2025-03-31",
-       test_start  = "2025-04-01", test_end  = "2025-10-01")
-)
+# --- Run expanding windows ---
+n_total <- nrow(mydf)
+min_train <- CONFIG$min_train_months
+horizon   <- CONFIG$forecast_horizon
 
-# --- Run all windows ---
 results_list <- list()
-for (w in windows) {
+train_end_idx <- min_train
+
+while (train_end_idx + horizon <= n_total) {
   res <- fit_single_window(
-    config      = CONFIG,
-    train_start = w$train_start,
-    train_end   = w$train_end,
-    test_start  = w$test_start,
-    test_end    = w$test_end
+    config           = CONFIG,
+    train_end_idx    = train_end_idx,
+    forecast_horizon = horizon
   )
   if (!is.null(res)) results_list[[length(results_list) + 1]] <- res
+  train_end_idx <- train_end_idx + 1
 }
 
-if (length(results_list) == 0) stop("No results from bulk run\n")
+if (length(results_list) == 0) stop("No results from expanding window run\n")
 
 results_df <- do.call(rbind, results_list)
 
-cat("\nBulk run complete. Total rows:", nrow(results_df), "\n")
+cat("\nExpanding window run complete. Total rows:", nrow(results_df), "\n")
 cat("Columns:", paste(colnames(results_df), collapse = ", "), "\n\n")
 print(head(results_df, 20))
 cat("\n")
@@ -259,17 +265,23 @@ cat("\n")
 # =============================================================================
 # PART 2: INDIVIDUAL CHECKS
 # =============================================================================
+# We replicate the FIRST expanding window manually:
+#   train = rows 1:48, test = rows 49:60 (i.e. train_end_idx = 48, horizon = 12)
 
 cat("##############################################\n")
 cat("# PART 2: INDIVIDUAL CHECKS                  #\n")
 cat("##############################################\n\n")
 
+check_train_end <- CONFIG$min_train_months
+check_horizon   <- CONFIG$forecast_horizon
+check_test_start <- check_train_end + 1
+check_test_end   <- min(check_train_end + check_horizon, nrow(mydf))
+
 # ----- CHECK 1: pop_lag1, scenario +1% -----
 
 cat("--- CHECK 1: pop_lag1, scenario +1% ---\n\n")
 
-df1 <- mydf %>%
-  arrange(date)
+df1 <- mydf %>% arrange(date)
 
 # Apply log transforms to match CONFIG
 if (CONFIG$log_response)       df1$apple_sales <- log(df1$apple_sales)
@@ -278,13 +290,8 @@ if (CONFIG$log_all_predictors) df1$population  <- log(df1$population)
 df1 <- df1 %>%
   mutate(pop_lag1 = dplyr::lag(population, 1))
 
-train1 <- df1 %>%
-  filter(date >= "2020-04-01" & date <= "2022-03-31") %>%
-  filter(!is.na(pop_lag1))
-
-test1 <- df1 %>%
-  filter(date >= "2022-04-01" & date <= "2023-03-31") %>%
-  filter(!is.na(pop_lag1))
+train1 <- df1[1:check_train_end, ] %>% filter(!is.na(pop_lag1))
+test1  <- df1[check_test_start:check_test_end, ] %>% filter(!is.na(pop_lag1))
 
 cat("Train rows:", nrow(train1), "| Test rows:", nrow(test1), "\n")
 
@@ -320,8 +327,7 @@ cat("Year MAPE:     ", check1_year_mape, "\n\n")
 
 cat("--- CHECK 2: pop_lag1+pop_lag2+pop_lag3, scenario +1% ---\n\n")
 
-df2 <- mydf %>%
-  arrange(date)
+df2 <- mydf %>% arrange(date)
 
 # Apply log transforms to match CONFIG
 if (CONFIG$log_response)       df2$apple_sales <- log(df2$apple_sales)
@@ -334,12 +340,9 @@ df2 <- df2 %>%
     pop_lag3 = dplyr::lag(population, 3)
   )
 
-train2 <- df2 %>%
-  filter(date >= "2020-04-01" & date <= "2022-03-31") %>%
+train2 <- df2[1:check_train_end, ] %>%
   filter(!is.na(pop_lag1) & !is.na(pop_lag2) & !is.na(pop_lag3))
-
-test2 <- df2 %>%
-  filter(date >= "2022-04-01" & date <= "2023-03-31") %>%
+test2  <- df2[check_test_start:check_test_end, ] %>%
   filter(!is.na(pop_lag1) & !is.na(pop_lag2) & !is.na(pop_lag3))
 
 cat("Train rows:", nrow(train2), "| Test rows:", nrow(test2), "\n")
@@ -389,10 +392,12 @@ cat("##############################################\n")
 cat("# PART 3: COMPARISON                         #\n")
 cat("##############################################\n\n")
 
+# The first expanding window uses train_months = min_train_months
+first_window_train <- CONFIG$min_train_months
+
 bulk1 <- results_df %>%
   filter(model == "pop_lag1",
-         training_period == "2020-04-01 to 2022-03-31",
-         testing_period  == "2022-04-01 to 2023-03-31",
+         train_months == first_window_train,
          scenario == 1)
 
 cat("--- CHECK 1: pop_lag1 ---\n")
@@ -402,8 +407,7 @@ cat("Match:", all.equal(bulk1$total_forecast, check1_total_forecast, tolerance =
 
 bulk2 <- results_df %>%
   filter(model == "pop_lag1+pop_lag2+pop_lag3",
-         training_period == "2020-04-01 to 2022-03-31",
-         testing_period  == "2022-04-01 to 2023-03-31",
+         train_months == first_window_train,
          scenario == 1)
 
 cat("--- CHECK 2: pop_lag1+pop_lag2+pop_lag3 ---\n")
