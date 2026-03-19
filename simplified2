@@ -200,3 +200,52 @@ results <- do.call(rbind, Map(
 
 rownames(results) <- NULL
 print(results)
+############
+library(dplyr)
+library(forecast)
+
+# CONFIG
+train_start  <- "2020-04-01"
+train_end    <- "2023-03-31"
+test_start   <- "2023-04-01"
+test_end     <- "2024-03-31"
+scenario_pct <- 1
+
+# PREP
+df <- mydf %>%
+  arrange(date) %>%
+  mutate(log_total  = log(total),
+         log_apples = log(apples),
+         log_banana = log(banana),
+         log_pop    = log(population),
+         pop_lag1   = dplyr::lag(log_pop, 1))
+
+train <- df %>% filter(date >= train_start & date <= train_end & !is.na(pop_lag1))
+test  <- df %>% filter(date >= test_start  & date <= test_end  & !is.na(pop_lag1))
+
+# SCENARIO XREG
+n_test   <- nrow(test)
+factors  <- log(1 + scenario_pct / 100) * (0:(n_test - 1)) / (n_test - 1)
+xreg_train <- as.matrix(train$pop_lag1)
+xreg_test  <- as.matrix(test$pop_lag1[1] + factors)
+
+# FIT & FORECAST
+model_total  <- auto.arima(train$log_total,  xreg = xreg_train)
+model_apples <- auto.arima(train$log_apples, xreg = xreg_train)
+model_banana <- auto.arima(train$log_banana, xreg = xreg_train)
+
+fc_total  <- forecast(model_total,  xreg = xreg_test)
+fc_apples <- forecast(model_apples, xreg = xreg_test)
+fc_banana <- forecast(model_banana, xreg = xreg_test)
+
+# ONE ROW PER MONTH
+results <- data.frame(
+  date           = test$date,
+  total          = exp(as.numeric(fc_total$mean)),
+  apples         = exp(as.numeric(fc_apples$mean)),
+  banana_direct  = exp(as.numeric(fc_banana$mean)),
+  banana_residual = exp(as.numeric(fc_total$mean)) - exp(as.numeric(fc_apples$mean)),
+  scenario       = scenario_pct
+)
+
+print(results)
