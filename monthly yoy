@@ -1,0 +1,232 @@
+############################## Part 2 ###############
+
+library(dplyr)
+library(lubridate)
+library(forecast)
+
+# CONFIG
+train_start  <- "2020-04-01"
+train_end    <- "2023-03-31"
+test_start   <- "2023-04-01"
+test_end     <- "2024-03-31"
+scenario_pct <- 1
+
+# PREP
+df <- mydf %>%
+  arrange(date) %>%
+  mutate(
+    log_total  = log(total),
+    log_apples = log(apples),
+    log_banana = log(banana),
+    # yoy column already exists in df; just lag it
+    yoy_lag1   = dplyr::lag(yoy, 1)
+  )
+
+train <- df %>% filter(date >= train_start & date <= train_end & !is.na(yoy_lag1))
+test  <- df %>% filter(date >= test_start  & date <= test_end)
+
+# ---- BUILD SCENARIO XREG ----
+# From last known population, grow by scenario_pct% annually (compounded monthly).
+# Then compute yoy = (pop_t - pop_{t-12}) / pop_{t-12} for each forecast month.
+
+last_known_pop <- df %>% filter(date <= train_end) %>% pull(population) %>% tail(1)
+monthly_factor <- (1 + scenario_pct / 100) ^ (1/12)
+n_test         <- nrow(test)
+projected_pop  <- last_known_pop * monthly_factor ^ (1:n_test)
+
+# Population from 12 months prior to each forecast month (from actual data)
+dates_12m_prior <- test$date %m-% months(12)
+pop_12m_prior   <- df %>%
+  filter(date %in% dates_12m_prior) %>%
+  arrange(date) %>%
+  pull(population)
+
+scenario_yoy <- (projected_pop - pop_12m_prior) / pop_12m_prior
+
+# Lag by 1: first forecast month uses last known yoy_lag1, rest use scenario
+xreg_train <- as.matrix(train$yoy_lag1)
+xreg_test  <- as.matrix(c(tail(train$yoy_lag1, 1), scenario_yoy[-n_test]))
+
+# ---- FIT + FORECAST FOR BOTH LOG AND NON-LOG ----
+run_models <- function(use_log) {
+
+  if (use_log) {
+    y_total  <- train$log_total
+    y_apples <- train$log_apples
+    y_banana <- train$log_banana
+  } else {
+    y_total  <- train$total
+    y_apples <- train$apples
+    y_banana <- train$banana
+  }
+
+  m_total  <- auto.arima(y_total,  xreg = xreg_train)
+  m_apples <- auto.arima(y_apples, xreg = xreg_train)
+  m_banana <- auto.arima(y_banana, xreg = xreg_train)
+
+  fc_total  <- forecast(m_total,  xreg = xreg_test)
+  fc_apples <- forecast(m_apples, xreg = xreg_test)
+  fc_banana <- forecast(m_banana, xreg = xreg_test)
+
+  if (use_log) {
+    fc_total_vec  <- exp(as.numeric(fc_total$mean))
+    fc_apples_vec <- exp(as.numeric(fc_apples$mean))
+    fc_banana_vec <- exp(as.numeric(fc_banana$mean))
+  } else {
+    fc_total_vec  <- as.numeric(fc_total$mean)
+    fc_apples_vec <- as.numeric(fc_apples$mean)
+    fc_banana_vec <- as.numeric(fc_banana$mean)
+  }
+
+  fc_banana_res_vec <- fc_total_vec - fc_apples_vec
+
+  real_total  <- test$total
+  real_apples <- test$apples
+  real_banana <- test$banana
+  true_pop_growth <- ((test$population[n_test] - test$population[1]) / test$population[1]) * 100
+
+  make_monthly <- function(variable_name, real_vec, fc_vec) {
+    data.frame(
+      date              = test$date,
+      variable          = variable_name,
+      log_response      = use_log,
+      real              = real_vec,
+      forecast          = fc_vec,
+      cumul_real        = cumsum(real_vec),
+      cumul_forecast    = cumsum(fc_vec),
+      true_pop_growth   = true_pop_growth,
+      scenario          = scenario_pct,
+      mape_signed       = (fc_vec - real_vec) / real_vec,
+      mape_abs          = abs((fc_vec - real_vec) / real_vec),
+      cumul_mape_signed = (cumsum(fc_vec) - cumsum(real_vec)) / cumsum(real_vec),
+      cumul_mape_abs    = abs((cumsum(fc_vec) - cumsum(real_vec)) / cumsum(real_vec)),
+      train_window_start = train_start,
+      train_window_end   = train_end,
+      test_window_start  = test_start,
+      test_window_end    = test_end,
+      months_in_test     = seq_len(n_test),
+      predictor          = "yoy_lag1",
+      stringsAsFactors   = FALSE
+    )
+  }
+
+  bind_rows(
+    make_monthly("total",          real_total,  fc_total_vec),
+    make_monthly("apples",         real_apples, fc_apples_vec),
+    make_monthly("banana_method1", real_banana, fc_banana_vec),
+    make_monthly("banana_method2", real_banana, fc_banana_res_vec)
+  )
+}
+
+results_p2 <- bind_rows(
+  run_models(use_log = TRUE),
+  run_models(use_log = FALSE)
+)
+
+print(results_p2)
+
+
+############################### Part 3 ###############
+
+# CONFIG (same as Part 2)
+train_start  <- "2020-04-01"
+train_end    <- "2023-03-31"
+test_start   <- "2023-04-01"
+test_end     <- "2024-03-31"
+scenario_pct <- 1
+
+# PREP (same as Part 2)
+df <- mydf %>%
+  arrange(date) %>%
+  mutate(
+    log_total  = log(total),
+    log_apples = log(apples),
+    log_banana = log(banana),
+    yoy_lag1   = dplyr::lag(yoy, 1)
+  )
+
+train <- df %>% filter(date >= train_start & date <= train_end & !is.na(yoy_lag1))
+test  <- df %>% filter(date >= test_start  & date <= test_end)
+
+# ---- SCENARIO XREG (same logic) ----
+last_known_pop <- df %>% filter(date <= train_end) %>% pull(population) %>% tail(1)
+monthly_factor <- (1 + scenario_pct / 100) ^ (1/12)
+n_test         <- nrow(test)
+projected_pop  <- last_known_pop * monthly_factor ^ (1:n_test)
+
+dates_12m_prior <- test$date %m-% months(12)
+pop_12m_prior   <- df %>%
+  filter(date %in% dates_12m_prior) %>%
+  arrange(date) %>%
+  pull(population)
+
+scenario_yoy <- (projected_pop - pop_12m_prior) / pop_12m_prior
+
+xreg_train <- as.matrix(train$yoy_lag1)
+xreg_test  <- as.matrix(c(tail(train$yoy_lag1, 1), scenario_yoy[-n_test]))
+
+# ---- FIT + FORECAST (forecast-only output, no actuals) ----
+run_models_p3 <- function(use_log) {
+
+  if (use_log) {
+    y_total  <- train$log_total
+    y_apples <- train$log_apples
+    y_banana <- train$log_banana
+  } else {
+    y_total  <- train$total
+    y_apples <- train$apples
+    y_banana <- train$banana
+  }
+
+  m_total  <- auto.arima(y_total,  xreg = xreg_train)
+  m_apples <- auto.arima(y_apples, xreg = xreg_train)
+  m_banana <- auto.arima(y_banana, xreg = xreg_train)
+
+  fc_total  <- forecast(m_total,  xreg = xreg_test)
+  fc_apples <- forecast(m_apples, xreg = xreg_test)
+  fc_banana <- forecast(m_banana, xreg = xreg_test)
+
+  if (use_log) {
+    fc_total_vec  <- exp(as.numeric(fc_total$mean))
+    fc_apples_vec <- exp(as.numeric(fc_apples$mean))
+    fc_banana_vec <- exp(as.numeric(fc_banana$mean))
+  } else {
+    fc_total_vec  <- as.numeric(fc_total$mean)
+    fc_apples_vec <- as.numeric(fc_apples$mean)
+    fc_banana_vec <- as.numeric(fc_banana$mean)
+  }
+
+  fc_banana_res_vec <- fc_total_vec - fc_apples_vec
+
+  make_row <- function(variable_name, fc_vec) {
+    data.frame(
+      date               = test$date,
+      variable           = variable_name,
+      log_response       = use_log,
+      forecast           = fc_vec,
+      cumul_forecast     = cumsum(fc_vec),
+      scenario           = scenario_pct,
+      train_window_start = train_start,
+      train_window_end   = train_end,
+      test_window_start  = test_start,
+      test_window_end    = test_end,
+      months_in_test     = seq_len(n_test),
+      predictor          = "yoy_lag1",
+      stringsAsFactors   = FALSE
+    )
+  }
+
+  bind_rows(
+    make_row("total",          fc_total_vec),
+    make_row("apples",         fc_apples_vec),
+    make_row("banana_method1", fc_banana_vec),
+    make_row("banana_method2", fc_banana_res_vec)
+  )
+}
+
+results_p3 <- bind_rows(
+  run_models_p3(use_log = TRUE),
+  run_models_p3(use_log = FALSE)
+)
+
+print(results_p3)
