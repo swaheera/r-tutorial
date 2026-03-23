@@ -1,0 +1,489 @@
+library(dplyr)
+library(forecast)
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+CONFIG <- list(
+  df_name            = "mydf",
+  date_col           = "date",
+  target_cols        = c("total_sales", "apple_sales", "banana_sales"),
+  pop_col            = "population",
+  n_lags             = 4,
+  scenario_min       = -3,
+  scenario_max       = 3,
+  scenario_step      = 0.5,
+  min_train_months   = 48,
+  forecast_horizon   = 12
+)
+
+# All 4 log transform combinations
+LOG_COMBOS <- expand.grid(
+  log_response   = c(FALSE, TRUE),
+  log_predictors = c(FALSE, TRUE),
+  stringsAsFactors = FALSE
+)
+
+# =============================================================================
+# DATA SETUP (simulated — replace with your own)
+# =============================================================================
+
+set.seed(42)
+dates <- seq.Date(from = as.Date("2020-04-01"), by = "month", length.out = 67)
+population <- cumsum(rnorm(67, mean = 0.5, sd = 1)) + 100
+apple_sales  <- 500 + 2 * population + rnorm(67, sd = 10)
+banana_sales <- 300 + 1.5 * population + rnorm(67, sd = 8)
+total_sales  <- apple_sales + banana_sales
+
+mydf <- data.frame(
+  date         = dates,
+  total_sales  = total_sales,
+  apple_sales  = apple_sales,
+  banana_sales = banana_sales,
+  population   = population
+)
+
+# =============================================================================
+# PRE-COMPUTE LAG DATAFRAMES
+# =============================================================================
+
+cat("Pre-computing lag dataframes...\n")
+
+precompute_lag_df <- function(df, date_col, pop_col, n_lags, do_log_pred) {
+  df <- df %>% arrange(.data[[date_col]])
+  if (do_log_pred) df[[pop_col]] <- log(df[[pop_col]])
+  for (i in 1:n_lags) {
+    df <- df %>% mutate(!!paste0("pop_lag", i) := dplyr::lag(.data[[pop_col]], i))
+  }
+  df
+}
+
+df_sorted   <- mydf %>% arrange(.data[[CONFIG$date_col]])
+original_df <- df_sorted
+
+lag_dfs <- list(
+  "FALSE" = precompute_lag_df(df_sorted, CONFIG$date_col, CONFIG$pop_col, CONFIG$n_lags, FALSE),
+  "TRUE"  = precompute_lag_df(df_sorted, CONFIG$date_col, CONFIG$pop_col, CONFIG$n_lags, TRUE)
+)
+
+cat("  Done.\n\n")
+
+# =============================================================================
+# PRE-COMPUTE ALL LAG COMBINATIONS
+# =============================================================================
+
+lag_cols   <- paste0("pop_lag", 1:CONFIG$n_lags)
+all_combos <- lapply(1:CONFIG$n_lags, function(k) combn(lag_cols, k, simplify = FALSE))
+all_combos <- unlist(all_combos, recursive = FALSE)
+
+cat("Lag combinations:", length(all_combos), "\n\n")
+
+# =============================================================================
+# PRE-COMPUTE SCENARIO VECTORS
+# =============================================================================
+
+scenarios <- seq(CONFIG$scenario_min, CONFIG$scenario_max, by = CONFIG$scenario_step)
+cat("Scenarios:", length(scenarios), "\n\n")
+
+# =============================================================================
+# MAIN LOOP
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 1: EXPANDING WINDOW (SEQUENTIAL)      #\n")
+cat("##############################################\n\n")
+
+n_total   <- nrow(df_sorted)
+min_train <- CONFIG$min_train_months
+horizon   <- CONFIG$forecast_horizon
+date_col  <- CONFIG$date_col
+pop_col   <- CONFIG$pop_col
+n_lags    <- CONFIG$n_lags
+
+window_indices <- seq(min_train, n_total - horizon)
+n_windows      <- length(window_indices)
+n_log_combos   <- nrow(LOG_COMBOS)
+n_responses    <- length(CONFIG$target_cols)
+n_combos       <- length(all_combos)
+
+total_models <- n_responses * n_log_combos * n_windows * (n_combos + 1)  # +1 for baseline
+cat("Windows:", n_windows, "\n")
+cat("Approx total auto.arima calls:", total_models, "\n\n")
+
+global_start_time <- Sys.time()
+all_results <- list()
+
+for (tgt in CONFIG$target_cols) {
+
+  resp_start <- Sys.time()
+  cat("=== Response:", tgt, "| Started:", format(resp_start, "%Y-%m-%d %H:%M:%S"), "===\n")
+
+  for (lc_idx in seq_len(n_log_combos)) {
+
+    lr <- LOG_COMBOS$log_response[lc_idx]
+    lp <- LOG_COMBOS$log_predictors[lc_idx]
+
+    cat("  log_response:", lr, "| log_predictors:", lp,
+        "| Time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+
+    # Pick pre-computed lag df
+    df_lag <- lag_dfs[[as.character(lp)]]
+
+    # Set up response column (log or raw)
+    if (lr) {
+      df_lag[[tgt]] <- log(original_df[[tgt]])
+    } else {
+      df_lag[[tgt]] <- original_df[[tgt]]
+    }
+
+    # Original-scale response for back-transformation
+    original_response <- original_df[[tgt]]
+
+    for (train_end_idx in window_indices) {
+
+      test_start_idx <- train_end_idx + 1
+      test_end_idx   <- min(train_end_idx + horizon, n_total)
+
+      train_start <- df_lag[[date_col]][1]
+      train_end   <- df_lag[[date_col]][train_end_idx]
+      test_start  <- df_lag[[date_col]][test_start_idx]
+      test_end    <- df_lag[[date_col]][test_end_idx]
+
+      training_period <- paste(train_start, "to", train_end)
+      testing_period  <- paste(test_start, "to", test_end)
+
+      train_df_all <- df_lag[1:train_end_idx, ]
+      test_df_all  <- df_lag[test_start_idx:test_end_idx, ]
+
+      original_test_response <- original_response[test_start_idx:test_end_idx]
+      n_test_full <- nrow(test_df_all)
+
+      # ---- Baseline ARIMA (no xreg) ----
+      baseline_model <- tryCatch(auto.arima(train_df_all[[tgt]]), error = function(e) NULL)
+      baseline_year_mape <- NA
+
+      if (!is.null(baseline_model)) {
+        baseline_fc <- tryCatch(forecast(baseline_model, h = n_test_full), error = function(e) NULL)
+        if (!is.null(baseline_fc)) {
+          baseline_fc_vals <- as.numeric(baseline_fc$mean)
+          if (lr) baseline_fc_vals <- exp(baseline_fc_vals)
+          baseline_year_mape <- (sum(baseline_fc_vals) - sum(original_test_response)) /
+                                 sum(original_test_response)
+        }
+      }
+
+      # ---- Loop over lag combinations ----
+      for (combo_idx in seq_along(all_combos)) {
+
+        xreg_cols  <- all_combos[[combo_idx]]
+        model_name <- paste(xreg_cols, collapse = "+")
+
+        train_df <- train_df_all %>% filter(complete.cases(pick(all_of(xreg_cols))))
+        test_df  <- test_df_all  %>% filter(complete.cases(pick(all_of(xreg_cols))))
+
+        n_train <- nrow(train_df)
+        n_test  <- nrow(test_df)
+        if (n_train < 10 || n_test < 1) next
+
+        test_pop <- test_df[[pop_col]]
+        true_scenario <- ((test_pop[n_test] - test_pop[1]) / test_pop[1]) * 100
+
+        test_dates <- test_df[[date_col]]
+
+        test_row_mask      <- complete.cases(test_df_all[, xreg_cols, drop = FALSE])
+        original_test_vals <- original_test_response[test_row_mask]
+        total_real_original <- sum(original_test_vals)
+
+        xreg_train <- as.matrix(train_df[, xreg_cols, drop = FALSE])
+
+        arima_model <- tryCatch(auto.arima(train_df[[tgt]], xreg = xreg_train),
+                                error = function(e) NULL)
+        if (is.null(arima_model)) next
+
+        coefs <- coef(arima_model)
+        xreg_coefs <- coefs[names(coefs) %in% xreg_cols]
+        if (length(xreg_coefs) == 0) next
+
+        # ---- Scenario loop ----
+        monthly_rows    <- vector("list", length(scenarios) * n_test)
+        row_idx         <- 0
+        total_forecasts <- rep(NA_real_, length(scenarios))
+
+        for (s_idx in seq_along(scenarios)) {
+
+          scenario_pct   <- scenarios[s_idx]
+          xreg_test_base <- as.numeric(test_df[1, xreg_cols])
+
+          xreg_test_scenario <- matrix(NA, nrow = n_test, ncol = length(xreg_cols))
+          colnames(xreg_test_scenario) <- xreg_cols
+
+          if (lp) {
+            log_growth <- log(1 + scenario_pct / 100)
+            if (n_test == 1) {
+              additive_factors <- log_growth
+            } else {
+              additive_factors <- log_growth * (0:(n_test - 1)) / (n_test - 1)
+            }
+            for (j in seq_along(xreg_cols)) {
+              xreg_test_scenario[, j] <- xreg_test_base[j] + additive_factors
+            }
+          } else {
+            if (n_test == 1) {
+              growth_factors <- 1 + scenario_pct / 100
+            } else {
+              growth_factors <- 1 + (scenario_pct / 100) * (0:(n_test - 1)) / (n_test - 1)
+            }
+            for (j in seq_along(xreg_cols)) {
+              xreg_test_scenario[, j] <- xreg_test_base[j] * growth_factors
+            }
+          }
+
+          fc <- tryCatch(forecast(arima_model, xreg = xreg_test_scenario),
+                         error = function(e) NULL)
+          if (is.null(fc)) next
+
+          fc_values <- as.numeric(fc$mean)
+          if (lr) fc_values <- exp(fc_values)
+
+          real_values    <- original_test_vals
+          total_forecast <- sum(fc_values)
+          total_forecasts[s_idx] <- total_forecast
+
+          monthly_diffs_pct <- (fc_values - real_values) / real_values
+          abs_avg_monthly_difference_pct <- mean(abs(monthly_diffs_pct))
+          avg_monthly_difference_pct     <- mean(monthly_diffs_pct)
+          year_difference_pct            <- (total_forecast - total_real_original) / total_real_original
+          abs_year_difference_pct        <- abs(year_difference_pct)
+
+          for (m in seq_len(n_test)) {
+            row_idx <- row_idx + 1
+            monthly_rows[[row_idx]] <- data.frame(
+              model                          = model_name,
+              response                       = tgt,
+              scenario                       = scenario_pct,
+              true_scenario                  = true_scenario,
+              scenario_diff                  = abs(true_scenario - scenario_pct),
+              log_response                   = lr,
+              log_predictors                 = lp,
+              training_window                = training_period,
+              testing_window                 = testing_period,
+              date                           = format(test_dates[m], "%Y-%m"),
+              forecast                       = fc_values[m],
+              actual                         = real_values[m],
+              abs_avg_monthly_difference_pct = abs_avg_monthly_difference_pct,
+              avg_monthly_difference_pct     = avg_monthly_difference_pct,
+              abs_year_difference_pct        = abs_year_difference_pct,
+              year_difference_pct            = year_difference_pct,
+              baseline_year_mape             = baseline_year_mape,
+              num_months_used_in_training    = train_end_idx,
+              num_months_used_in_testing     = n_test,
+              forecast_month                 = m,
+              stringsAsFactors               = FALSE
+            )
+          }
+        }
+
+        if (row_idx == 0) next
+
+        monthly_rows <- monthly_rows[1:row_idx]
+        out <- do.call(rbind, monthly_rows)
+
+        valid <- total_forecasts[!is.na(total_forecasts)]
+        out$monotonic <- ifelse(length(valid) > 1 && all(diff(valid) > 0), "yes", "no")
+
+        all_results[[length(all_results) + 1]] <- out
+
+      }  # end combo loop
+    }  # end window loop
+  }  # end log combo loop
+
+  resp_elapsed <- round(as.numeric(difftime(Sys.time(), resp_start, units = "mins")), 1)
+  total_elapsed <- round(as.numeric(difftime(Sys.time(), global_start_time, units = "mins")), 1)
+  cat("  Finished:", tgt, "| This response:", resp_elapsed, "min | Total:", total_elapsed, "min\n")
+  cat("  Time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+
+}  # end response loop
+
+if (length(all_results) == 0) stop("No results from expanding window run\n")
+
+results_df <- do.call(rbind, all_results)
+
+cat("Expanding window run complete.\n")
+cat("  Total rows:", nrow(results_df), "\n")
+cat("  Responses:", paste(unique(results_df$response), collapse = ", "), "\n")
+cat("  Log combos:", nrow(distinct(results_df, log_response, log_predictors)), "\n")
+cat("  Total time:", round(as.numeric(difftime(Sys.time(), global_start_time, units = "mins")), 1), "min\n\n")
+
+
+# =============================================================================
+# PART 2: DERIVE banana_method2 = total_forecast - apple_forecast
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 2: DERIVE banana_method2              #\n")
+cat("##############################################\n\n")
+
+join_keys <- c("model", "scenario", "training_window", "testing_window", "date",
+               "true_scenario", "scenario_diff", "log_response", "log_predictors",
+               "num_months_used_in_training", "num_months_used_in_testing",
+               "forecast_month", "monotonic")
+
+total_rows <- results_df %>% filter(response == "total_sales")
+apple_rows <- results_df %>% filter(response == "apple_sales")
+
+banana_actual_lookup <- results_df %>%
+  filter(response == "banana_sales") %>%
+  select(model, scenario, training_window, testing_window, date,
+         log_response, log_predictors, actual) %>%
+  distinct()
+
+banana_m2 <- total_rows %>%
+  inner_join(apple_rows, by = join_keys, suffix = c("_total", "_apple")) %>%
+  mutate(forecast = forecast_total - forecast_apple)
+
+banana_m2 <- banana_m2 %>%
+  left_join(banana_actual_lookup,
+            by = c("model", "scenario", "training_window", "testing_window",
+                   "date", "log_response", "log_predictors")) %>%
+  select(all_of(join_keys), forecast, actual) %>%
+  mutate(response = "banana_method2")
+
+banana_m2 <- banana_m2 %>%
+  group_by(model, scenario, training_window, testing_window,
+           log_response, log_predictors) %>%
+  mutate(
+    monthly_diff_pct               = (forecast - actual) / actual,
+    abs_avg_monthly_difference_pct = mean(abs(monthly_diff_pct)),
+    avg_monthly_difference_pct     = mean(monthly_diff_pct),
+    year_difference_pct            = (sum(forecast) - sum(actual)) / sum(actual),
+    abs_year_difference_pct        = abs(year_difference_pct)
+  ) %>%
+  ungroup() %>%
+  select(-monthly_diff_pct) %>%
+  mutate(baseline_year_mape = NA)
+
+banana_m2 <- banana_m2 %>% select(all_of(colnames(results_df)))
+
+results_df <- results_df %>%
+  mutate(response = ifelse(response == "banana_sales", "banana_method1", response))
+
+results_final <- bind_rows(results_df, banana_m2)
+
+cat("banana_method2 rows created:", nrow(banana_m2), "\n")
+cat("Final combined rows:", nrow(results_final), "\n")
+cat("Response values:", paste(unique(results_final$response), collapse = ", "), "\n\n")
+
+print(head(results_final %>% filter(response == "banana_method2"), 20))
+cat("\n")
+
+
+# =============================================================================
+# PART 3: INDIVIDUAL CHECKS
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 3: INDIVIDUAL CHECKS                  #\n")
+cat("##############################################\n\n")
+
+# ----- CHECK 1: apple_sales, pop_lag1, scenario +1%, 48mo, no log -----
+
+cat("--- CHECK 1: apple_sales, pop_lag1, scenario +1%, 48mo, no log ---\n\n")
+
+df1 <- lag_dfs[["FALSE"]]
+df1$apple_sales <- original_df$apple_sales
+
+train1 <- df1[1:48, ] %>% filter(!is.na(pop_lag1))
+test1  <- df1[49:60, ] %>% filter(!is.na(pop_lag1))
+
+scenario_pct_1 <- 1
+n_test_1 <- nrow(test1)
+growth_factors_1 <- 1 + (scenario_pct_1 / 100) * (0:(n_test_1 - 1)) / (n_test_1 - 1)
+
+xreg_train_1 <- as.matrix(train1[, "pop_lag1", drop = FALSE])
+xreg_test_1  <- as.matrix(test1$pop_lag1[1] * growth_factors_1)
+colnames(xreg_test_1) <- "pop_lag1"
+
+model1_apple <- auto.arima(train1$apple_sales, xreg = xreg_train_1)
+fc1_apple    <- forecast(model1_apple, xreg = xreg_test_1)
+
+check1_fc  <- as.numeric(fc1_apple$mean)
+check1_act <- test1$apple_sales
+
+cat("Monthly forecasts:", paste(round(check1_fc, 2), collapse = ", "), "\n")
+cat("Monthly actuals:  ", paste(round(check1_act, 2), collapse = ", "), "\n")
+cat("Year diff pct:    ", (sum(check1_fc) - sum(check1_act)) / sum(check1_act), "\n\n")
+
+# ----- CHECK 2: apple_sales, pop_lag1, scenario +1%, 48mo, log_response=T, log_pred=F -----
+
+cat("--- CHECK 2: apple_sales, pop_lag1, scenario +1%, 48mo, log_response=T, log_pred=F ---\n\n")
+
+train2_log_y <- log(train1$apple_sales)
+
+model2 <- auto.arima(train2_log_y, xreg = xreg_train_1)
+fc2    <- forecast(model2, xreg = xreg_test_1)
+
+check2_fc  <- exp(as.numeric(fc2$mean))
+check2_act <- test1$apple_sales
+
+cat("Monthly forecasts (exp):", paste(round(check2_fc, 2), collapse = ", "), "\n")
+cat("Monthly actuals:        ", paste(round(check2_act, 2), collapse = ", "), "\n")
+cat("Year diff pct:          ", (sum(check2_fc) - sum(check2_act)) / sum(check2_act), "\n\n")
+
+# ----- CHECK 3: banana_method2, no log -----
+
+cat("--- CHECK 3: banana_method2, pop_lag1, scenario +1%, 48mo, no log ---\n\n")
+
+df1$total_sales <- original_df$total_sales
+train1t <- df1[1:48, ] %>% filter(!is.na(pop_lag1))
+
+model1_total <- auto.arima(train1t$total_sales, xreg = xreg_train_1)
+fc1_total    <- forecast(model1_total, xreg = xreg_test_1)
+
+bm2_fc  <- as.numeric(fc1_total$mean) - check1_fc
+bm2_act <- test1$banana_sales
+
+cat("banana_method2 forecasts:", paste(round(bm2_fc, 2), collapse = ", "), "\n")
+cat("banana actuals:          ", paste(round(bm2_act, 2), collapse = ", "), "\n")
+cat("Year diff pct:           ", (sum(bm2_fc) - sum(bm2_act)) / sum(bm2_act), "\n\n")
+
+
+# =============================================================================
+# PART 4: COMPARISON — BULK vs INDIVIDUAL
+# =============================================================================
+
+cat("##############################################\n")
+cat("# PART 4: COMPARISON                         #\n")
+cat("##############################################\n\n")
+
+bulk1 <- results_final %>%
+  filter(response == "apple_sales", model == "pop_lag1",
+         num_months_used_in_training == 48, scenario == 1,
+         log_response == FALSE, log_predictors == FALSE)
+
+cat("--- apple_sales, no log ---\n")
+cat("Match forecasts:", all.equal(bulk1$forecast, check1_fc, tolerance = 1e-6), "\n")
+cat("Match actuals:  ", all.equal(bulk1$actual, check1_act, tolerance = 1e-6), "\n\n")
+
+bulk2 <- results_final %>%
+  filter(response == "apple_sales", model == "pop_lag1",
+         num_months_used_in_training == 48, scenario == 1,
+         log_response == TRUE, log_predictors == FALSE)
+
+cat("--- apple_sales, log_response=T, log_pred=F ---\n")
+cat("Bulk forecasts: ", paste(round(bulk2$forecast, 2), collapse = ", "), "\n")
+cat("Indiv forecasts:", paste(round(check2_fc, 2), collapse = ", "), "\n")
+cat("Match forecasts:", all.equal(bulk2$forecast, check2_fc, tolerance = 1e-6), "\n")
+cat("Match actuals:  ", all.equal(bulk2$actual, check2_act, tolerance = 1e-6), "\n\n")
+
+bulk_bm2 <- results_final %>%
+  filter(response == "banana_method2", model == "pop_lag1",
+         num_months_used_in_training == 48, scenario == 1,
+         log_response == FALSE, log_predictors == FALSE)
+
+cat("--- banana_method2, no log ---\n")
+cat("Match forecasts:", all.equal(bulk_bm2$forecast, bm2_fc, tolerance = 1e-6), "\n")
+cat("Match actuals:  ", all.equal(bulk_bm2$actual, bm2_act, tolerance = 1e-6), "\n\n")
+
+cat("Total runtime:", round(as.numeric(difftime(Sys.time(), global_start_time, units = "mins")), 1), "min\n")
+cat("Done!\n")
