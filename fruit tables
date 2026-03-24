@@ -1,0 +1,274 @@
+library(tidyverse)
+library(gt)
+
+# =============================================================================
+# CONFIG — Edit this section to match your data
+# =============================================================================
+
+config <- list(
+  response_col         = "response",
+  trained_on_col       = "dates_model_trained_on",
+  tested_on_col        = "dates_model_tested_on",
+  actual_col           = "actual",
+  true_scenario_col    = "true_scenario",
+  scenario_prefix      = "forecast_scenario_",
+  scenarios            = seq(-3, 3, by = 0.5),
+  abbreviate_numbers   = TRUE    # TRUE = "150K", "3.5M"  |  FALSE = "150,000", "3,500,000"
+)
+
+scenario_names <- paste0(
+  config$scenario_prefix,
+  gsub("-", "neg", as.character(config$scenarios))
+)
+
+# =============================================================================
+# SIMULATE DATA (replace with your real data)
+# =============================================================================
+
+set.seed(42)
+n <- 20
+
+df <- tibble(
+  response               = rep(c("Apple", "Banana", "Cherry"), each = n),
+  dates_model_trained_on = rep("Jan 2020 to Jan 2021", n * 3),
+  dates_model_tested_on  = rep("Feb 2021 to Dec 2021", n * 3),
+  actual                 = c(
+    round(rnorm(n, mean = 1500,    sd = 200)),
+    round(rnorm(n, mean = 250000,  sd = 30000)),
+    round(rnorm(n, mean = 3500000, sd = 400000))
+  ),
+  true_scenario = sample(config$scenarios, n * 3, replace = TRUE)
+)
+
+for (s in scenario_names) {
+  df[[s]] <- round(df$actual * runif(n * 3, 0.85, 1.15))
+}
+
+# =============================================================================
+# NUMBER FORMATTING
+# =============================================================================
+
+fmt_number_display <- function(x, abbreviate = TRUE) {
+  if (abbreviate) {
+    ifelse(is.na(x), NA_character_,
+      ifelse(abs(x) >= 1e6,
+        paste0(formatC(round(x / 1e6, 1), format = "f", digits = 1), "M"),
+      ifelse(abs(x) >= 1e3,
+        paste0(formatC(round(x / 1e3), format = "d"), "K"),
+        formatC(x, format = "d")
+      ))
+    )
+  } else {
+    ifelse(is.na(x), NA_character_, formatC(x, format = "d", big.mark = ","))
+  }
+}
+
+# =============================================================================
+# COLUMN NAME HELPERS
+# =============================================================================
+
+error_col_names <- paste0("err_", scenario_names)
+disp_num_names  <- paste0("dnum_", scenario_names)
+disp_pct_names  <- paste0("dpct_", scenario_names)
+disp_both_names <- paste0("dboth_", scenario_names)
+
+always_hide <- c(scenario_names, error_col_names,
+                 disp_num_names, disp_pct_names, disp_both_names,
+                 config$response_col)
+
+# =============================================================================
+# TABLE BUILDER
+#
+#   data           : your dataframe
+#   response_level : single value, e.g. "Apple"
+#   content        : "num", "pct", or "both"
+#   use_colour     : TRUE (red/white) or FALSE (no colour)
+#
+# =============================================================================
+
+build_forecast_table <- function(data,
+                                  response_level,
+                                  content    = "both",
+                                  use_colour = TRUE) {
+
+  abbrev <- config$abbreviate_numbers
+
+  # --- Filter ---
+  df_resp <- data %>% filter(.data[[config$response_col]] == response_level)
+
+  # --- Build display + error columns ---
+  df_ready <- df_resp
+  for (i in seq_along(scenario_names)) {
+    forecast_vals <- df_resp[[scenario_names[i]]]
+    actual_vals   <- df_resp[[config$actual_col]]
+    pct_error     <- abs((actual_vals - forecast_vals) / actual_vals) * 100
+
+    df_ready[[error_col_names[i]]] <- round(pct_error, 4)
+
+    df_ready[[disp_num_names[i]]] <- fmt_number_display(forecast_vals, abbrev)
+
+    df_ready[[disp_pct_names[i]]] <- paste0(
+      formatC(pct_error, format = "f", digits = 2), "%"
+    )
+
+    df_ready[[disp_both_names[i]]] <- paste0(
+      fmt_number_display(forecast_vals, abbrev),
+      "\n(",
+      formatC(pct_error, format = "f", digits = 2), "%)"
+    )
+  }
+
+  # --- Pick display columns ---
+  disp_cols <- switch(content,
+    "num"  = disp_num_names,
+    "pct"  = disp_pct_names,
+    "both" = disp_both_names
+  )
+
+  hide_cols <- setdiff(always_hide, disp_cols)
+
+  # --- Labels ---
+  scenario_labels <- setNames(
+    paste0(ifelse(config$scenarios >= 0, "+", ""), config$scenarios, "%"),
+    disp_cols
+  )
+  all_labels <- setNames(
+    c("Training Period", "Testing Period", "Actual Received", "True Scenario",
+      unname(scenario_labels)),
+    c(config$trained_on_col, config$tested_on_col, config$actual_col,
+      config$true_scenario_col, disp_cols)
+  )
+
+  # --- Build table ---
+  tbl <- df_ready %>%
+    gt() %>%
+    cols_hide(columns = all_of(hide_cols)) %>%
+    cols_label(.list = as.list(all_labels)) %>%
+
+    tab_header(
+      title = md(paste0("**", response_level,
+                        ": Performance of Forecasting Model Under Different Scenarios**"))
+    ) %>%
+
+    tab_spanner(
+      label   = md("**Model Forecasts**"),
+      columns = all_of(disp_cols)
+    ) %>%
+
+    # Format actual with same abbreviation setting
+    text_transform(
+      fn        = function(x) fmt_number_display(as.numeric(x), abbrev),
+      locations = cells_body(columns = all_of(config$actual_col))
+    ) %>%
+
+    fmt_number(columns = all_of(config$true_scenario_col), decimals = 1) %>%
+
+    tab_style(
+      style     = cell_text(weight = "bold"),
+      locations = cells_body(columns = all_of(config$actual_col))
+    ) %>%
+
+    tab_style(
+      style     = cell_borders(sides = "left", color = "#999999", weight = px(2)),
+      locations = cells_body(columns = all_of(disp_cols[1]))
+    ) %>%
+
+    tab_options(
+      table.font.size            = px(12),
+      heading.title.font.size    = px(18),
+      column_labels.font.weight  = "bold",
+      table.border.top.color     = "#2C3E50",
+      table.border.top.width     = px(3),
+      heading.border.bottom.color = "#2C3E50",
+      column_labels.border.bottom.color = "#2C3E50",
+      column_labels.border.bottom.width = px(2),
+      table_body.hlines.color    = "#EDEDED",
+      data_row.padding           = px(6)
+    ) %>%
+
+    tab_source_note(
+      source_note = md("*Scenarios represent percentage deviations from baseline. Abs % error = |actual \u2013 forecast| / |actual| \u00d7 100.*")
+    )
+
+  # --- Two-line HTML for "both" ---
+  if (content == "both") {
+    tbl <- tbl %>%
+      text_transform(
+        fn = function(x) {
+          parts <- strsplit(x, "\n")
+          sapply(parts, function(p) {
+            if (length(p) == 2) {
+              paste0(
+                "<span style='font-weight:600;'>", p[1], "</span><br>",
+                "<span style='font-size:10px; color:#777;'>", p[2], "</span>"
+              )
+            } else {
+              p[1]
+            }
+          })
+        },
+        locations = cells_body(columns = all_of(disp_cols))
+      )
+  }
+
+  # --- Red/white colouring + white text on dark cells ---
+  if (use_colour) {
+    err_domain <- range(df_ready[error_col_names], na.rm = TRUE)
+
+    for (i in seq_along(scenario_names)) {
+      tbl <- tbl %>%
+        data_color(
+          columns        = all_of(error_col_names[i]),
+          target_columns = all_of(disp_cols[i]),
+          palette        = c("#FFFFFF", "#FDEDED", "#F5B7B1", "#E74C3C", "#922B21"),
+          domain         = err_domain
+        )
+    }
+
+    # White text on dark cells
+    err_midpoint <- mean(err_domain)
+    for (i in seq_along(scenario_names)) {
+      dark_rows <- which(df_ready[[error_col_names[i]]] > err_midpoint)
+      if (length(dark_rows) > 0) {
+        tbl <- tbl %>%
+          tab_style(
+            style     = cell_text(color = "#FFFFFF"),
+            locations = cells_body(
+              columns = all_of(disp_cols[i]),
+              rows    = dark_rows
+            )
+          )
+      }
+    }
+
+    # Make sub-text inherit white on dark cells for "both" content
+    if (content == "both") {
+      tbl <- tbl %>%
+        text_transform(
+          fn = function(x) {
+            gsub("color:#777;", "color:inherit;", x, fixed = TRUE)
+          },
+          locations = cells_body(columns = all_of(disp_cols))
+        )
+    }
+  }
+
+  tbl
+}
+
+# =============================================================================
+# USAGE
+# =============================================================================
+
+# With abbreviate_numbers = TRUE  ->  "1500" displays as "1K", "250000" as "250K"
+# With abbreviate_numbers = FALSE ->  "1500" displays as "1,500", "250000" as "250,000"
+
+build_forecast_table(df, response_level = "Apple",  content = "num",  use_colour = FALSE)
+build_forecast_table(df, response_level = "Apple",  content = "num",  use_colour = TRUE)
+build_forecast_table(df, response_level = "Apple",  content = "pct",  use_colour = FALSE)
+build_forecast_table(df, response_level = "Apple",  content = "pct",  use_colour = TRUE)
+build_forecast_table(df, response_level = "Apple",  content = "both", use_colour = FALSE)
+build_forecast_table(df, response_level = "Apple",  content = "both", use_colour = TRUE)
+
+# build_forecast_table(df, response_level = "Banana", content = "both", use_colour = TRUE)
+# build_forecast_table(df, response_level = "Cherry", content = "pct",  use_colour = TRUE)
