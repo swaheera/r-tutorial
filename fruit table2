@@ -1,0 +1,263 @@
+library(tidyverse)
+library(gt)
+
+# =============================================================================
+# CONFIG — Define everything here once. Nothing else needs editing.
+# =============================================================================
+
+config <- list(
+
+  df                 = NULL,
+
+  response_col       = "response",
+  scenario_col       = "scenario",
+  true_scenario_col  = "true_scenario",
+  actual_col         = "total_real",
+  forecast_col       = "total_forecast",
+  trained_on_col     = "training_period",
+  tested_on_col      = "testing_period"
+)
+
+# =============================================================================
+# SIMULATE DATA — Replace with your real data, then set config$df
+# =============================================================================
+
+set.seed(42)
+scenarios <- seq(-3, 3, by = 0.5)
+bases     <- c(Apple = 1500, Banana = 250000, Cherry = 3500000)
+n_periods <- 10
+
+rows <- list()
+for (resp in names(bases)) {
+  for (p in 1:n_periods) {
+    av <- round(rnorm(1, bases[resp], bases[resp] * 0.1))
+    ts <- sample(scenarios, 1)
+    for (sc in scenarios) {
+      rows[[length(rows) + 1]] <- data.frame(
+        response        = resp,
+        training_period = paste0("Jan ", 2019 + p, " to Jan ", 2020 + p),
+        testing_period  = paste0("Feb ", 2020 + p, " to Dec ", 2020 + p),
+        total_real      = av,
+        true_scenario   = ts,
+        scenario        = sc,
+        total_forecast  = round(av * runif(1, 0.85, 1.15)),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+}
+config$df <- do.call(rbind, rows)
+
+# --- Inspect your input data ---
+cat("\n=== INPUT DATAFRAME STRUCTURE ===\n")
+str(config$df)
+cat("\n=== FIRST 20 ROWS (Apple, period 1, scenarios -3 to +0.5) ===\n")
+print(head(config$df, 20))
+cat("\n=== UNIQUE VALUES IN SCENARIO COLUMN ===\n")
+print(sort(unique(config$df$scenario)))
+cat("\n=== UNIQUE RESPONSES ===\n")
+print(unique(config$df$response))
+cat("\n=== ROWS PER RESPONSE ===\n")
+print(table(config$df$response))
+
+# =============================================================================
+# ENGINE — Do not edit below
+# =============================================================================
+
+fmt_num <- function(x, abbrev) {
+  sapply(x, function(v) {
+    if (is.na(v)) return(NA_character_)
+    if (abbrev && abs(v) >= 1e6) return(paste0(formatC(round(v / 1e6, 1), format = "f", digits = 1), "M"))
+    if (abbrev && abs(v) >= 1e3) return(paste0(formatC(round(v / 1e3), format = "d"), "K"))
+    if (!abbrev) return(formatC(round(v), format = "d", big.mark = ","))
+    formatC(round(v), format = "d")
+  })
+}
+
+generate_all_tables <- function(cfg) {
+
+  responses <- sort(unique(cfg$df[[cfg$response_col]]))
+  results   <- list()
+
+  for (resp in responses) {
+
+    df_raw  <- cfg$df[cfg$df[[cfg$response_col]] == resp, ]
+    id_cols <- c(cfg$trained_on_col, cfg$tested_on_col, cfg$actual_col, cfg$true_scenario_col)
+    scens   <- sort(unique(df_raw[[cfg$scenario_col]]))
+
+    df_wide <- df_raw %>%
+      tidyr::pivot_wider(
+        id_cols      = all_of(id_cols),
+        names_from   = all_of(cfg$scenario_col),
+        values_from  = all_of(cfg$forecast_col),
+        names_prefix = "sc_"
+      )
+
+    sc_cols  <- paste0("sc_", scens)
+    err_cols <- paste0("err_", scens)
+
+    for (i in seq_along(sc_cols)) {
+      df_wide[[err_cols[i]]] <- round(
+        abs((df_wide[[cfg$actual_col]] - df_wide[[sc_cols[i]]]) / df_wide[[cfg$actual_col]]) * 100, 4
+      )
+    }
+
+    error_domain <- range(unlist(df_wide[err_cols]), na.rm = TRUE)
+    err_mid      <- mean(error_domain)
+
+    # Display columns for both abbreviation settings
+    dn_ab  <- paste0("dnum_ab_", scens)
+    dp_ab  <- paste0("dpct_ab_", scens)
+    db_ab  <- paste0("dboth_ab_", scens)
+    dn_fl  <- paste0("dnum_fl_", scens)
+    dp_fl  <- paste0("dpct_fl_", scens)
+    db_fl  <- paste0("dboth_fl_", scens)
+
+    for (i in seq_along(sc_cols)) {
+      fv      <- df_wide[[sc_cols[i]]]
+      pct     <- df_wide[[err_cols[i]]]
+      pct_str <- paste0(formatC(pct, format = "f", digits = 2), "%")
+
+      df_wide[[dn_ab[i]]]  <- fmt_num(fv, TRUE)
+      df_wide[[dp_ab[i]]]  <- pct_str
+      df_wide[[db_ab[i]]]  <- paste0(fmt_num(fv, TRUE), "\n(", pct_str, ")")
+
+      df_wide[[dn_fl[i]]]  <- fmt_num(fv, FALSE)
+      df_wide[[dp_fl[i]]]  <- pct_str
+      df_wide[[db_fl[i]]]  <- paste0(fmt_num(fv, FALSE), "\n(", pct_str, ")")
+    }
+
+    sc_labels   <- paste0(ifelse(scens >= 0, "+", ""), scens, "%")
+    always_hide <- c(sc_cols, err_cols, dn_ab, dp_ab, db_ab, dn_fl, dp_fl, db_fl)
+
+    # --- Inner table builder ---
+    build_one <- function(disp_cols, content, use_colour, ab) {
+
+      hide_cols <- setdiff(always_hide, disp_cols)
+
+      col_labels <- as.list(setNames(
+        c("Training Period", "Testing Period", "Actual Received", "True Scenario", sc_labels),
+        c(cfg$trained_on_col, cfg$tested_on_col, cfg$actual_col, cfg$true_scenario_col, disp_cols)
+      ))
+
+      tbl <- df_wide %>%
+        gt() %>%
+        cols_hide(columns = all_of(hide_cols)) %>%
+        cols_label(.list = col_labels) %>%
+        tab_header(
+          title    = md(paste0("**", resp, ": Performance of Forecasting Model Under Different Scenarios**")),
+          subtitle = md("*Model forecasts under different growth scenarios*")
+        ) %>%
+        tab_spanner(label = md("**Model Forecasts**"), columns = all_of(disp_cols)) %>%
+        text_transform(
+          fn        = function(x) fmt_num(as.numeric(x), ab),
+          locations = cells_body(columns = all_of(cfg$actual_col))
+        ) %>%
+        fmt_number(columns = all_of(cfg$true_scenario_col), decimals = 1) %>%
+        tab_style(
+          style     = cell_text(weight = "bold"),
+          locations = cells_body(columns = all_of(cfg$actual_col))
+        ) %>%
+        tab_style(
+          style     = cell_borders(sides = "left", color = "#999999", weight = px(2)),
+          locations = cells_body(columns = all_of(disp_cols[1]))
+        ) %>%
+        tab_options(
+          table.font.size                   = px(12),
+          heading.title.font.size           = px(16),
+          column_labels.font.weight         = "bold",
+          table.border.top.color            = "#2C3E50",
+          table.border.top.width            = px(3),
+          heading.border.bottom.color       = "#2C3E50",
+          column_labels.border.bottom.color = "#2C3E50",
+          column_labels.border.bottom.width = px(2),
+          table_body.hlines.color           = "#EDEDED",
+          data_row.padding                  = px(4)
+        ) %>%
+        tab_source_note(
+          source_note = md("*Abs % error = |actual \u2013 forecast| / |actual| \u00d7 100.*")
+        )
+
+      if (content == "both") {
+        tbl <- tbl %>%
+          text_transform(
+            fn = function(x) {
+              parts <- strsplit(x, "\n")
+              sapply(parts, function(p) {
+                if (length(p) == 2) {
+                  paste0("<span style='font-weight:600;'>", p[1], "</span><br>",
+                         "<span style='font-size:10px; color:#777;'>", p[2], "</span>")
+                } else p[1]
+              })
+            },
+            locations = cells_body(columns = all_of(disp_cols))
+          )
+      }
+
+      if (use_colour) {
+        for (i in seq_along(sc_cols)) {
+          tbl <- tbl %>%
+            data_color(
+              columns        = all_of(err_cols[i]),
+              target_columns = all_of(disp_cols[i]),
+              palette        = c("#FFFFFF", "#FDEDED", "#F5B7B1", "#E74C3C", "#922B21"),
+              domain         = error_domain
+            )
+        }
+        for (i in seq_along(sc_cols)) {
+          dark_rows <- which(df_wide[[err_cols[i]]] > err_mid)
+          if (length(dark_rows) > 0) {
+            tbl <- tbl %>%
+              tab_style(
+                style     = cell_text(color = "#FFFFFF"),
+                locations = cells_body(columns = all_of(disp_cols[i]), rows = dark_rows)
+              )
+          }
+        }
+        if (content == "both") {
+          tbl <- tbl %>%
+            text_transform(
+              fn = function(x) gsub("color:#777;", "color:inherit;", x, fixed = TRUE),
+              locations = cells_body(columns = all_of(disp_cols))
+            )
+        }
+      }
+
+      tbl
+    }
+
+    # --- 12 tables per response: 3 content x 2 colour x 2 abbrev ---
+    for (ab in c(TRUE, FALSE)) {
+      ab_tag <- ifelse(ab, "abbrev", "full")
+      dn <- if (ab) dn_ab else dn_fl
+      dp <- if (ab) dp_ab else dp_fl
+      db <- if (ab) db_ab else db_fl
+
+      for (ct in c("num", "pct", "both")) {
+        dc <- switch(ct, "num" = dn, "pct" = dp, "both" = db)
+        for (col in c(FALSE, TRUE)) {
+          key <- paste0(resp, "_", ct, "_", ifelse(col, "redwhite", "nocolour"), "_", ab_tag)
+          results[[key]] <- build_one(dc, ct, col, ab)
+        }
+      }
+    }
+  }
+
+  results
+}
+
+# =============================================================================
+# RUN — One call, ALL tables for ALL response levels, ALL combos
+# =============================================================================
+
+all_tables <- generate_all_tables(config)
+
+# Naming: {Response}_{num|pct|both}_{nocolour|redwhite}_{abbrev|full}
+#
+# Examples:
+#   all_tables[["Apple_both_redwhite_abbrev"]]
+#   all_tables[["Banana_pct_nocolour_full"]]
+#   all_tables[["Cherry_num_redwhite_abbrev"]]
+#
+# To see all available table names:
+# names(all_tables)
