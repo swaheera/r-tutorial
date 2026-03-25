@@ -1,0 +1,154 @@
+library(dplyr)
+library(forecast)
+
+# ==============================================================================
+# PICK ONE WINDOW AND ONE SCENARIO
+# ==============================================================================
+train_start  <- "2020-04-01"
+train_end    <- "2024-03-31"
+test_start   <- "2024-04-01"
+test_end     <- "2025-03-31"
+scenario_pct <- -3
+
+# ==============================================================================
+# PREP
+# ==============================================================================
+df <- mydf %>%
+  arrange(date) %>%
+  mutate(pop_lag1 = dplyr::lag(population, 1))
+
+train <- df %>% dplyr::filter(date >= train_start & date <= train_end & !is.na(pop_lag1))
+test  <- df %>% dplyr::filter(date >= test_start  & date <= test_end  & !is.na(pop_lag1))
+
+# ==============================================================================
+# SCENARIO POPULATION
+# ==============================================================================
+k        <- nrow(test)
+base_pop <- train$population[nrow(train)]
+end_pop  <- base_pop * (1 + scenario_pct / 100)
+
+test$pop_under_scenario     <- base_pop + (1:k) / k * (end_pop - base_pop)
+test$log_pop_under_scenario <- log(test$pop_under_scenario)
+
+# ==============================================================================
+# FIT & FORECAST
+# ==============================================================================
+xreg_train <- log(train$pop_lag1)
+
+model_total  <- auto.arima(log(train$total),  xreg = xreg_train)
+model_apples <- auto.arima(log(train$apples), xreg = xreg_train)
+model_banana <- auto.arima(log(train$banana), xreg = xreg_train)
+
+xreg_test <- test$log_pop_under_scenario
+
+fc_total  <- forecast(model_total,  xreg = xreg_test)
+fc_apples <- forecast(model_apples, xreg = xreg_test)
+fc_banana <- forecast(model_banana, xreg = xreg_test)
+
+test$fc_total          <- exp(as.numeric(fc_total$mean))
+test$fc_apples         <- exp(as.numeric(fc_apples$mean))
+test$fc_banana_method1 <- exp(as.numeric(fc_banana$mean))
+test$fc_banana_method2 <- test$fc_total - test$fc_apples
+
+test$log_fc_total          <- as.numeric(fc_total$mean)
+test$log_fc_apples         <- as.numeric(fc_apples$mean)
+test$log_fc_banana_method1 <- as.numeric(fc_banana$mean)
+test$log_fc_banana_method2 <- log(test$fc_banana_method2)
+
+# ==============================================================================
+# CUMULATIVE ERROR
+# ==============================================================================
+cum_actual_total  <- cumsum(test$total)
+cum_fc_total      <- cumsum(test$fc_total)
+cum_actual_apples <- cumsum(test$apples)
+cum_fc_apples     <- cumsum(test$fc_apples)
+cum_actual_banana <- cumsum(test$banana)
+cum_fc_banana1    <- cumsum(test$fc_banana_method1)
+cum_fc_banana2    <- cumsum(test$fc_banana_method2)
+
+test$cum_err_total_pct   <- abs(cum_actual_total  - cum_fc_total)  / cum_actual_total  * 100
+test$cum_err_apples_pct  <- abs(cum_actual_apples - cum_fc_apples) / cum_actual_apples * 100
+test$cum_err_banana1_pct <- abs(cum_actual_banana - cum_fc_banana1) / cum_actual_banana * 100
+test$cum_err_banana2_pct <- abs(cum_actual_banana - cum_fc_banana2) / cum_actual_banana * 100
+
+# ==============================================================================
+# POP GROWTH
+# ==============================================================================
+pop_first <- test$population[1]
+test$true_pop_growth_rate_pct <- (test$population / pop_first - 1) * 100
+
+# ==============================================================================
+# RESULTS
+# ==============================================================================
+results <- test %>%
+  dplyr::transmute(
+    training_period                = paste(train_start, "to", train_end),
+    testing_period                 = paste(test_start,  "to", test_end),
+    date                           = date,
+    scenario                       = paste0(scenario_pct, "%"),
+
+    base_pop_scenario              = base_pop,
+    base_pop_date                  = train$date[nrow(train)],
+
+    pop_under_scenario             = pop_under_scenario,
+    pop_under_scenario_formula     = paste0(round(base_pop,2), " + ", row_number(), "/", k,
+                                            " * (", round(end_pop,2), " - ", round(base_pop,2), ")"),
+
+    log_pop_under_scenario         = log_pop_under_scenario,
+    log_pop_under_scenario_formula = paste0("log(", round(pop_under_scenario, 2), ")"),
+
+    true_pop                       = population,
+
+    true_pop_growth_rate_pct       = paste0(round(true_pop_growth_rate_pct, 4), "%"),
+    true_pop_growth_rate_formula   = paste0("(", population, " / ", pop_first, " - 1) * 100%"),
+
+    true_total                     = total,
+    true_apple                     = apples,
+    true_banana                    = banana,
+
+    total_forecast                 = fc_total,
+    total_forecast_formula         = paste0("exp(", round(log_fc_total, 6), ")"),
+
+    apple_forecast                 = fc_apples,
+    apple_forecast_formula         = paste0("exp(", round(log_fc_apples, 6), ")"),
+
+    banana_method1_forecast        = fc_banana_method1,
+    banana_method1_forecast_formula = paste0("exp(", round(log_fc_banana_method1, 6), ")"),
+
+    banana_method2_forecast        = fc_banana_method2,
+    banana_method2_forecast_formula = paste0(round(fc_total, 4), " - ", round(fc_apples, 4)),
+
+    log_total_forecast             = log_fc_total,
+    log_total_forecast_formula     = paste0("log(", round(fc_total, 4), ")"),
+
+    log_apple_forecast             = log_fc_apples,
+    log_apple_forecast_formula     = paste0("log(", round(fc_apples, 4), ")"),
+
+    log_banana_method1_forecast    = log_fc_banana_method1,
+    log_banana_method1_forecast_formula = paste0("log(", round(fc_banana_method1, 4), ")"),
+
+    log_banana_method2_forecast    = log_fc_banana_method2,
+    log_banana_method2_forecast_formula = paste0("log(", round(fc_banana_method2, 4), ")"),
+
+    cum_error_total_pct            = paste0(round(cum_err_total_pct, 4), "%"),
+    cum_error_total_formula        = paste0("abs(", round(cum_actual_total, 2), " - ",
+                                            round(cum_fc_total, 2), ") / ",
+                                            round(cum_actual_total, 2), " * 100%"),
+
+    cum_error_apple_pct            = paste0(round(cum_err_apples_pct, 4), "%"),
+    cum_error_apple_formula        = paste0("abs(", round(cum_actual_apples, 2), " - ",
+                                            round(cum_fc_apples, 2), ") / ",
+                                            round(cum_actual_apples, 2), " * 100%"),
+
+    cum_error_banana_method1_pct   = paste0(round(cum_err_banana1_pct, 4), "%"),
+    cum_error_banana_method1_formula = paste0("abs(", round(cum_actual_banana, 2), " - ",
+                                              round(cum_fc_banana1, 2), ") / ",
+                                              round(cum_actual_banana, 2), " * 100%"),
+
+    cum_error_banana_method2_pct   = paste0(round(cum_err_banana2_pct, 4), "%"),
+    cum_error_banana_method2_formula = paste0("abs(", round(cum_actual_banana, 2), " - ",
+                                              round(cum_fc_banana2, 2), ") / ",
+                                              round(cum_actual_banana, 2), " * 100%")
+  )
+
+print(results)
