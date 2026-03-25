@@ -1,0 +1,441 @@
+library(tidyverse)
+library(gt)
+
+# =============================================================================
+# DATA SETUP — aggregate all_results to CUMULATIVE TOTALS over each test period
+# =============================================================================
+
+# Sum actuals and forecasts across all months in each window/scenario,
+# and grab the true pop growth rate from the last month (end-of-period growth)
+df_summed <- all_results %>%
+  mutate(
+    scenario_num = as.numeric(gsub("%", "", scenario))
+  ) %>%
+  group_by(training_period, testing_period, scenario_num) %>%
+  summarise(
+    sum_true_total             = sum(true_total,             na.rm = TRUE),
+    sum_true_apple             = sum(true_apple,             na.rm = TRUE),
+    sum_true_banana            = sum(true_banana,            na.rm = TRUE),
+    sum_fc_total               = sum(total_forecast,         na.rm = TRUE),
+    sum_fc_apple               = sum(apple_forecast,         na.rm = TRUE),
+    sum_fc_banana_method1      = sum(banana_method1_forecast, na.rm = TRUE),
+    sum_fc_banana_method2      = sum(banana_method2_forecast, na.rm = TRUE),
+    # true pop growth rate: take from the last month (cumulative growth over period)
+    true_pop_growth_num        = as.numeric(gsub("%", "", last(true_pop_growth_rate_pct))),
+    .groups = "drop"
+  )
+
+# Pivot into long format with one row per (window, scenario, response)
+# so that each response type can get its own table
+df_long <- bind_rows(
+  df_summed %>% transmute(
+    response         = "total",
+    training_period, testing_period,
+    scenario         = scenario_num,
+    true_scenario    = true_pop_growth_num,
+    total_real       = sum_true_total,
+    total_forecast   = sum_fc_total
+  ),
+  df_summed %>% transmute(
+    response         = "apples",
+    training_period, testing_period,
+    scenario         = scenario_num,
+    true_scenario    = true_pop_growth_num,
+    total_real       = sum_true_apple,
+    total_forecast   = sum_fc_apple
+  ),
+  df_summed %>% transmute(
+    response         = "banana_method1",
+    training_period, testing_period,
+    scenario         = scenario_num,
+    true_scenario    = true_pop_growth_num,
+    total_real       = sum_true_banana,
+    total_forecast   = sum_fc_banana_method1
+  ),
+  df_summed %>% transmute(
+    response         = "banana_method2",
+    training_period, testing_period,
+    scenario         = scenario_num,
+    true_scenario    = true_pop_growth_num,
+    total_real       = sum_true_banana,
+    total_forecast   = sum_fc_banana_method2
+  )
+)
+
+# =============================================================================
+# TABLE TITLES — 3 customizable titles per response type
+# =============================================================================
+
+# main_title:    Bold heading at the top of the table
+# main_subtitle: Appears under the spanner over forecast columns
+# title3:        Appears in parentheses after main_title, e.g. "(ARIMA)"
+
+total_main_title          <- "Total: Forecast Performance Under Different Scenarios"
+total_main_subtitle       <- "ARIMA Model Forecasts and Cumulative Error by Population-Growth Scenario"
+total_title3              <- "(ARIMA)"
+
+apples_main_title         <- "Apples: Forecast Performance Under Different Scenarios"
+apples_main_subtitle      <- "ARIMA Model Forecasts and Cumulative Error by Population-Growth Scenario"
+apples_title3             <- "(ARIMA)"
+
+banana_method1_main_title    <- "Banana (Direct): Forecast Performance Under Different Scenarios"
+banana_method1_main_subtitle <- "ARIMA Model Forecasts and Cumulative Error by Population-Growth Scenario"
+banana_method1_title3        <- "(ARIMA)"
+
+banana_method2_main_title    <- "Banana (Residual): Forecast Performance Under Different Scenarios"
+banana_method2_main_subtitle <- "Total minus Apples Forecasts and Cumulative Error by Population-Growth Scenario"
+banana_method2_title3        <- "(Residual)"
+
+# Store in named lists for easy lookup
+title_main_lookup <- c(
+  "total"          = total_main_title,
+  "apples"         = apples_main_title,
+  "banana_method1" = banana_method1_main_title,
+  "banana_method2" = banana_method2_main_title
+)
+
+subtitle_lookup <- c(
+  "total"          = total_main_subtitle,
+  "apples"         = apples_main_subtitle,
+  "banana_method1" = banana_method1_main_subtitle,
+  "banana_method2" = banana_method2_main_subtitle
+)
+
+title3_lookup <- c(
+  "total"          = total_title3,
+  "apples"         = apples_title3,
+  "banana_method1" = banana_method1_title3,
+  "banana_method2" = banana_method2_title3
+)
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+format_date_range <- function(x) {
+  sapply(x, function(s) {
+    parts     <- strsplit(s, " to ")[[1]]
+    formatted <- sapply(parts, function(d) format(as.Date(d), "%b %Y"))
+    paste(formatted, collapse = " to ")
+  })
+}
+
+fmt_num <- function(x, abbrev = TRUE) {
+  sapply(x, function(v) {
+    if (is.na(v)) return(NA_character_)
+    if (abbrev && abs(v) >= 1e6) return(paste0(round(v / 1e6, 1), "M"))
+    if (abbrev && abs(v) >= 1e3) return(paste0(round(v / 1e3), "K"))
+    formatC(round(v), format = "d", big.mark = ",")
+  })
+}
+
+fmt_signed <- function(x) {
+  sapply(x, function(v) {
+    if (is.na(v)) return(NA_character_)
+    paste0(ifelse(v >= 0, "+", ""), formatC(v, format = "f", digits = 2), "%")
+  })
+}
+
+calc_error <- function(actual, forecast) {
+  round(abs((actual - forecast) / actual) * 100, 2)
+}
+
+# =============================================================================
+# DATA PREPARATION — pivot wide by scenario
+# =============================================================================
+
+prepare_wide_data <- function(df) {
+  scenarios <- sort(unique(df$scenario))
+
+  df_wide <- df %>%
+    pivot_wider(
+      id_cols      = c(training_period, testing_period, true_scenario, total_real),
+      names_from   = scenario,
+      values_from  = total_forecast,
+      names_prefix = "fc_"
+    )
+
+  for (sc in scenarios) {
+    fc_col  <- paste0("fc_", sc)
+    err_col <- paste0("err_", sc)
+    df_wide[[err_col]] <- calc_error(df_wide$total_real, df_wide[[fc_col]])
+  }
+
+  list(data = df_wide, scenarios = scenarios)
+}
+
+# =============================================================================
+# SHARED STYLING
+# =============================================================================
+
+apply_shared_style <- function(tbl, fc_cols, non_fc_cols, table_title, table_subtitle, table_title3 = "") {
+
+  # Combine main title and title3 (e.g. "Apples: Forecast Performance ... (ARIMA)")
+  full_title <- if (nchar(table_title3) > 0) {
+    paste0("**", table_title, "** ", table_title3)
+  } else {
+    paste0("**", table_title, "**")
+  }
+
+  tbl %>%
+    text_transform(
+      fn       = function(x) format_date_range(x),
+      locations = cells_body(columns = c(training_period, testing_period))
+    ) %>%
+    tab_header(
+      title = md(full_title)
+    ) %>%
+    tab_spanner(
+      label   = html(paste0(
+        "<b>Model Forecasts</b><br>",
+        "<span style='font-weight:normal; font-size:10px;'>", table_subtitle, "</span>"
+      )),
+      columns = all_of(fc_cols)
+    ) %>%
+    tab_style(
+      style     = cell_text(weight = "bold"),
+      locations = cells_body(columns = total_real)
+    ) %>%
+    tab_style(
+      style     = cell_text(align = "center"),
+      locations = cells_body(columns = all_of(c(non_fc_cols, fc_cols)))
+    ) %>%
+    tab_style(
+      style     = cell_text(align = "center"),
+      locations = cells_column_labels()
+    ) %>%
+    tab_style(
+      style     = cell_borders(sides = "left", color = "#999999", weight = px(2)),
+      locations = cells_body(columns = all_of(fc_cols[1]))
+    ) %>%
+    tab_style(
+      style     = cell_borders(sides = "left", color = "#999999", weight = px(2)),
+      locations = cells_column_labels(columns = all_of(fc_cols[1]))
+    ) %>%
+    tab_style(
+      style     = cell_borders(sides = "right", color = "#E0E0E0", weight = px(1)),
+      locations = cells_body(columns = c(training_period, testing_period, total_real))
+    ) %>%
+    tab_style(
+      style     = cell_borders(sides = "right", color = "#E0E0E0", weight = px(1)),
+      locations = cells_body(columns = all_of(fc_cols[-length(fc_cols)]))
+    ) %>%
+    tab_style(
+      style     = cell_text(v_align = "middle"),
+      locations = cells_body()
+    ) %>%
+    tab_options(
+      table.font.size                   = px(12),
+      heading.title.font.size           = px(16),
+      heading.subtitle.font.size        = px(12),
+      column_labels.font.size           = px(11),
+      column_labels.font.weight         = "bold",
+      column_labels.padding             = px(4),
+      column_labels.vlines.color        = "#E0E0E0",
+      column_labels.vlines.width        = px(1),
+      table.border.top.color            = "#2C3E50",
+      table.border.top.width            = px(3),
+      heading.border.bottom.color       = "#2C3E50",
+      column_labels.border.bottom.color = "#2C3E50",
+      column_labels.border.bottom.width = px(2),
+      table_body.hlines.color           = "#EDEDED",
+      data_row.padding                  = px(2),
+      source_notes.font.size            = px(10)
+    )
+}
+
+# =============================================================================
+# FORMAT FORECAST CELLS: number + error percent
+# =============================================================================
+
+format_both <- function(tbl, df_wide, scenarios) {
+  fc_cols  <- paste0("fc_", scenarios)
+  err_cols <- paste0("err_", scenarios)
+
+  for (i in seq_along(scenarios)) {
+    local({
+      my_num <- fmt_num(df_wide[[fc_cols[i]]], abbrev = FALSE)
+      my_pct <- paste0(df_wide[[err_cols[i]]], "%")
+      my_combined <- paste0(
+        "<span style='font-weight:600;'>", my_num, "</span><br>",
+        "<span style='font-size:10px; color:#777;'>", my_pct, "</span>"
+      )
+      my_col <- fc_cols[i]
+      tbl <<- tbl %>%
+        text_transform(
+          fn       = function(x) my_combined,
+          locations = cells_body(columns = all_of(my_col))
+        )
+    })
+  }
+  tbl
+}
+
+# =============================================================================
+# COLOR SCALE LEGEND
+# =============================================================================
+
+make_color_legend <- function(error_domain, n_buckets = 5) {
+  palette <- colorRampPalette(c("#FFFFFF", "#FDEDED", "#F5B7B1", "#E74C3C", "#922B21"))
+  colors  <- palette(n_buckets)
+  breaks  <- seq(error_domain[1], error_domain[2], length.out = n_buckets + 1)
+  text_threshold <- error_domain[1] + 0.80 * diff(error_domain)
+
+  boxes <- sapply(seq_len(n_buckets), function(i) {
+    lo      <- round(breaks[i], 1)
+    hi      <- round(breaks[i + 1], 1)
+    label   <- paste0(lo, "% – ", hi, "%")
+    mid_val <- (breaks[i] + breaks[i + 1]) / 2
+    txt_col <- if (mid_val > text_threshold) "#FFFFFF" else "#333333"
+    paste0(
+      "<span style='display:inline-block; padding:3px 6px; background:", colors[i],
+      "; color:", txt_col,
+      "; font-size:9px; border:1px solid #ddd; white-space:nowrap;'>",
+      label, "</span>"
+    )
+  })
+
+  html(paste0(
+    "<div style='display:inline-flex; align-items:center; gap:2px; margin-top:2px;'>",
+    "<span style='font-size:10px; font-weight:600; color:#555; margin-right:4px;'>Abs % Error:</span>",
+    paste(boxes, collapse = ""),
+    "</div>"
+  ))
+}
+
+# =============================================================================
+# APPLY RED-WHITE COLOR SCALE
+# =============================================================================
+
+apply_color <- function(tbl, df_wide, scenarios) {
+  fc_cols  <- paste0("fc_", scenarios)
+  err_cols <- paste0("err_", scenarios)
+
+  error_domain  <- range(unlist(df_wide[err_cols]), na.rm = TRUE)
+  err_threshold <- error_domain[1] + 0.80 * diff(error_domain)
+
+  for (i in seq_along(scenarios)) {
+    tbl <- tbl %>%
+      data_color(
+        columns        = all_of(err_cols[i]),
+        target_columns = all_of(fc_cols[i]),
+        palette        = c("#FFFFFF", "#FDEDED", "#F5B7B1", "#E74C3C", "#922B21"),
+        domain         = error_domain
+      )
+  }
+
+  for (i in seq_along(scenarios)) {
+    dark_rows <- which(df_wide[[err_cols[i]]] > err_threshold)
+    if (length(dark_rows) > 0) {
+      tbl <- tbl %>%
+        tab_style(
+          style     = cell_text(color = "#FFFFFF"),
+          locations = cells_body(columns = all_of(fc_cols[i]), rows = dark_rows)
+        )
+    }
+  }
+
+  for (i in seq_along(scenarios)) {
+    light_rows <- which(df_wide[[err_cols[i]]] <= err_threshold)
+    if (length(light_rows) > 0) {
+      tbl <- tbl %>%
+        tab_style(
+          style     = cell_text(color = "#000000"),
+          locations = cells_body(columns = all_of(fc_cols[i]), rows = light_rows)
+        )
+    }
+  }
+
+  tbl <- tbl %>%
+    text_transform(
+      fn       = function(x) gsub("color:#777;", "color:inherit;", x, fixed = TRUE),
+      locations = cells_body(columns = all_of(fc_cols))
+    )
+
+  tbl %>%
+    tab_source_note(source_note = make_color_legend(error_domain))
+}
+
+# =============================================================================
+# BUILD TABLE (with true growth rate column)
+# =============================================================================
+
+make_table_v1 <- function(df_wide, scenarios, table_title, table_subtitle, table_title3 = "") {
+
+  fc_cols   <- paste0("fc_", scenarios)
+  err_cols  <- paste0("err_", scenarios)
+  sc_labels <- paste0(ifelse(scenarios >= 0, "+", ""), scenarios, "%")
+
+  col_labels <- setNames(
+    c(
+      list(
+        html("Training<br>Period<br>&nbsp;"),
+        html("Testing<br>Period<br>&nbsp;"),
+        html("True Growth<br>Rate During<br>Testing Period"),
+        html("Actual Total<br>Received During<br>Testing Period")
+      ),
+      lapply(sc_labels, html)
+    ),
+    c("training_period", "testing_period", "true_scenario", "total_real", fc_cols)
+  )
+
+  tbl <- df_wide %>%
+    gt() %>%
+    cols_hide(columns = all_of(err_cols)) %>%
+    cols_label(.list = col_labels) %>%
+    apply_shared_style(fc_cols, non_fc_cols = c("true_scenario", "total_real"),
+                       table_title = table_title, table_subtitle = table_subtitle,
+                       table_title3 = table_title3)
+
+  tbl <- tbl %>%
+    text_transform(
+      fn       = function(x) fmt_signed(as.numeric(x)),
+      locations = cells_body(columns = true_scenario)
+    )
+
+  tbl <- tbl %>%
+    tab_style(
+      style     = cell_borders(sides = "right", color = "#E0E0E0", weight = px(1)),
+      locations = cells_body(columns = true_scenario)
+    )
+
+  tbl <- tbl %>%
+    text_transform(
+      fn       = function(x) fmt_num(as.numeric(x), abbrev = FALSE),
+      locations = cells_body(columns = total_real)
+    )
+
+  tbl <- format_both(tbl, df_wide, scenarios)
+  tbl <- apply_color(tbl, df_wide, scenarios)
+
+  tbl
+}
+
+# =============================================================================
+# GENERATE ALL FOUR TABLES
+# =============================================================================
+
+response_types <- c("total", "apples", "banana_method1", "banana_method2")
+
+tables <- list()
+
+for (resp in response_types) {
+
+  df_resp   <- df_long %>% filter(response == resp)
+  prep      <- prepare_wide_data(df_resp)
+  df_wide   <- prep$data
+  scenarios <- prep$scenarios
+
+  tables[[resp]] <- make_table_v1(
+    df_wide, scenarios,
+    table_title    = title_main_lookup[resp],
+    table_subtitle = subtitle_lookup[resp],
+    table_title3   = title3_lookup[resp]
+  )
+}
+
+# Access individual tables:
+# tables[["total"]]
+# tables[["apples"]]
+# tables[["banana_method1"]]
+# tables[["banana_method2"]]
