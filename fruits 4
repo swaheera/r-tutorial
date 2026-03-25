@@ -1,0 +1,383 @@
+library(tidyverse)
+library(gt)
+
+# =============================================================================
+# SIMULATE TEST DATA
+# =============================================================================
+
+set.seed(123)
+
+scenarios <- seq(-3, 3, by = 0.5)
+n_rows <- 10
+
+base_data <- tibble(
+    row_id = 1:n_rows,
+    training_period = paste0(2015:(2015 + n_rows - 1), "-01-01 to ", 2016:(2016 + n_rows - 1), "-01-01"),
+    testing_period  = paste0(2016:(2016 + n_rows - 1), "-02-01 to ", 2016:(2016 + n_rows - 1), "-12-01"),
+    true_scenario   = round(runif(n_rows, -0.5, 0.5), 2),
+    total_real      = round(rnorm(n_rows, 50000, 15000))
+)
+
+mydf <- base_data %>%
+    crossing(scenario = scenarios) %>%
+    mutate(
+        response       = "apples",
+        total_forecast = round(total_real * (1 + scenario / 100) + rnorm(n(), 0, total_real * 0.05))
+    ) %>%
+    dplyr::select(response, training_period, testing_period, scenario, true_scenario, total_real, total_forecast)
+
+# =============================================================================
+# DATA SETUP
+# =============================================================================
+
+df <- mydf %>% filter(response == "apples")
+
+# =============================================================================
+# TABLE TITLES
+# =============================================================================
+
+table_title    <- "Apples: Forecast Performance Under Different Scenarios"
+table_subtitle <- "Model Forecasts and Performance Under Different Scenarios"
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+format_date_range <- function(x) {
+    sapply(x, function(s) {
+        parts     <- strsplit(s, " to ")[[1]]
+        formatted <- sapply(parts, function(d) format(as.Date(d), "%b %Y"))
+        paste(formatted, collapse = " to ")
+    })
+}
+
+fmt_num <- function(x, abbrev = TRUE) {
+    sapply(x, function(v) {
+        if (is.na(v)) return(NA_character_)
+        if (abbrev && abs(v) >= 1e6) return(paste0(round(v / 1e6, 1), "M"))
+        if (abbrev && abs(v) >= 1e3) return(paste0(round(v / 1e3), "K"))
+        formatC(round(v), format = "d", big.mark = ",")
+    })
+}
+
+calc_error <- function(actual, forecast) {
+    round(abs((actual - forecast) / actual) * 100, 2)
+}
+
+# =============================================================================
+# DATA PREPARATION
+# =============================================================================
+
+prepare_wide_data <- function(df) {
+    scenarios <- sort(unique(df$scenario))
+
+    df_wide <- df %>%
+        pivot_wider(
+            id_cols     = c(training_period, testing_period, total_real),
+            names_from  = scenario,
+            values_from = total_forecast,
+            names_prefix = "fc_"
+        )
+
+    for (sc in scenarios) {
+        fc_col <- paste0("fc_", sc)
+        err_col <- paste0("err_", sc)
+        df_wide[[err_col]] <- calc_error(df_wide$total_real, df_wide[[fc_col]])
+    }
+
+    list(data = df_wide, scenarios = scenarios)
+}
+
+# =============================================================================
+# TABLE BUILDING FUNCTIONS
+# =============================================================================
+
+build_base_table <- function(df_wide, scenarios) {
+
+    fc_cols  <- paste0("fc_", scenarios)
+    err_cols <- paste0("err_", scenarios)
+    sc_labels <- paste0(ifelse(scenarios >= 0, "+", ""), scenarios, "%")
+
+    # ---- Consistent 3-line headers for cols 1-4, single line for scenario cols ----
+    col_labels <- setNames(
+        c(
+            list(
+                html("Training<br>Period<br>&nbsp;"),
+                html("Testing<br>Period<br>&nbsp;"),
+                html("Actual Number<br>Received During<br>Testing Period")
+            ),
+            lapply(sc_labels, html)
+        ),
+        c("training_period", "testing_period", "total_real", fc_cols)
+    )
+
+    df_wide %>%
+        gt() %>%
+        cols_hide(columns = all_of(err_cols)) %>%
+        cols_label(.list = col_labels) %>%
+
+        # Format dates
+        text_transform(
+            fn       = function(x) format_date_range(x),
+            locations = cells_body(columns = c(training_period, testing_period))
+        ) %>%
+
+        # Title
+        tab_header(
+            title = md(paste0("**", table_title, "**"))
+        ) %>%
+
+        # Spanner over forecast columns
+        tab_spanner(
+            label   = html(paste0(
+                "<b>Model Forecasts</b><br>",
+                "<span style='font-weight:normal; font-size:10px;'>", table_subtitle, "</span>"
+            )),
+            columns = all_of(fc_cols)
+        ) %>%
+
+        # Bold actual column
+        tab_style(
+            style     = cell_text(weight = "bold"),
+            locations = cells_body(columns = total_real)
+        ) %>%
+
+        # Center-align columns 3 & 4
+        tab_style(
+            style     = cell_text(align = "center"),
+            locations = cells_body(columns = total_real)
+        ) %>%
+        tab_style(
+            style     = cell_text(align = "center"),
+            locations = cells_column_labels(columns = c(training_period, testing_period, total_real))
+        ) %>%
+
+        # Center-align forecast columns
+        tab_style(
+            style     = cell_text(align = "center"),
+            locations = cells_body(columns = all_of(fc_cols))
+        ) %>%
+        tab_style(
+            style     = cell_text(align = "center"),
+            locations = cells_column_labels(columns = all_of(fc_cols))
+        ) %>%
+
+        # Left border on first forecast column
+        tab_style(
+            style     = cell_borders(sides = "left", color = "#999999", weight = px(2)),
+            locations = cells_body(columns = all_of(fc_cols[1]))
+        ) %>%
+        tab_style(
+            style     = cell_borders(sides = "left", color = "#999999", weight = px(2)),
+            locations = cells_column_labels(columns = all_of(fc_cols[1]))
+        ) %>%
+
+        # Faint vertical dividers between non-forecast columns
+        tab_style(
+            style     = cell_borders(sides = "right", color = "#E0E0E0", weight = px(1)),
+            locations = cells_body(columns = c(training_period, testing_period, total_real))
+        ) %>%
+
+        # Faint vertical dividers between forecast columns
+        tab_style(
+            style     = cell_borders(sides = "right", color = "#E0E0E0", weight = px(1)),
+            locations = cells_body(columns = all_of(fc_cols[-length(fc_cols)]))
+        ) %>%
+
+        # Vertical alignment
+        tab_style(
+            style     = cell_text(v_align = "middle"),
+            locations = cells_body()
+        ) %>%
+
+        # Global options
+        tab_options(
+            table.font.size                = px(12),
+            heading.title.font.size        = px(16),
+            heading.subtitle.font.size     = px(12),
+            column_labels.font.size        = px(11),
+            column_labels.font.weight      = "bold",
+            column_labels.padding          = px(4),
+            column_labels.vlines.color     = "#E0E0E0",
+            column_labels.vlines.width     = px(1),
+            table.border.top.color         = "#2C3E50",
+            table.border.top.width         = px(3),
+            heading.border.bottom.color    = "#2C3E50",
+            column_labels.border.bottom.color = "#2C3E50",
+            column_labels.border.bottom.width = px(2),
+            table_body.hlines.color        = "#EDEDED",
+            data_row.padding               = px(2),
+            source_notes.font.size         = px(10)
+        ) %>%
+
+        tab_source_note(
+            source_note = md("*Abs % error = |actual – forecast| / |actual| × 100.*")
+        )
+}
+
+format_actual <- function(tbl, abbrev) {
+    tbl %>%
+        text_transform(
+            fn       = function(x) fmt_num(as.numeric(x), abbrev),
+            locations = cells_body(columns = total_real)
+        )
+}
+
+format_number_only <- function(tbl, df_wide, scenarios, abbrev) {
+    fc_cols <- paste0("fc_", scenarios)
+    tbl %>%
+        text_transform(
+            fn       = function(x) fmt_num(as.numeric(x), abbrev),
+            locations = cells_body(columns = all_of(fc_cols))
+        )
+}
+
+format_percent_only <- function(tbl, df_wide, scenarios) {
+    fc_cols  <- paste0("fc_", scenarios)
+    err_cols <- paste0("err_", scenarios)
+
+    for (i in seq_along(scenarios)) {
+        local({
+            my_pct <- paste0(df_wide[[err_cols[i]]], "%")
+            my_col <- fc_cols[i]
+            tbl <<- tbl %>%
+                text_transform(
+                    fn       = function(x) my_pct,
+                    locations = cells_body(columns = all_of(my_col))
+                )
+        })
+    }
+    tbl
+}
+
+format_both <- function(tbl, df_wide, scenarios, abbrev) {
+    fc_cols  <- paste0("fc_", scenarios)
+    err_cols <- paste0("err_", scenarios)
+
+    for (i in seq_along(scenarios)) {
+        local({
+            my_num <- fmt_num(df_wide[[fc_cols[i]]], abbrev)
+            my_pct <- paste0(df_wide[[err_cols[i]]], "%")
+            my_combined <- paste0(
+                "<span style='font-weight:600;'>", my_num, "</span><br>",
+                "<span style='font-size:10px; color:#777;'>", my_pct, "</span>"
+            )
+            my_col <- fc_cols[i]
+            tbl <<- tbl %>%
+                text_transform(
+                    fn       = function(x) my_combined,
+                    locations = cells_body(columns = all_of(my_col))
+                )
+        })
+    }
+    tbl
+}
+
+apply_color <- function(tbl, df_wide, scenarios, content_type) {
+    fc_cols  <- paste0("fc_", scenarios)
+    err_cols <- paste0("err_", scenarios)
+
+    error_domain <- range(unlist(df_wide[err_cols]), na.rm = TRUE)
+    err_mid      <- mean(error_domain)
+
+    for (i in seq_along(scenarios)) {
+        tbl <- tbl %>%
+            data_color(
+                columns        = all_of(err_cols[i]),
+                target_columns = all_of(fc_cols[i]),
+                palette        = c("#FFFFFF", "#FDEDED", "#F5B7B1", "#E74C3C", "#922B21"),
+                domain         = error_domain
+            )
+    }
+
+    for (i in seq_along(scenarios)) {
+        dark_rows <- which(df_wide[[err_cols[i]]] > err_mid)
+        if (length(dark_rows) > 0) {
+            tbl <- tbl %>%
+                tab_style(
+                    style     = cell_text(color = "#FFFFFF"),
+                    locations = cells_body(columns = all_of(fc_cols[i]), rows = dark_rows)
+                )
+        }
+    }
+
+    if (content_type == "both") {
+        tbl <- tbl %>%
+            text_transform(
+                fn       = function(x) gsub("color:#777;", "color:inherit;", x, fixed = TRUE),
+                locations = cells_body(columns = all_of(fc_cols))
+            )
+    }
+
+    tbl
+}
+
+# =============================================================================
+# MAIN TABLE GENERATOR
+# =============================================================================
+
+make_table <- function(df_wide, scenarios, content, use_color, abbrev) {
+
+    tbl <- build_base_table(df_wide, scenarios)
+    tbl <- format_actual(tbl, abbrev)
+
+    if (content == "number") {
+        tbl <- format_number_only(tbl, df_wide, scenarios, abbrev)
+    } else if (content == "percent") {
+        tbl <- format_percent_only(tbl, df_wide, scenarios)
+    } else if (content == "both") {
+        tbl <- format_both(tbl, df_wide, scenarios, abbrev)
+    }
+
+    if (use_color) {
+        tbl <- apply_color(tbl, df_wide, scenarios, content)
+    }
+
+    tbl
+}
+
+# =============================================================================
+# GENERATE ALL TABLES
+# =============================================================================
+
+prep      <- prepare_wide_data(df)
+df_wide   <- prep$data
+scenarios <- prep$scenarios
+
+# --- NO COLOR ---
+no_color_num_abbrev  <- make_table(df_wide, scenarios, "number",  FALSE, TRUE)
+no_color_num_full    <- make_table(df_wide, scenarios, "number",  FALSE, FALSE)
+no_color_pct_abbrev  <- make_table(df_wide, scenarios, "percent", FALSE, TRUE)
+no_color_pct_full    <- make_table(df_wide, scenarios, "percent", FALSE, FALSE)
+no_color_both_abbrev <- make_table(df_wide, scenarios, "both",    FALSE, TRUE)
+no_color_both_full   <- make_table(df_wide, scenarios, "both",    FALSE, FALSE)
+
+# --- RED-WHITE COLOR ---
+red_num_abbrev  <- make_table(df_wide, scenarios, "number",  TRUE, TRUE)
+red_num_full    <- make_table(df_wide, scenarios, "number",  TRUE, FALSE)
+red_pct_abbrev  <- make_table(df_wide, scenarios, "percent", TRUE, TRUE)
+red_pct_full    <- make_table(df_wide, scenarios, "percent", TRUE, FALSE)
+red_both_abbrev <- make_table(df_wide, scenarios, "both",    TRUE, TRUE)
+red_both_full   <- make_table(df_wide, scenarios, "both",    TRUE, FALSE)
+
+# =============================================================================
+# ALL TABLES LIST
+# =============================================================================
+
+all_tables <- list(
+    no_color_num_abbrev  = no_color_num_abbrev,
+    no_color_num_full    = no_color_num_full,
+    no_color_pct_abbrev  = no_color_pct_abbrev,
+    no_color_pct_full    = no_color_pct_full,
+    no_color_both_abbrev = no_color_both_abbrev,
+    no_color_both_full   = no_color_both_full,
+    red_num_abbrev       = red_num_abbrev,
+    red_num_full         = red_num_full,
+    red_pct_abbrev       = red_pct_abbrev,
+    red_pct_full         = red_pct_full,
+    red_both_abbrev      = red_both_abbrev,
+    red_both_full        = red_both_full
+)
+
+# View any table:
+# all_tables$red_both_abbrev
