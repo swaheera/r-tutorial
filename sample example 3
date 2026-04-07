@@ -1,0 +1,50 @@
+library(dplyr)
+library(forecast)
+
+# ==============================================================================
+# SETTINGS
+# ==============================================================================
+train_start  <- "2020-04-01"
+train_end    <- "2024-03-31"
+test_start   <- "2024-04-01"
+test_end     <- "2025-03-31"
+scenario_pct <- -3
+
+# ==============================================================================
+# PREP
+# ==============================================================================
+df <- mydf %>%
+  arrange(date) %>%
+  mutate(pop_lag1 = dplyr::lag(population, 1))
+
+train <- df %>% dplyr::filter(date >= train_start & date <= train_end & !is.na(pop_lag1))
+test  <- df %>% dplyr::filter(date >= test_start  & date <= test_end  & !is.na(pop_lag1))
+
+# ==============================================================================
+# FIT MODELS
+# ==============================================================================
+xreg_train <- log(train$pop_lag1)
+
+model_total  <- auto.arima(log(train$total),  xreg = xreg_train)
+model_apples <- auto.arima(log(train$apples), xreg = xreg_train)
+
+# ==============================================================================
+# FORECAST
+# ==============================================================================
+k         <- nrow(test)
+base_pop  <- train$population[nrow(train)]
+end_pop   <- base_pop * (1 + scenario_pct / 100)
+pop_scen  <- base_pop + (1:k) / k * (end_pop - base_pop)
+xreg_test <- log(pop_scen)
+
+fc_total  <- exp(as.numeric(forecast(model_total,  xreg = xreg_test)$mean))
+fc_apples <- exp(as.numeric(forecast(model_apples, xreg = xreg_test)$mean))
+
+results <- data.frame(
+  date   = test$date,
+  total  = fc_total,
+  apples = fc_apples,
+  banana = fc_total - fc_apples
+)
+
+print(results)
