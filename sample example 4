@@ -1,0 +1,96 @@
+library(dplyr)
+library(forecast)
+
+# ==============================================================================
+# SIMULATE DATA
+# ==============================================================================
+set.seed(42)
+
+dates <- seq(as.Date("2020-04-01"), as.Date("2026-03-31"), by = "month")
+n <- length(dates)
+
+population <- 100000 + cumsum(rnorm(n, 50, 20))
+apples     <- exp(0.5 * log(population) + rnorm(n, 5, 0.05))
+banana     <- exp(0.3 * log(population) + rnorm(n, 4, 0.08))
+total      <- apples + banana
+
+mydf <- data.frame(
+  date       = dates,
+  population = population,
+  total      = total,
+  apples     = apples,
+  banana     = banana
+)
+
+# ==============================================================================
+# SETTINGS
+# ==============================================================================
+train_start  <- "2020-04-01"
+train_end    <- "2025-03-31"
+test_start   <- "2025-04-01"
+test_end     <- "2026-03-31"
+
+# ==============================================================================
+# PREP
+# ==============================================================================
+df <- mydf %>%
+  arrange(date) %>%
+  mutate(pop_lag1 = dplyr::lag(population, 1))
+
+train <- df %>% dplyr::filter(date >= train_start & date <= train_end & !is.na(pop_lag1))
+test  <- df %>% dplyr::filter(date >= test_start  & date <= test_end  & !is.na(pop_lag1))
+
+# ==============================================================================
+# FIT MODELS
+# ==============================================================================
+xreg_train <- log(train$pop_lag1)
+
+model_total  <- auto.arima(log(train$total),  xreg = xreg_train)
+model_apples <- auto.arima(log(train$apples), xreg = xreg_train)
+
+# ==============================================================================
+# PART 1: SINGLE SCENARIO
+# ==============================================================================
+scenario_pct <- -3
+
+k         <- nrow(test)
+base_pop  <- train$population[nrow(train)]
+end_pop   <- base_pop * (1 + scenario_pct / 100)
+pop_scen  <- base_pop + (1:k) / k * (end_pop - base_pop)
+xreg_test <- log(pop_scen)
+
+fc_total  <- exp(as.numeric(forecast(model_total,  xreg = xreg_test)$mean))
+fc_apples <- exp(as.numeric(forecast(model_apples, xreg = xreg_test)$mean))
+
+results_single <- data.frame(
+  date   = test$date,
+  total  = fc_total,
+  apples = fc_apples,
+  banana = fc_total - fc_apples
+)
+
+print(results_single)
+
+# ==============================================================================
+# PART 2: MULTIPLE SCENARIOS
+# ==============================================================================
+scenario_pct <- c(-3, 0, 3)
+
+results_multi <- do.call(rbind, lapply(scenario_pct, function(s) {
+  end_pop   <- base_pop * (1 + s / 100)
+  pop_scen  <- base_pop + (1:k) / k * (end_pop - base_pop)
+  xreg_test <- log(pop_scen)
+
+  fc_total  <- exp(as.numeric(forecast(model_total,  xreg = xreg_test)$mean))
+  fc_apples <- exp(as.numeric(forecast(model_apples, xreg = xreg_test)$mean))
+
+  data.frame(
+    scenario = s,
+    date     = test$date,
+    total    = fc_total,
+    apples   = fc_apples,
+    banana   = fc_total - fc_apples
+  )
+}))
+
+print(results_multi)
