@@ -1,0 +1,133 @@
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+
+# ===========================================================================
+# DATA
+# ===========================================================================
+set.seed(42)
+n <- 6
+totals <- sample(800000:1500000, n)
+a_pct  <- runif(n, 0.50, 0.60)
+
+df <- data.frame(
+    fiscal_year = c("2020-2021", "2021-2022", "2022-2023",
+                    "2023-2024", "2024-2025", "2025-2026"),
+    a = round(totals * a_pct),
+    b = round(totals * (1 - a_pct))
+)
+df$total <- df$a + df$b
+df <- df %>% filter(fiscal_year != "2020-2021")
+
+# ===========================================================================
+# PREP
+# ===========================================================================
+max_total <- max(df$total)
+
+# Use TWO separate text layers: one for the value, one for the %.
+# Each is a single line, so we can position them independently
+# and keep them well inside the segment.
+pad <- max_total * 0.04  # padding from each edge
+
+df_long <- df %>%
+    pivot_longer(cols = c(a, b), names_to = "category", values_to = "value") %>%
+    mutate(
+        category    = factor(category, levels = c("b", "a")),
+        fiscal_year = factor(fiscal_year, levels = df$fiscal_year)
+    ) %>%
+    group_by(fiscal_year) %>%
+    arrange(category) %>%
+    mutate(
+        pct      = round(value / sum(value) * 100, 1),
+        ymax     = cumsum(value),
+        ymin     = ymax - value,
+        y_mid    = (ymin + ymax) / 2,
+        # Position value label slightly above center, % slightly below
+        y_val    = pmin(y_mid + pad * 0.6, ymax - pad),
+        y_pct    = pmax(y_mid - pad * 0.6, ymin + pad),
+        val_text = comma(value),
+        pct_text = paste0("(", pct, "%)")
+    ) %>%
+    ungroup()
+
+df_totals <- df %>%
+    mutate(fiscal_year = factor(fiscal_year, levels = fiscal_year))
+
+# ===========================================================================
+# PLOT
+# ===========================================================================
+p <- ggplot(df_long, aes(x = fiscal_year, y = value, fill = category)) +
+    
+    geom_col(width = 0.6, colour = "white", linewidth = 0.5) +
+    
+    # Value line (e.g. "507,529")
+    geom_text(
+        aes(y = y_val, label = val_text),
+        size     = 4.5,
+        fontface = "bold",
+        colour   = "grey25"
+    ) +
+    
+    # Percent line (e.g. "(59.4%)")
+    geom_text(
+        aes(y = y_pct, label = pct_text),
+        size     = 4.2,
+        colour   = "grey35"
+    ) +
+    
+    # Total above each bar
+    geom_text(
+        data        = df_totals,
+        aes(x = fiscal_year, y = total, label = comma(total)),
+        inherit.aes = FALSE,
+        nudge_y     = max_total * 0.04,
+        size        = 5,
+        fontface    = "bold",
+        colour      = "grey15"
+    ) +
+    
+    scale_fill_manual(
+        values = c(a = "lightcoral", b = "lightblue"),
+        labels = c("Apples", "Bananas")
+    ) +
+    
+    scale_y_continuous(
+        labels = comma,
+        expand = expansion(mult = c(0, 0.10))
+    ) +
+    
+    labs(
+        title    = "Annual Volume by Category",
+        subtitle = "Apple and banana units across fiscal years 2021\u20132026.",
+        x        = "Fiscal Year",
+        y        = "Units",
+        fill     = NULL,
+        caption  = "Source: Internal data"
+    ) +
+    
+    theme_minimal(base_size = 13) +
+    theme(
+        plot.title           = element_text(face = "bold", size = 18,
+                                            margin = margin(b = 2)),
+        plot.subtitle        = element_text(colour = "grey40", size = 11,
+                                            margin = margin(b = 16)),
+        plot.caption         = element_text(colour = "grey50", size = 9,
+                                            hjust = 0, margin = margin(t = 12)),
+        plot.margin          = margin(16, 20, 10, 16),
+        axis.title.x         = element_text(margin = margin(t = 10), size = 13,
+                                            colour = "grey30"),
+        axis.title.y         = element_text(margin = margin(r = 10), size = 13,
+                                            colour = "grey30"),
+        axis.text            = element_text(colour = "grey25", size = 12),
+        panel.grid.major.x   = element_blank(),
+        panel.grid.minor     = element_blank(),
+        panel.grid.major.y   = element_line(colour = "grey88", linewidth = 0.3),
+        legend.position      = "top",
+        legend.justification = "left",
+        legend.text          = element_text(size = 10),
+        legend.key.size      = unit(14, "pt"),
+        legend.margin        = margin(b = -4)
+    )
+
+print(p)
