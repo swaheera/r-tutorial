@@ -1,0 +1,72 @@
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+
+# ── Constants ──
+VLINE_DATES <- as.Date(c("2023-07-01", "2023-12-01"))
+PLOT_START  <- min(master$date) - 30
+PLOT_END    <- max(master$date) + 30
+
+x_breaks <- seq.Date(
+    from = as.Date(format(min(master$date), "%Y-01-01")),
+    to   = PLOT_END,
+    by   = "12 months"
+)
+
+# ── Compute MoM change ──
+master <- master %>%
+    arrange(province, date) %>%
+    group_by(province) %>%
+    mutate(mom_change = food_cpi - lag(food_cpi, 1)) %>%
+    ungroup()
+
+# ── Toggle: show historical range in subtitle? ──
+SHOW_STATS <- TRUE
+
+# ── Plot builder ──
+make_plot <- function(df, y_col, prov, sub_txt, color, ylab, show_stats = FALSE) {
+    
+    subtitle <- NULL
+    if (show_stats) {
+        vals <- na.omit(df[[y_col]])
+        p025 <- round(quantile(vals, 0.025), 2)
+        p975 <- round(quantile(vals, 0.975), 2)
+        subtitle <- paste0("Historically, 95% of MoM changes in Food CPI fall between ", p025, " and ", p975, " points")
+    }
+    
+    ggplot(df, aes(x = date, y = .data[[y_col]])) +
+        geom_line(linewidth = 0.4, color = color) +
+        geom_hline(yintercept = 0, linetype = "dashed",
+                   color = "black", linewidth = 0.3) +
+        geom_vline(xintercept = VLINE_DATES, linetype = "dotted",
+                   color = "darkgreen", linewidth = 0.5) +
+        scale_x_date(
+            breaks = x_breaks,
+            labels = function(x) format(x, "%b\n%Y"),
+            limits = c(PLOT_START, PLOT_END)
+        ) +
+        labs(title = paste0(gsub(",.*", "", prov), " — ", sub_txt),
+             subtitle = subtitle,
+             x = NULL, y = ylab) +
+        theme_minimal(base_size = 8) +
+        theme(
+            plot.title       = element_text(face = "bold", size = 8, hjust = 0.5),
+            plot.subtitle    = element_text(size = 6, hjust = 0.5, color = "gray40"),
+            axis.text.x      = element_text(size = 6),
+            axis.text.y      = element_text(size = 6),
+            axis.title.y     = element_text(size = 6.5),
+            panel.grid.minor = element_blank(),
+            panel.grid.major = element_line(linewidth = 0.2),
+            plot.margin      = margin(3, 5, 3, 5)
+        )
+}
+
+# ── Set 1: MoM Change grid ──
+provinces <- sort(unique(master$province))
+nc <- min(4, length(provinces))
+
+plots <- lapply(provinces, function(prov) {
+    df <- master %>% filter(province == prov)
+    make_plot(df, "mom_change", prov, "Food CPI MoM Change", "steelblue", "Change in Food CPI", show_stats = SHOW_STATS)
+})
+do.call(grid.arrange, c(plots, ncol = nc))
