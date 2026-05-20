@@ -1,0 +1,436 @@
+# ============================================================
+# MULTI-HORIZON COUNTERFACTUAL: 1, 2, ..., 6 months
+# 
+# For each horizon h in 1..6:
+#   - simulate counterfactuals
+#   - produce per-province time series plots
+#   - produce 5x2 panel plot
+#   - produce per-horizon lollipop plot
+# 
+# At the end, produce a joint lollipop showing all horizons together.
+# ============================================================
+
+suppressPackageStartupMessages({
+    library(tidyverse)
+    library(ggplot2)
+    library(gridExtra)
+    library(grid)
+    library(lubridate)
+    library(forecast)
+    library(MASS)
+})
+
+set.seed(123)
+
+INTERVENTION_START <- as.Date("2023-07-01")
+HORIZONS           <- 1:6
+MAX_HORIZON        <- max(HORIZONS)
+N_SIMS             <- 10000
+
+DATA_SOURCE <- "Statistics Canada (2026)\nhttps://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1810000401"
+
+xreg_cols <- c("log_usa_imports_L2", "us_core_cpi_L2", "us_core_cpi_L4",
+               "usd_cad_L2", "s3_1", "s3_2")
+
+# ============================================================
+# FIT ONCE PER PROVINCE, SIMULATE AT MAX HORIZON
+# All shorter-horizon results are derived from the same sim_paths.
+# ============================================================
+
+fit_and_simulate <- function(province_name) {
+
+    df <- master %>%
+        dplyr::filter(province == province_name) %>%
+        dplyr::arrange(date)
+
+    df$log_usa_imports_L2 <- dplyr::lag(df$log_usa_imports, 2)
+    df$us_core_cpi_L2     <- dplyr::lag(df$us_core_cpi, 2)
+    df$us_core_cpi_L4     <- dplyr::lag(df$us_core_cpi, 4)
+    df$usd_cad_L2         <- dplyr::lag(df$usd_cad, 2)
+    m       <- month(df$date)
+    df$s3_1 <- as.numeric(m >= 5 & m <= 8)
+    df$s3_2 <- as.numeric(m >= 9)
+    df <- df %>% drop_na(us_core_cpi_L4)
+
+    train <- df %>% dplyr::filter(date < INTERVENTION_START)
+
+    max_end <- INTERVENTION_START %m+% months(MAX_HORIZON - 1)
+    intv_full <- df %>%
+        dplyr::filter(date >= INTERVENTION_START & date <= max_end)
+
+    y_ts       <- ts(train$food_cpi, frequency = 12)
+    xreg_train <- as.matrix(train[, xreg_cols])
+
+    fit <- auto.arima(y_ts, xreg = xreg_train, seasonal = FALSE,
+                      stepwise = FALSE, approximation = FALSE)
+
+    x_post_full <- as.matrix(intv_full[, xreg_cols])
+    n_full      <- nrow(intv_full)
+    sigma2      <- fit$sigma2
+    coef_hat    <- coef(fit)
+    vcov_mat    <- fit$var.coef
+
+    sim_paths <- matrix(NA, nrow = N_SIMS, ncol = n_full)
+    for (sim in 1:N_SIMS) {
+        coef_draw     <- MASS::mvrnorm(n = 1, mu = coef_hat, Sigma = vcov_mat)
+        fit_star      <- fit
+        fit_star$coef <- coef_draw
+        sim_paths[sim, ] <- tryCatch(
+            as.numeric(simulate(fit_star, nsim = n_full,
+                                xreg = x_post_full, future = TRUE)),
+            error = function(e) {
+                as.numeric(forecast(fit_star, xreg = x_post_full, h = n_full)$mean) +
+                    rnorm(n_full, 0, sqrt(sigma2))
+            })
+    }
+
+    list(
+        prov_df    = df,
+        train      = train,
+        intv_full  = intv_full,
+        fitted_pre = as.numeric(fitted(fit)),
+        sim_paths  = sim_paths
+    )
+}
+
+# ============================================================
+# DERIVE HORIZON-SPECIFIC RESULTS FROM CACHED SIMS
+# ============================================================
+
+extract_horizon <- function(cached, province_name, horizon) {
+
+    intervention_end <- INTERVENTION_START %m+% months(horizon - 1)
+
+    intv      <- cached$intv_full[1:horizon, , drop = FALSE]
+    sims_h    <- cached$sim_paths[, 1:horizon, drop = FALSE]
+    actuals_h <- intv$food_cpi
+
+    mean_diffs <- apply(sims_h, 1, function(row) mean(actuals_h - row))
+    est <- mean(mean_diffs)
+    ci  <- quantile(mean_diffs, c(0.025, 0.975))
+
+    sig_label <- ifelse(ci[1] > 0 | ci[2] < 0, "Yes", "No")
+
+    table_row <- data.frame(
+        province                  = province_name,
+        horizon                   = horizon,
+        estimated_effect          = round(est, 2),
+        ci_lower                  = round(ci[1], 2),
+        ci_upper                  = round(ci[2], 2),
+        ci_width                  = round(ci[2] - ci[1], 2),
+        statistically_significant = sig_label
+    )
+
+    plot_data <- list(
+        prov_df    = cached$prov_df,
+        train      = cached$train,
+        intv       = intv,
+        fitted_pre = cached$fitted_pre,
+        cf_mean    = colMeans(sims_h),
+        cf_lower   = apply(sims_h, 2, quantile, 0.025),
+        cf_upper   = apply(sims_h, 2, quantile, 0.975),
+        effect     = data.frame(estimate = est, ci_lower = ci[1], ci_upper = ci[2])
+    )
+
+    list(table_row = table_row, plot_data = plot_data,
+         intervention_end = intervention_end)
+}
+
+# ============================================================
+# RUN: cache simulations once per province
+# ============================================================
+
+provinces <- unique(master$province)
+provinces <- provinces[!grepl("Whitehorse|Yellowknife|Iqaluit|Canada", provinces)]
+
+cached_sims <- setNames(lapply(provinces, fit_and_simulate), provinces)
+
+# ============================================================
+# PLOT BUILDERS (parameterized by horizon)
+# ============================================================
+
+build_plot_df <- function(pd, intervention_end, plot_start, plot_end) {
+
+    plot_df <- pd$prov_df %>%
+        dplyr::filter(date >= plot_start & date <= plot_end)
+
+    plot_df$fitted_solid  <- NA_real_
+    plot_df$fitted_dotted <- NA_real_
+    plot_df$cf_lower      <- NA_real_
+    plot_df$cf_upper      <- NA_real_
+
+    pre <- pd$train
+    for (i in seq_along(pre$date)) {
+        idx <- which(plot_df$date == pre$date[i])
+        if (length(idx) > 0 && i <= length(pd$fitted_pre) && !is.na(pd$fitted_pre[i]))
+            plot_df$fitted_solid[idx] <- pd$fitted_pre[i]
+    }
+
+    intv <- pd$intv
+    for (i in seq_along(intv$date)) {
+        idx <- which(plot_df$date == intv$date[i])
+        if (length(idx) > 0) {
+            plot_df$fitted_dotted[idx] <- pd$cf_mean[i]
+            plot_df$cf_lower[idx]      <- pd$cf_lower[i]
+            plot_df$cf_upper[idx]      <- pd$cf_upper[i]
+        }
+    }
+
+    # Bridge: solid line ends at first counterfactual point
+    start_idx <- which(plot_df$date == INTERVENTION_START)
+    if (length(start_idx) > 0 && length(pd$cf_mean) >= 1) {
+        plot_df$fitted_solid[start_idx] <- pd$cf_mean[1]
+    }
+
+    plot_df
+}
+
+build_x_breaks <- function(plot_start, intervention_end) {
+    breaks <- c(plot_start, INTERVENTION_START, intervention_end)
+    if (as.numeric(INTERVENTION_START - plot_start) > 120) {
+        mid <- plot_start + floor((INTERVENTION_START - plot_start) / 2)
+        breaks <- sort(unique(c(breaks, mid)))
+    }
+    breaks
+}
+
+# ============================================================
+# MAIN LOOP: one horizon at a time
+# ============================================================
+
+all_horizons <- list()
+
+for (h in HORIZONS) {
+
+    cat("\n=========================================\n")
+    cat("HORIZON =", h, "month(s)\n")
+    cat("=========================================\n")
+
+    intervention_end <- INTERVENTION_START %m+% months(h - 1)
+    plot_start       <- as.Date("2023-01-01")
+    plot_end         <- intervention_end
+
+    window_label <- if (h == 1) {
+        format(INTERVENTION_START, "%B %Y")
+    } else {
+        paste0(format(INTERVENTION_START, "%B %Y"), " \u2013 ",
+               format(intervention_end, "%B %Y"))
+    }
+
+    # ---- extract horizon-specific results ----
+    horizon_results <- lapply(provinces, function(prov) {
+        extract_horizon(cached_sims[[prov]], prov, h)
+    })
+    names(horizon_results) <- provinces
+
+    table_rows  <- bind_rows(lapply(horizon_results, `[[`, "table_row"))
+    plot_data_h <- setNames(lapply(horizon_results, `[[`, "plot_data"), provinces)
+
+    all_horizons[[as.character(h)]] <- table_rows
+
+    # ============================================================
+    # INDIVIDUAL TIME SERIES PLOTS
+    # ============================================================
+
+    for (prov in provinces) {
+
+        pd      <- plot_data_h[[prov]]
+        plot_df <- build_plot_df(pd, intervention_end, plot_start, plot_end)
+
+        p <- ggplot(plot_df, aes(x = date)) +
+            geom_ribbon(aes(ymin = cf_lower, ymax = cf_upper,
+                            fill = "95% Prediction Interval"),
+                        alpha = 0.4, na.rm = TRUE) +
+            geom_line(aes(y = food_cpi, color = "Actual Food CPI"),
+                      linewidth = 0.7) +
+            geom_line(aes(y = fitted_solid, color = "Fitted Model"),
+                      linewidth = 0.8, na.rm = TRUE) +
+            geom_line(aes(y = fitted_dotted, color = "Counterfactual (No Rebate)"),
+                      linetype = "dotted", linewidth = 1, na.rm = TRUE) +
+            geom_vline(xintercept = INTERVENTION_START, linetype = "dotted",
+                       color = "darkgreen", linewidth = 0.8) +
+            geom_vline(xintercept = intervention_end, linetype = "dotted",
+                       color = "darkgreen", linewidth = 0.8) +
+            scale_color_manual(
+                name   = "",
+                values = c("Actual Food CPI"            = "black",
+                           "Fitted Model"               = "red",
+                           "Counterfactual (No Rebate)" = "red"),
+                guide  = guide_legend(order = 1,
+                                      override.aes = list(
+                                          linetype  = c("solid", "solid", "dotted"),
+                                          linewidth = c(0.7, 0.8, 1)))
+            ) +
+            scale_fill_manual(
+                name   = "",
+                values = c("95% Prediction Interval" = "lightpink"),
+                guide  = guide_legend(order = 2)
+            ) +
+            scale_x_date(breaks = build_x_breaks(plot_start, intervention_end),
+                         date_labels = "%b\n%Y",
+                         limits = c(plot_start, plot_end)) +
+            labs(
+                title   = paste0("Counterfactual Analysis: ", prov,
+                                 " (", h, "-month horizon)"),
+                x = "", y = "Food CPI",
+                caption = DATA_SOURCE
+            ) +
+            theme_minimal() +
+            theme(plot.title    = element_text(face = "bold", size = 12),
+                  plot.caption  = element_text(hjust = 0, size = 8),
+                  legend.position = "bottom",
+                  legend.text     = element_text(size = 8))
+
+        print(p)
+    }
+
+    # ============================================================
+    # MULTI-PANEL PLOT (5 x 2)
+    # ============================================================
+
+    province_plots <- list()
+
+    for (prov in provinces) {
+
+        pd      <- plot_data_h[[prov]]
+        plot_df <- build_plot_df(pd, intervention_end, plot_start, plot_end)
+        eff     <- pd$effect
+
+        panel_title <- gsub(",.*", "", prov)
+        panel_subtitle <- paste0(
+            "Avg. Effect: ", sprintf("%+.2f", eff$estimate), " pts | ",
+            "95% PI [", sprintf("%.2f", eff$ci_lower), ", ",
+            sprintf("%.2f", eff$ci_upper), "]"
+        )
+
+        p <- ggplot(plot_df, aes(x = date)) +
+            geom_ribbon(aes(ymin = cf_lower, ymax = cf_upper),
+                        fill = "lightpink", alpha = 0.4, na.rm = TRUE) +
+            geom_line(aes(y = food_cpi), color = "black", linewidth = 0.3) +
+            geom_line(aes(y = fitted_solid), color = "red",
+                      linewidth = 0.3, na.rm = TRUE) +
+            geom_line(aes(y = fitted_dotted), color = "red",
+                      linetype = "dotted", linewidth = 0.5, na.rm = TRUE) +
+            geom_vline(xintercept = INTERVENTION_START, linetype = "dotted",
+                       color = "darkgreen", linewidth = 0.4) +
+            geom_vline(xintercept = intervention_end, linetype = "dotted",
+                       color = "darkgreen", linewidth = 0.4) +
+            scale_x_date(breaks = build_x_breaks(plot_start, intervention_end),
+                         date_labels = "%b\n%Y",
+                         limits = c(plot_start, plot_end)) +
+            labs(title = panel_title, subtitle = panel_subtitle,
+                 x = NULL, y = NULL) +
+            theme_minimal(base_size = 8) +
+            theme(
+                plot.title       = element_text(face = "bold", size = 9, hjust = 0.5),
+                plot.subtitle    = element_text(size = 7, hjust = 0.5, color = "gray40"),
+                axis.text.x      = element_text(size = 7),
+                axis.text.y      = element_text(size = 7),
+                axis.ticks       = element_line(linewidth = 0.3),
+                panel.grid.minor = element_blank(),
+                panel.grid.major = element_line(linewidth = 0.2),
+                plot.margin      = margin(3, 5, 3, 5)
+            )
+
+        province_plots[[prov]] <- p
+    }
+
+    grid.arrange(
+        grobs = province_plots,
+        ncol  = 5,
+        nrow  = 2,
+        top   = textGrob(
+            paste0(
+                "Counterfactual Analysis: Estimated Grocery Rebate Association with Food CPI\n",
+                "Effect in index points | ", window_label
+            ),
+            gp = gpar(fontsize = 11, fontface = "bold")
+        ),
+        bottom = textGrob(
+            DATA_SOURCE,
+            gp = gpar(fontsize = 8, col = "gray40"),
+            hjust = 1, x = 1
+        )
+    )
+
+    # ============================================================
+    # PER-HORIZON LOLLIPOP
+    # ============================================================
+
+    lollipop <- ggplot(table_rows %>% dplyr::filter(!is.na(estimated_effect)),
+                       aes(x = reorder(province, estimated_effect),
+                           y = estimated_effect)) +
+        geom_point(size = 3, color = "black") +
+        geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                      width = 0.3, color = "black") +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+        coord_flip() +
+        labs(
+            title   = paste0("Estimated Grocery Rebate Association with Food CPI (",
+                             window_label, ")"),
+            x = "", y = "Estimated Change in Food CPI (Index Points)",
+            caption = DATA_SOURCE
+        ) +
+        theme_minimal() +
+        theme(
+            plot.title   = element_text(face = "bold", size = 12),
+            plot.caption = element_text(hjust = 0, size = 8)
+        )
+
+    print(lollipop)
+}
+
+# ============================================================
+# JOINT LOLLIPOP: ALL HORIZONS OVERLAID
+# ============================================================
+
+joint_df <- bind_rows(all_horizons) %>%
+    dplyr::filter(!is.na(estimated_effect)) %>%
+    dplyr::mutate(horizon = factor(horizon, levels = HORIZONS))
+
+# Order provinces by their max-horizon estimate
+prov_order <- joint_df %>%
+    dplyr::filter(horizon == MAX_HORIZON) %>%
+    dplyr::arrange(estimated_effect) %>%
+    dplyr::pull(province)
+
+joint_df$province <- factor(joint_df$province, levels = prov_order)
+
+dodge <- position_dodge(width = 0.7)
+
+joint_lollipop <- ggplot(joint_df,
+                         aes(x = province, y = estimated_effect,
+                             color = horizon, group = horizon)) +
+    geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper),
+                  width = 0.0, linewidth = 0.6, position = dodge) +
+    geom_point(size = 2, position = dodge) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    coord_flip() +
+    scale_color_brewer(palette = "RdYlBu", direction = -1,
+                       name = "Horizon\n(months)") +
+    labs(
+        title   = "Estimated Grocery Rebate Association with Food CPI by Horizon",
+        x = "", y = "Estimated Change in Food CPI (Index Points)",
+        caption = DATA_SOURCE
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title         = element_text(face = "bold", size = 12),
+        plot.caption       = element_text(hjust = 0, size = 8),
+        legend.position    = "right",
+        panel.grid.major.y = element_line(color = "gray90"),
+        panel.grid.minor   = element_blank()
+    )
+
+print(joint_lollipop)
+
+# ============================================================
+# SUMMARY TABLE (long format)
+# ============================================================
+
+summary_table <- bind_rows(all_horizons) %>%
+    dplyr::select(province, horizon, estimated_effect,
+                  ci_lower, ci_upper, ci_width) %>%
+    dplyr::arrange(province, horizon)
+
+print(summary_table)
