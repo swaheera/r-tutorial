@@ -1,0 +1,124 @@
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+# =====================================================
+# USER-CONFIGURABLE SETTINGS
+# =====================================================
+plot_title    <- "Snack Preferences by Animal and Size"
+y_axis_label  <- "Count (Millions)"
+legend_title  <- "Preferred Snack"
+x_axis_label  <- NULL
+legend_label_a <- "Apples"
+legend_label_b <- "Bananas"
+
+# Lighter color palette
+color_b   <- "#7A8AA3"   # soft slate-blue for Bananas
+color_a   <- "#F8C48A"   # soft peach for Apples
+bg_color  <- "#F7F7F9"
+
+# Helper: format big numbers as "12.57 M"
+format_millions <- function(x) {
+  paste0(formatC(x / 1e6, format = "f", digits = 2), " M")
+}
+
+# =====================================================
+# SIMULATE DATA (counts in the millions)
+# =====================================================
+set.seed(42)
+
+df <- expand.grid(
+  year    = c(2021, 2022, 2023),
+  size    = c("Small", "Large"),
+  animal  = c("Monkey", "Elephant"),
+  snack   = c("Apples", "Bananas"),
+  stringsAsFactors = FALSE
+)
+
+# Counts in raw units (millions-scale)
+df$count <- c(
+  # 2021
+  8500000, 4200000,  3100000, 5800000,
+  15200000, 9400000, 2100000, 7300000,
+  # 2022
+  9100000, 4500000,  3300000, 6000000,
+  16100000, 9900000, 2300000, 7600000,
+  # 2023
+  9800000, 4900000,  3500000, 6300000,
+  17000000,10500000, 2500000, 7900000
+)
+
+# =====================================================
+# 4 BARS PER YEAR
+# x = size × animal combo, stack = snack preference
+# =====================================================
+plot_df <- df %>%
+  mutate(group = paste(size, animal)) %>%
+  group_by(year, group, snack) %>%
+  summarise(count = sum(count), .groups = "drop")
+
+# Lock the bar order
+group_levels <- c("Small Monkey", "Small Elephant", "Large Monkey", "Large Elephant")
+plot_df$group <- factor(plot_df$group, levels = group_levels)
+plot_df$year  <- factor(plot_df$year)
+plot_df$snack <- factor(plot_df$snack, levels = c("Apples", "Bananas"))
+
+# Totals (top of each bar)
+totals <- plot_df %>%
+  group_by(year, group) %>%
+  summarise(Total = sum(count), .groups = "drop")
+
+# Sub-bar labels: one per stacked segment, centered in the segment
+sublabels <- plot_df %>%
+  arrange(year, group, desc(snack)) %>%   # "Bananas" first (bottom), then "Apples"
+  group_by(year, group) %>%
+  mutate(ypos = cumsum(count) - count / 2) %>%
+  ungroup()
+
+p <- ggplot(plot_df, aes(x = group, y = count, fill = snack)) +
+  geom_bar(stat = "identity", width = 0.75) +
+  geom_text(
+    data = sublabels,
+    aes(x = group, y = ypos, label = format_millions(count)),
+    inherit.aes = FALSE,
+    size = 2.8,
+    color = "black"
+  ) +
+  geom_text(
+    data = totals,
+    aes(x = group, y = Total, label = format_millions(Total)),
+    inherit.aes = FALSE,
+    vjust = -0.5,
+    size = 3.2,
+    fontface = "bold"
+  ) +
+  facet_wrap(~ year, strip.position = "bottom") +
+  scale_fill_manual(
+    values = c("Bananas" = color_b, "Apples" = color_a),
+    breaks = c("Apples", "Bananas"),
+    labels = c(legend_label_a, legend_label_b),
+    name   = legend_title
+  ) +
+  scale_y_continuous(
+    labels = format_millions,
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(title = plot_title, y = y_axis_label, x = x_axis_label) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(size = 18, color = "#3D4A5C"),
+    axis.title.y       = element_text(hjust = 1, size = 9, color = "#3D4A5C"),
+    axis.text.x        = element_text(size = 8, angle = 0),
+    panel.grid         = element_blank(),
+    axis.line          = element_line(color = "black"),
+    axis.ticks         = element_line(color = "black"),
+    strip.background   = element_blank(),
+    strip.placement    = "outside",
+    strip.text         = element_text(size = 11, color = "black"),
+    panel.spacing      = unit(1.5, "lines"),
+    legend.position    = "right",
+    plot.background    = element_rect(fill = bg_color, color = NA),
+    panel.background   = element_rect(fill = bg_color, color = NA)
+  )
+
+print(p)
