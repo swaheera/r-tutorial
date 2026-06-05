@@ -1,0 +1,81 @@
+library(DiagrammeR)
+
+# =====================================================================
+#  CONFIG: custom labels for each state.
+#  Keys are the internal state letters; values are what gets displayed.
+#  Used for as many states as the diagram needs (2-state uses A,B; etc.)
+# =====================================================================
+state_labels <- c(
+    A = "A",      # e.g. "Growth"
+    B = "B",      # e.g. "Stable"
+    C = "C",      # e.g. "Decline"
+    D = "D"       # e.g. "Exit"
+)
+
+# =====================================================================
+#  make_year_transition(n)
+#  Bipartite Year 1 -> Year 2 diagram for n states.
+#  Pink = stayed the same (X->X); gray = switched.
+# =====================================================================
+make_year_transition <- function(n,
+                                 labels      = state_labels,
+                                 fill        = "gray92",
+                                 same_color  = "#c2185b",
+                                 diff_color  = "gray55") {
+    
+    states <- LETTERS[1:n]
+    lab    <- function(s) labels[[s]]    # look up display label for a state
+    
+    # vertical positions: evenly spaced, top to bottom
+    ys    <- seq(from = 1.5 * (n - 1), to = 0, length.out = n)
+    cap_y <- -1.2
+    
+    # ---- node declarations (id stays the letter; label is custom) ----
+    left  <- mapply(function(s, y)
+        sprintf("  l_%s [label='%s', fillcolor='%s', pos='0,%.2f!']", s, lab(s), fill, y),
+        states, ys)
+    right <- mapply(function(s, y)
+        sprintf("  r_%s [label='%s', fillcolor='%s', pos='5,%.2f!']", s, lab(s), fill, y),
+        states, ys)
+    
+    # ---- captions: transparent, no border ----
+    caps <- c(
+        sprintf("  yr1 [label='Year 1', shape=plaintext, style='', fillcolor=none, color=none, pos='0,%.2f!', fontsize=16]", cap_y),
+        sprintf("  yr2 [label='Year 2', shape=plaintext, style='', fillcolor=none, color=none, pos='5,%.2f!', fontsize=16]", cap_y)
+    )
+    
+    # ---- edges (still keyed by letter, so wiring is unaffected by labels) ----
+    stay <- sprintf("  l_%s -> r_%s", states, states)
+    switch <- character(0)
+    for (a in states) for (b in states) if (a != b)
+        switch <- c(switch, sprintf("  l_%s -> r_%s", a, b))
+    
+    dot <- paste(
+        "digraph g {",
+        "  layout = neato",
+        "  splines = curved",
+        "  node [shape=circle, style=filled, color=black, penwidth=0.8,",
+        "        fontname='Times-Roman', fontsize=16, fixedsize=true, width=0.9]",
+        "  edge [penwidth=1.0, arrowsize=1.0]",
+        "",
+        paste(left,  collapse = "\n"),
+        paste(right, collapse = "\n"),
+        paste(caps,  collapse = "\n"),
+        "",
+        sprintf("  edge [color='%s']", same_color),
+        paste(stay, collapse = "\n"),
+        sprintf("  edge [color='%s']", diff_color),
+        paste(switch, collapse = "\n"),
+        "}",
+        sep = "\n"
+    )
+    
+    grViz(dot)
+}
+
+# =====================================================================
+#  The three pages
+# =====================================================================
+make_year_transition(2)   # uses labels A, B
+make_year_transition(3)   # uses labels A, B, C
+make_year_transition(4)   # uses labels A, B, C, D
