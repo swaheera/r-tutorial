@@ -1,0 +1,159 @@
+# ---------- CONFIG: labels ----------
+s1 <- "State 1"; s2 <- "State 2"; s3 <- "State 3"; s4 <- "State 4"
+s5 <- "State 5"; s6 <- "State 6"; s7 <- "State 7"; s8 <- "State 8"
+
+# ---------- CONFIG: node fill colors (default neutral gray) ----------
+c1 <- "gray92"; c2 <- "gray92"; c3 <- "gray92"; c4 <- "gray92"
+c5 <- "gray92"; c6 <- "gray92"; c7 <- "gray92"; c8 <- "gray70"  # absorbing
+# ------------------------------------
+
+grViz(sprintf("
+digraph g {
+  layout = circo
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=12, fixedsize=true, width=0.9]
+  edge [color=black, penwidth=0.8, arrowsize=0.7]
+
+  s1[label='%s', fillcolor='%s']
+  s2[label='%s', fillcolor='%s']
+  s3[label='%s', fillcolor='%s']
+  s4[label='%s', fillcolor='%s']
+  s5[label='%s', fillcolor='%s']
+  s6[label='%s', fillcolor='%s']
+  s7[label='%s', fillcolor='%s']
+  s8[label='%s', fillcolor='%s', shape=doublecircle]
+
+  s1->s1 s2->s2 s3->s3 s4->s4 s5->s5 s6->s6 s7->s7 s8->s8
+  s1->s2 s2->s1 s1->s3 s3->s1 s1->s4 s4->s1 s1->s5 s5->s1 s1->s6 s6->s1 s1->s7 s7->s1
+  s2->s3 s3->s2 s2->s4 s4->s2 s2->s5 s5->s2 s2->s6 s6->s2 s2->s7 s7->s2
+  s3->s4 s4->s3 s3->s5 s5->s3 s3->s6 s6->s3 s3->s7 s7->s3
+  s4->s5 s5->s4 s4->s6 s6->s4 s4->s7 s7->s4
+  s5->s6 s6->s5 s5->s7 s7->s5  s6->s7 s7->s6
+
+  edge [style=dashed, color='gray50']
+  s1->s8 s2->s8 s3->s8 s4->s8 s5->s8 s6->s8 s7->s8
+}",
+s1,c1, s2,c2, s3,c3, s4,c4, s5,c5, s6,c6, s7,c7, s8,c8))
+
+########
+# ---------- CONFIG: labels ----------
+s1 <- "State 1"; s2 <- "State 2"; s3 <- "State 3"; s4 <- "State 4"
+s5 <- "State 5"; s6 <- "State 6"; s7 <- "State 7"; s8 <- "State 8"
+
+# ---------- CONFIG: node fill colors ----------
+c1 <- "gray92"; c2 <- "gray92"; c3 <- "gray92"; c4 <- "gray92"
+c5 <- "gray92"; c6 <- "gray92"; c7 <- "gray92"; c8 <- "gray70"  # absorbing
+# ------------------------------------
+
+grViz(sprintf("
+digraph g {
+  layout = dot
+  rankdir = LR
+  nodesep = 0.5  ranksep = 1.2
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=12, fixedsize=true, width=0.9]
+  edge [color=black, penwidth=0.8, arrowsize=0.7]
+
+  s1[label='%s', fillcolor='%s']
+  s2[label='%s', fillcolor='%s']
+  s3[label='%s', fillcolor='%s']
+  s4[label='%s', fillcolor='%s']
+  s5[label='%s', fillcolor='%s']
+  s6[label='%s', fillcolor='%s']
+  s7[label='%s', fillcolor='%s']
+  s8[label='%s', fillcolor='%s', shape=doublecircle]
+
+  s1->s1 s2->s2 s3->s3 s4->s4 s5->s5 s6->s6 s7->s7 s8->s8
+  s1->s2 s2->s1 s1->s3 s3->s1 s1->s4 s4->s1 s1->s5 s5->s1 s1->s6 s6->s1 s1->s7 s7->s1
+  s2->s3 s3->s2 s2->s4 s4->s2 s2->s5 s5->s2 s2->s6 s6->s2 s2->s7 s7->s2
+  s3->s4 s4->s3 s3->s5 s5->s3 s3->s6 s6->s3 s3->s7 s7->s3
+  s4->s5 s5->s4 s4->s6 s6->s4 s4->s7 s7->s4
+  s5->s6 s6->s5 s5->s7 s7->s5  s6->s7 s7->s6
+  {rank=same; s1 s2 s3 s4 s5 s6 s7}
+  s1->s8 s2->s8 s3->s8 s4->s8 s5->s8 s6->s8 s7->s8
+}",
+s1,c1, s2,c2, s3,c3, s4,c4, s5,c5, s6,c6, s7,c7, s8,c8))
+
+###############
+# ---------- CONFIG: labels ----------
+s1 <- "State 1"; s2 <- "State 2"; s3 <- "State 3"; s4 <- "State 4"
+
+# ---------- CONFIG: node fill colors ----------
+c1 <- "gray92"; c2 <- "gray92"; c3 <- "gray92"; c4 <- "gray70"  # absorbing
+# ------------------------------------
+
+grViz(sprintf("
+digraph g {
+  layout = dot
+  rankdir = TB
+  nodesep = 0.7  ranksep = 1.1
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=12, fixedsize=true, width=0.9]
+  edge [color=black, penwidth=0.8, arrowsize=0.7]
+
+  s1[label='%s', fillcolor='%s']
+  s2[label='%s', fillcolor='%s']
+  s3[label='%s', fillcolor='%s']
+  s4[label='%s', fillcolor='%s', shape=doublecircle]
+
+  s1->s1 s2->s2 s3->s3 s4->s4
+  s1->s2 s2->s1 s1->s3 s3->s1 s2->s3 s3->s2
+  {rank=same; s1 s2 s3}
+  s1->s4 s2->s4 s3->s4
+}",
+s1,c1, s2,c2, s3,c3, s4,c4))
+
+#####################
+# ---------- CONFIG: labels ----------
+s1 <- "State 1"; s2 <- "State 2"; s3 <- "State 3"; s4 <- "State 4"
+
+# ---------- CONFIG: node fill colors ----------
+c1 <- "gray92"; c2 <- "gray92"; c3 <- "gray92"; c4 <- "gray92"
+# ------------------------------------
+
+grViz(sprintf("
+digraph g {
+  layout = neato
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=12, fixedsize=true, width=0.9]
+  edge [color=black, penwidth=0.8, arrowsize=0.7]
+
+  s1[label='%s', fillcolor='%s']
+  s2[label='%s', fillcolor='%s']
+  s3[label='%s', fillcolor='%s']
+  s4[label='%s', fillcolor='%s']
+
+  s1->s1 s2->s2 s3->s3 s4->s4
+  s1->s2 s2->s1 s1->s3 s3->s1 s1->s4 s4->s1
+  s2->s3 s3->s2 s2->s4 s4->s2 s3->s4 s4->s3
+}",
+s1,c1, s2,c2, s3,c3, s4,c4))
+
+##############
+# ---------- CONFIG: labels ----------
+s1 <- "State 1"; s2 <- "State 2"; s3 <- "State 3"; s4 <- "State 4"
+
+# ---------- CONFIG: node fill colors ----------
+c1 <- "gray92"; c2 <- "gray92"; c3 <- "gray92"; c4 <- "gray70"  # absorbing
+# ------------------------------------
+
+grViz(sprintf("
+digraph g {
+  layout = dot
+  rankdir = TB
+  nodesep = 1.0  ranksep = 1.6
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=14, fixedsize=true, width=1.1]
+  edge [color=black, penwidth=0.8, arrowsize=0.8]
+
+  s1[label='%s', fillcolor='%s']
+  s2[label='%s', fillcolor='%s']
+  s3[label='%s', fillcolor='%s']
+  s4[label='%s', fillcolor='%s', shape=doublecircle]
+
+  s1->s1 s2->s2 s3->s3 s4->s4
+  s1->s2 s2->s1 s1->s3 s3->s1 s2->s3 s3->s2
+  {rank=same; s1 s2 s3}
+  s1->s4 s2->s4 s3->s4
+}",
+s1,c1, s2,c2, s3,c3, s4,c4))
