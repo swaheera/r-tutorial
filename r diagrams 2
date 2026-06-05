@@ -1,0 +1,59 @@
+library(DiagrammeR)
+
+# ---------- CONFIG ----------
+sA <- "A"; sB <- "B"
+cA <- "gray92"; cB <- "gray92"
+# ----------------------------
+
+grViz(sprintf("
+digraph g {
+  layout = dot
+  rankdir = LR
+  size = '3,2'              // cap drawing size (inches)
+  ratio = compress
+  nodesep = 0.5  ranksep = 0.8
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=14, fixedsize=true, width=0.7]
+  edge [color=black, penwidth=0.8, arrowsize=0.7]
+
+  sA[label='%s', fillcolor='%s']
+  sB[label='%s', fillcolor='%s']
+
+  sA->sA  sB->sB
+  sA->sB  sB->sA
+}",
+sA,cA, sB,cB), width = 400, height = 250)
+
+###################
+library(DiagrammeR)
+
+# ---------- CONFIG ----------
+sA <- "A"; sB <- "B"; sC <- "C"
+cA <- "gray92"; cB <- "gray92"; cC <- "gray70"  # absorbing
+# ----------------------------
+
+grViz(sprintf("
+digraph g {
+  layout = dot
+  rankdir = TB
+  size = '3.5,3.5'         // cap drawing size (inches)
+  ratio = compress
+  nodesep = 0.8  ranksep = 1.0
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=14, fixedsize=true, width=0.7]
+  edge [color=black, penwidth=0.8, arrowsize=0.7]
+
+  sA[label='%s', fillcolor='%s']
+  sB[label='%s', fillcolor='%s']
+  sC[label='%s', fillcolor='%s', shape=doublecircle]
+
+  // self-loops ported to the OUTER sides: A on the left, B on the right, C below
+  sA:w -> sA:w
+  sB:e -> sB:e
+  sC:s -> sC:s
+
+  sA->sB  sB->sA
+  {rank=same; sA sB}
+  sA->sC  sB->sC
+}",
+sA,cA, sB,cB, sC,cC), width = 420, height = 380)
