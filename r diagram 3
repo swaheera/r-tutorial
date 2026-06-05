@@ -1,0 +1,157 @@
+library(DiagrammeR)
+
+# ---------- CONFIG: labels (use \\n for a line break) ----------
+a0 <- "Trend A\\nToday"
+a1 <- "Trend A\\n1 Month Ago"
+a2 <- "Trend A\\n2 Months Ago"
+a3 <- "Trend A\\n3 Months Ago"
+a4 <- "Trend A\\n4 Months Ago"
+a5 <- "Trend A\\n5 Months Ago"
+a6 <- "Trend A\\nx Months Ago"
+
+b0 <- "Trend B\\nToday"
+b1 <- "Trend B\\n1 Month Ago"
+b2 <- "Trend B\\n2 Months Ago"
+b3 <- "Trend B\\n3 Months Ago"
+b4 <- "Trend B\\n4 Months Ago"
+b5 <- "Trend B\\n5 Months Ago"
+b6 <- "Trend B\\nx Months Ago"
+
+# ---------- CONFIG: node fill colors ----------
+ca <- "gray92"; cb <- "gray92"; cend <- "white"
+# ---------- CONFIG: cross-feed arrow style ----------
+cross_color <- "black"   # set e.g. '#c2185b' to make B->A feeds stand out
+# ------------------------------------
+
+grViz(sprintf("
+digraph g {
+  layout = dot
+  rankdir = LR
+  ranksep = 0.7  nodesep = 0.6
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=14,
+        fixedsize=true, width=1.35, height=1.35]
+  edge [color=black, penwidth=0.8, arrowsize=0.7]
+
+  // ===== Trend A chain (top row), oldest -> newest =====
+  a6[label='%s', fillcolor='%s', style=dashed]
+  a5[label='%s', fillcolor='%s']
+  a4[label='%s', fillcolor='%s']
+  a3[label='%s', fillcolor='%s']
+  a2[label='%s', fillcolor='%s']
+  a1[label='%s', fillcolor='%s']
+  a0[label='%s', fillcolor='%s']
+
+  // ===== Trend B chain (bottom row), oldest -> newest =====
+  b6[label='%s', fillcolor='%s', style=dashed]
+  b5[label='%s', fillcolor='%s']
+  b4[label='%s', fillcolor='%s']
+  b3[label='%s', fillcolor='%s']
+  b2[label='%s', fillcolor='%s']
+  b1[label='%s', fillcolor='%s']
+  b0[label='%s', fillcolor='%s']
+
+  // align each time period in the same column
+  {rank=same; a6 b6}
+  {rank=same; a5 b5}
+  {rank=same; a4 b4}
+  {rank=same; a3 b3}
+  {rank=same; a2 b2}
+  {rank=same; a1 b1}
+  {rank=same; a0 b0}
+
+  // ===== forward-in-time edges within each chain =====
+  a6 -> a5 [style=dashed]
+  a5 -> a4  a4 -> a3  a3 -> a2  a2 -> a1  a1 -> a0
+  b6 -> b5 [style=dashed]
+  b5 -> b4  b4 -> b3  b3 -> b2  b2 -> b1  b1 -> b0
+
+  // ===== lagged cross-feeds: B at lag k -> A at lag k-1 =====
+  edge [color='%s', penwidth=1.1, arrowsize=0.8, constraint=false]
+  b5 -> a4
+  b4 -> a3
+  b3 -> a2
+  b2 -> a1
+  b1 -> a0
+}",
+a6,cend, a5,ca, a4,ca, a3,ca, a2,ca, a1,ca, a0,ca,
+b6,cend, b5,cb, b4,cb, b3,cb, b2,cb, b1,cb, b0,cb,
+cross_color))
+
+##################
+library(DiagrammeR)
+
+# ---------- CONFIG: labels (use \\n for a line break) ----------
+a0 <- "Trend A\\nToday"
+a1 <- "Trend A\\n1 Month Ago"
+a2 <- "Trend A\\n2 Months Ago"
+a3 <- "Trend A\\n3 Months Ago"
+a4 <- "Trend A\\n4 Months Ago"
+a6 <- "Trend A\\nx Months Ago"
+
+b0 <- "Trend B\\nToday"
+b1 <- "Trend B\\n1 Month Ago"
+b2 <- "Trend B\\n2 Months Ago"
+b3 <- "Trend B\\n3 Months Ago"
+b4 <- "Trend B\\n4 Months Ago"
+b5 <- "Trend B\\n5 Months Ago"
+b6 <- "Trend B\\nx Months Ago"
+
+# ---------- CONFIG: node fill colors ----------
+ca <- "gray92"; cb <- "gray92"; cend <- "white"
+# ---------- CONFIG: cross-feed arrow style ----------
+cross_color <- "black"   # set e.g. '#c2185b' to make B->A feeds stand out
+# ------------------------------------
+
+grViz(sprintf("
+digraph g {
+  layout = dot
+  rankdir = LR
+  ranksep = 0.7  nodesep = 0.6
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=14,
+        fixedsize=true, width=1.35, height=1.35]
+  edge [color=black, penwidth=0.8, arrowsize=0.7]
+
+  // ===== Trend A chain (top row) — no '5 months ago' node =====
+  a6[label='%s', fillcolor='%s', style=dashed]
+  a4[label='%s', fillcolor='%s']
+  a3[label='%s', fillcolor='%s']
+  a2[label='%s', fillcolor='%s']
+  a1[label='%s', fillcolor='%s']
+  a0[label='%s', fillcolor='%s']
+
+  // ===== Trend B chain (bottom row), oldest -> newest =====
+  b6[label='%s', fillcolor='%s', style=dashed]
+  b5[label='%s', fillcolor='%s']
+  b4[label='%s', fillcolor='%s']
+  b3[label='%s', fillcolor='%s']
+  b2[label='%s', fillcolor='%s']
+  b1[label='%s', fillcolor='%s']
+  b0[label='%s', fillcolor='%s']
+
+  // align matching time periods in the same column
+  {rank=same; a6 b6}
+  {rank=same; a4 b4}
+  {rank=same; a3 b3}
+  {rank=same; a2 b2}
+  {rank=same; a1 b1}
+  {rank=same; a0 b0}
+
+  // ===== forward-in-time edges within each chain =====
+  a6 -> a4 [style=dashed]
+  a4 -> a3  a3 -> a2  a2 -> a1  a1 -> a0
+  b6 -> b5 [style=dashed]
+  b5 -> b4  b4 -> b3  b3 -> b2  b2 -> b1  b1 -> b0
+
+  // ===== cross-feeds: A at lag k fed by B at lag k+1 AND lag k+2 =====
+  edge [color='%s', penwidth=1.1, arrowsize=0.8, constraint=false]
+  b5 -> a3   b4 -> a3        // -> A 3 months ago
+  b4 -> a2   b3 -> a2        // -> A 2 months ago
+  b3 -> a1   b2 -> a1        // -> A 1 month ago
+  b2 -> a0   b1 -> a0        // -> A today
+  b5 -> a4                   // oldest A node fed by the B available before it
+}",
+a6,cend, a4,ca, a3,ca, a2,ca, a1,ca, a0,ca,
+b6,cend, b5,cb, b4,cb, b3,cb, b2,cb, b1,cb, b0,cb,
+cross_color))
