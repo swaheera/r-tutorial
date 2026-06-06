@@ -1,0 +1,134 @@
+library(DiagrammeR)
+library(htmlwidgets)
+library(DiagrammeRsvg)
+
+############################################################
+## GRAPH 1 — Trend A only
+############################################################
+
+# ---------- labels (HTML labels: <br/> for line break) ----------
+a0 <- "Trend A<br/><b>Today</b>"
+a1 <- "Trend A<br/><b>1 Month Ago</b>"
+a2 <- "Trend A<br/><b>2 Months Ago</b>"
+a3 <- "Trend A<br/><b>3 Months Ago</b>"
+a4 <- "Trend A<br/><b>4 Months Ago</b>"
+a5 <- "Trend A<br/><b>5 Months Ago</b>"
+a6 <- "Trend A<br/><b>x Months Ago</b>"
+
+# ---------- node fill colors ----------
+ca <- "gray92"; cend <- "white"
+
+g1 <- grViz(sprintf("
+digraph g {
+  layout = dot
+  rankdir = LR
+  ranksep = 0.9  nodesep = 0.8
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=14,
+        fixedsize=true, width=1.9, height=1.9]
+  edge [color=black, penwidth=0.8, arrowsize=0.7]
+
+  // ===== Trend A chain, oldest -> newest =====
+  a6[label=<%s>, fillcolor='%s', style=dashed]
+  a5[label=<%s>, fillcolor='%s']
+  a4[label=<%s>, fillcolor='%s']
+  a3[label=<%s>, fillcolor='%s']
+  a2[label=<%s>, fillcolor='%s']
+  a1[label=<%s>, fillcolor='%s']
+  a0[label=<%s>, fillcolor='%s']
+
+  // ===== forward-in-time edges =====
+  a6 -> a5 [style=dashed]
+  a5 -> a4  a4 -> a3  a3 -> a2  a2 -> a1  a1 -> a0
+}",
+a6,cend, a5,ca, a4,ca, a3,ca, a2,ca, a1,ca, a0,ca))
+
+# ---- Save Graph 1 ----
+saveWidget(g1, "graph1_trendA.html", selfcontained = TRUE)
+writeLines(export_svg(g1), "graph1_trendA.svg")
+
+
+############################################################
+## GRAPH 2 — Trend A and Trend B (with lagged cross-feeds)
+############################################################
+
+# ---------- labels ----------
+a0 <- "Trend A<br/><b>Today</b>"
+a1 <- "Trend A<br/><b>1 Month Ago</b>"
+a2 <- "Trend A<br/><b>2 Months Ago</b>"
+a3 <- "Trend A<br/><b>3 Months Ago</b>"
+a4 <- "Trend A<br/><b>4 Months Ago</b>"
+a5 <- "Trend A<br/><b>5 Months Ago</b>"
+a6 <- "Trend A<br/><b>x Months Ago</b>"
+
+b0 <- "Trend B<br/><b>Today</b>"
+b1 <- "Trend B<br/><b>1 Month Ago</b>"
+b2 <- "Trend B<br/><b>2 Months Ago</b>"
+b3 <- "Trend B<br/><b>3 Months Ago</b>"
+b4 <- "Trend B<br/><b>4 Months Ago</b>"
+b5 <- "Trend B<br/><b>5 Months Ago</b>"
+b6 <- "Trend B<br/><b>x Months Ago</b>"
+
+# ---------- node fill colors ----------
+ca <- "gray92"; cb <- "gray92"; cend <- "white"
+# ---------- cross-feed arrow style ----------
+cross_color <- "black"   # e.g. '#c2185b' to make B->A feeds stand out
+
+g2 <- grViz(sprintf("
+digraph g {
+  layout = dot
+  rankdir = LR
+  ranksep = 0.9  nodesep = 0.8
+  node [shape=circle, style=filled, color=black, penwidth=0.8,
+        fontname='Times-Roman', fontsize=14,
+        fixedsize=true, width=1.9, height=1.9]
+  edge [color=black, penwidth=0.8, arrowsize=0.7]
+
+  // ===== Trend A chain (top row), oldest -> newest =====
+  a6[label=<%s>, fillcolor='%s', style=dashed]
+  a5[label=<%s>, fillcolor='%s']
+  a4[label=<%s>, fillcolor='%s']
+  a3[label=<%s>, fillcolor='%s']
+  a2[label=<%s>, fillcolor='%s']
+  a1[label=<%s>, fillcolor='%s']
+  a0[label=<%s>, fillcolor='%s']
+
+  // ===== Trend B chain (bottom row), oldest -> newest =====
+  b6[label=<%s>, fillcolor='%s', style=dashed]
+  b5[label=<%s>, fillcolor='%s']
+  b4[label=<%s>, fillcolor='%s']
+  b3[label=<%s>, fillcolor='%s']
+  b2[label=<%s>, fillcolor='%s']
+  b1[label=<%s>, fillcolor='%s']
+  b0[label=<%s>, fillcolor='%s']
+
+  // align each time period in the same column
+  {rank=same; a6 b6}
+  {rank=same; a5 b5}
+  {rank=same; a4 b4}
+  {rank=same; a3 b3}
+  {rank=same; a2 b2}
+  {rank=same; a1 b1}
+  {rank=same; a0 b0}
+
+  // ===== forward-in-time edges within each chain =====
+  a6 -> a5 [style=dashed]
+  a5 -> a4  a4 -> a3  a3 -> a2  a2 -> a1  a1 -> a0
+  b6 -> b5 [style=dashed]
+  b5 -> b4  b4 -> b3  b3 -> b2  b2 -> b1  b1 -> b0
+
+  // ===== lagged cross-feeds: B at lag k -> A at lag k-1 =====
+  edge [color='%s', penwidth=1.1, arrowsize=0.8, constraint=false]
+  b5 -> a4
+  b4 -> a3
+  b3 -> a2
+  b2 -> a1
+  b1 -> a0
+}",
+a6,cend, a5,ca, a4,ca, a3,ca, a2,ca, a1,ca, a0,ca,
+b6,cend, b5,cb, b4,cb, b3,cb, b2,cb, b1,cb, b0,cb,
+cross_color))
+
+# ---- Save Graph 2 ----
+saveWidget(g2, "graph2_trendAB.html", selfcontained = TRUE)
+writeLines(export_svg(g2), "graph2_trendAB.svg")
