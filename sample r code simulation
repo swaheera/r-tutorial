@@ -1,0 +1,235 @@
+# ============================================================
+# Wide-table sales forecasting grid — REAL POPULATION ONLY.
+# Append all candidate population feature columns (built from actual population),
+# then fit one model per (class x target x feature x k) via rolling-origin CV.
+# Long format: one row per (date, class). Features use population through n-1 only.
+# ============================================================
+library(forecast)
+library(dplyr)
+library(ggplot2)
+
+# ============================================================
+# INITIALIZATION  — the only section you normally edit
+# ============================================================
+DF_NAME     <- "df"
+DATE_VAR    <- "date"
+POP_VAR     <- "population"
+CLASS_VAR   <- "class"
+TARGET_VARS <- c("var1", "var2")
+
+KMAX        <- 12                        # max months of pop history to precompute
+H_VALUES    <- 1:6                       # horizons to evaluate
+K_VALUES    <- 1:12                      # k values to sweep
+INIT_START  <- as.Date("2015-01-01")     # first date of initial training window
+INIT_END    <- as.Date("2019-12-01")     # last date of initial training window
+VERBOSE     <- TRUE
+
+### ================= SIMULATED DATA (DELETE FOR REAL USE) =================
+set.seed(42)
+{
+    n_months <- 120
+    dates <- seq(as.Date("2015-01-01"), by = "month", length.out = n_months)
+    population <- 100000 + cumsum(rnorm(n_months, mean = 300, sd = 120))
+    pop_growth <- c(NA, diff(population) / head(population, -1))
+    make_class <- function(a1, a2, b1, b3, s1, s2) {
+        v1 <- 5000 + a1 * dplyr::lag(pop_growth, 1) + a2 * dplyr::lag(pop_growth, 2) +
+            as.numeric(arima.sim(list(ar = 0.4), n_months)) * s1 + rnorm(n_months, 0, 40)
+        v2 <- 4000 + b1 * dplyr::lag(pop_growth, 1) + b3 * dplyr::lag(pop_growth, 3) +
+            as.numeric(arima.sim(list(ar = 0.3), n_months)) * s2 + rnorm(n_months, 0, 35)
+        list(v1 = v1, v2 = v2)
+    }
+    cA <- make_class(2.0e6, 1.5e6, 1.2e6, 0.8e6, 50, 45)
+    cB <- make_class(1.6e6, 1.1e6, 0.9e6, 0.6e6, 55, 48)
+    df <- rbind(
+        data.frame(date = dates, population, class = "A", var1 = cA$v1, var2 = cA$v2),
+        data.frame(date = dates, population, class = "B", var1 = cB$v1, var2 = cB$v2)
+    )
+    df <- df[complete.cases(df), ]
+}
+### ======================= END SIMULATED DATA =======================
+
+# ============================================================
+# STEP 1 — Append all candidate population feature columns (per class).
+# At row n (features use population through n-1 only):
+#   pop_lag{j}      = pv[n-j]                              j = 1..KMAX
+#   pop_pct{j}      = (pv[n-j] - pv[n-j-1]) / pv[n-j-1]    j = 1..KMAX
+#   pop_avgpct_k{k} = mean(pop_pct1 .. pop_pctk)           k = 1..KMAX
+# NA where history is insufficient.
+# ============================================================
+add_pop_features <- function(d) {
+    d  <- d[order(d[[DATE_VAR]]), , drop = FALSE]
+    pv <- d[[POP_VAR]]
+    T  <- length(pv)
+    
+    lag_mat <- matrix(NA_real_, T, KMAX)
+    pct_mat <- matrix(NA_real_, T, KMAX)
+    for (n in seq_len(T)) {
+        for (j in seq_len(KMAX)) {
+            if (n - j >= 1)     lag_mat[n, j] <- pv[n - j]
+            if (n - j - 1 >= 1) pct_mat[n, j] <- (pv[n - j] - pv[n - j - 1]) / pv[n - j - 1]
+        }
+    }
+    avg_mat <- matrix(NA_real_, T, KMAX)
+    for (k in seq_len(KMAX)) avg_mat[, k] <- rowMeans(pct_mat[, 1:k, drop = FALSE])
+    
+    colnames(lag_mat) <- paste0("pop_lag",      seq_len(KMAX))
+    colnames(pct_mat) <- paste0("pop_pct",      seq_len(KMAX))
+    colnames(avg_mat) <- paste0("pop_avgpct_k", seq_len(KMAX))
+    
+    cbind(d, lag_mat, pct_mat, avg_mat)
+}
+
+dat_all <- get(DF_NAME)
+stopifnot(all(c(DATE_VAR, POP_VAR, CLASS_VAR, TARGET_VARS) %in% names(dat_all)))
+
+df_wide <- do.call(rbind, lapply(
+    split(dat_all, as.character(dat_all[[CLASS_VAR]])),
+    add_pop_features
+))
+rownames(df_wide) <- NULL
+
+cat(sprintf("Wide table: %d rows, %d cols\n", nrow(df_wide), ncol(df_wide)))
+cat("Feature columns added:\n  ",
+    paste(grep("^pop_", names(df_wide), value = TRUE), collapse = ", "), "\n\n")
+
+write.csv(df_wide, "df_with_pop_features.csv", row.names = FALSE)
+cat("Wrote df_with_pop_features.csv (inspect combinations in Excel)\n\n")
+
+# ============================================================
+# STEP 2 — Map (feature type, k) -> column names.
+#   avg_pct   -> pop_avgpct_k{k}       (single column)
+#   raw_level -> pop_lag1 .. pop_lag{k}
+#   raw_pct   -> pop_pct1 .. pop_pct{k}
+# ============================================================
+FEATURE_TYPES <- c("avg_pct", "raw_level", "raw_pct")
+feature_cols <- function(ftype, k) {
+    if (ftype == "avg_pct")        paste0("pop_avgpct_k", k)
+    else if (ftype == "raw_level") paste0("pop_lag", 1:k)
+    else                           paste0("pop_pct", 1:k)   # raw_pct
+}
+
+# ============================================================
+# STEP 3 — Fit all models (per class). Rolling-origin CV.
+# Fit ONCE per (target, feature, k, origin); forecast to HMAX; score every h.
+# All xreg values (train AND future) come from the appended real-population columns.
+# ============================================================
+HMAX <- max(H_VALUES)
+
+fit_all <- function(d) {
+    d  <- d[order(d[[DATE_VAR]]), , drop = FALSE]
+    N  <- nrow(d)
+    dt <- d[[DATE_VAR]]
+    train_start  <- min(which(dt >= INIT_START))
+    init_end_row <- max(which(dt <= INIT_END))
+    origins      <- init_end_row:(N - 1)
+    cl <- as.character(d[[CLASS_VAR]][1])
+    
+    cat(sprintf("Class %s: %d rows (%s..%s), %d origins\n",
+                cl, N, min(dt), max(dt), length(origins)))
+    
+    res <- data.frame()
+    for (tg in TARGET_VARS) {
+        y_all <- d[[tg]]
+        for (ftype in FEATURE_TYPES) {
+            for (k in K_VALUES) {
+                cols <- feature_cols(ftype, k)
+                X    <- as.matrix(d[, cols, drop = FALSE])
+                
+                ok_rows <- which(stats::complete.cases(X))
+                if (!length(ok_rows)) next
+                fs0 <- max(train_start, min(ok_rows))
+                
+                err <- setNames(vector("list", length(H_VALUES)), as.character(H_VALUES))
+                for (i in seq_along(origins)) {
+                    end <- origins[i]
+                    if (fs0 > end) next
+                    train_rows <- fs0:end
+                    xreg_train <- X[train_rows, , drop = FALSE]
+                    if (anyNA(xreg_train)) next
+                    
+                    fut_rows <- (end + 1):(end + HMAX)
+                    valid    <- fut_rows <= N
+                    xreg_fut <- matrix(NA_real_, HMAX, ncol(X))
+                    if (any(valid)) xreg_fut[valid, ] <- X[fut_rows[valid], , drop = FALSE]
+                    
+                    fit <- tryCatch(auto.arima(y_all[train_rows], xreg = xreg_train),
+                                    error = function(e) NULL)
+                    if (is.null(fit)) next
+                    fc <- tryCatch(forecast(fit, xreg = xreg_fut, h = HMAX),
+                                   error = function(e) NULL)
+                    if (is.null(fc)) next
+                    pmean <- as.numeric(fc$mean)
+                    
+                    for (h in H_VALUES) {
+                        if (end + h > N) next
+                        if (anyNA(xreg_fut[h, , drop = FALSE])) next
+                        a <- y_all[end + h]
+                        err[[as.character(h)]] <- c(err[[as.character(h)]], (a - pmean[h]) / a)
+                    }
+                }
+                
+                for (h in H_VALUES) {
+                    e <- err[[as.character(h)]]
+                    res <- rbind(res, data.frame(
+                        class = cl, target = tg, feature = ftype, k = k, h = h,
+                        n_forecasts = length(e),
+                        MAPE = if (length(e)) mean(abs(e)) * 100 else NA_real_,
+                        stringsAsFactors = FALSE))
+                }
+                if (VERBOSE)
+                    cat(sprintf("  class=%s target=%s feat=%s k=%2d done\n", cl, tg, ftype, k))
+            }
+        }
+    }
+    res
+}
+
+results <- do.call(rbind, lapply(
+    split(df_wide, as.character(df_wide[[CLASS_VAR]])),
+    fit_all
+))
+rownames(results) <- NULL
+
+# ============================================================
+# SUMMARY
+# ============================================================
+cat("\n########## BEST COMBO PER class x target ##########\n")
+print(results %>% filter(!is.na(MAPE)) %>%
+          group_by(class, target) %>% slice_min(MAPE, n = 1) %>% ungroup() %>%
+          arrange(class, target),
+      row.names = FALSE)
+
+cat("\n########## BEST (k,h) PER class x target x feature ##########\n")
+print(results %>% filter(!is.na(MAPE)) %>%
+          group_by(class, target, feature) %>%
+          slice_min(MAPE, n = 1) %>% ungroup() %>%
+          arrange(class, target, feature),
+      row.names = FALSE)
+
+write.csv(results, "model_results.csv", row.names = FALSE)
+cat("\nWrote model_results.csv\n")
+
+# ============================================================
+# PLOTS — one faceted heatmap per (class x target): feature cols, k vs h
+# ============================================================
+pretty_name <- function(s) tools::toTitleCase(gsub("_", " ", s))
+
+faceted_heatmap <- function(res, cl, tg) {
+    res %>%
+        filter(class == cl, target == tg) %>%
+        ggplot(aes(factor(k), factor(h), fill = MAPE)) +
+        geom_tile(color = "white") +
+        geom_text(aes(label = ifelse(is.na(MAPE), "", sprintf("%.1f", MAPE))), size = 2.4) +
+        scale_fill_viridis_c(option = "magma", direction = -1, name = "MAPE (%)",
+                             na.value = "grey85") +
+        facet_wrap(~ feature, nrow = 1) +
+        labs(title = sprintf("Class %s — %s — MAPE by k and horizon", cl, pretty_name(tg)),
+             subtitle = "cols: feature type",
+             x = "k (months of population history)", y = "forecast horizon h") +
+        theme_minimal(base_size = 11) +
+        theme(panel.grid = element_blank())
+}
+
+for (cl in sort(unique(results$class)))
+    for (tg in TARGET_VARS)
+        print(faceted_heatmap(results, cl, tg))
