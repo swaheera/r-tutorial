@@ -1,0 +1,593 @@
+# =====================================================================
+#  Naive population-lag forecasting of fruit sales
+#  Expanding-window cross-validation grid
+#
+#  Metric per fold : total-year APE
+#                    |sum(actual, 12 m) - sum(forecast, 12 m)| / sum(actual, 12 m)
+#  Model selection : mean of that APE across CV folds ("average MAPE")
+#  Population      : treated as KNOWN (oracle) for every month, incl. test year
+#
+#  Base method families (21 sales-only configs + 21 configs per lag set)
+#    Sales-only : SNAIVE, MOM, DRIFT, SEASF, EWMA
+#    Population : RATIO, SMOOTH, DAMP, ADD, PCMY, SPLIT, PCSEAS, PCEWMA, MULTIBASE
+#  Lag sets     : single lags 0..18 (19) + all lag pairs (171)
+#  Ensembles    : family champions (picked on COMPLETED earlier folds only),
+#                 all subsets of 2-4 families x {mean, median, inverse-error},
+#                 plus ALL-mean, ALL-median, best-sales + best-pop, rolling selection
+#
+#  To use your own data: delete the SIMULATED DATA block and fill in the
+#  data frame name and column names in the INPUT block.
+#  The driver column must have no gaps; sales can be NA before they start.
+# =====================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+})
+
+# ---------------------------------------------------------------------
+# SIMULATED DATA -- delete this block when using your own data
+# ---------------------------------------------------------------------
+set.seed(42)
+sim_dates  <- seq(as.Date("2017-01-01"), as.Date("2026-09-01"), by = "month")
+population <- 5e6 + cumsum(rnorm(length(sim_dates), mean = 8000, sd = 6000))
+
+df <- expand.grid(date = sim_dates, fruit = c("apple", "banana"),
+                  stringsAsFactors = FALSE)
+df$population <- population[match(df$date, sim_dates)]
+df$sales      <- rnorm(nrow(df), mean = ifelse(df$fruit == "apple", 50000, 80000), sd = 3000)
+df$sales[df$date < as.Date("2021-04-01")] <- NA   # sales start Apr 2021
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# INPUT: data frame name and column names (edit these)
+# ---------------------------------------------------------------------
+DF_NAME   <- "df"              # name of your data frame object, e.g. "my_sales"
+DATE_COL  <- "date"            # monthly date (Date or "YYYY-MM-DD"; snapped to the 1st)
+GROUP_COL <- "fruit"           # series identifier, e.g. "product"
+SALES_COL <- "sales"           # target, e.g. "units_sold"
+POP_COL   <- "population"      # driver, e.g. "pop_total"
+
+t_start <- Sys.time()
+ym <- function(x) format(x, "%Y-%m")
+
+# ---------------------------------------------------------------------
+# 0. Settings
+# ---------------------------------------------------------------------
+LAGS           <- 0:18   # population lags in months
+HORIZON        <- 12     # test window length (months)
+MIN_HISTORY    <- 12     # months of sales needed before the first forecast origin
+MIN_DONE_FOLDS <- 6      # completed earlier folds needed before ensembles start
+ROLL_WINDOW    <- 12     # completed folds used by rolling selection
+
+SALES_FAMILIES <- c("SNAIVE", "MOM", "DRIFT", "SEASF", "EWMA")
+POP_FAMILIES   <- c("RATIO", "SMOOTH", "DAMP", "ADD", "PCMY", "SPLIT",
+                    "PCSEAS", "PCEWMA", "MULTIBASE")
+ALL_FAMILIES   <- c(SALES_FAMILIES, POP_FAMILIES)
+
+# ---------------------------------------------------------------------
+# 1. Read input using the configured names
+#     Internally the code uses: date, fruit, sales, population.
+#     Your names are restored on every output at the end.
+# ---------------------------------------------------------------------
+cat("\n== 1. Reading input ==\n")
+if (!exists(DF_NAME)) stop("No object called `", DF_NAME, "` found. Check DF_NAME.")
+raw <- get(DF_NAME)
+
+needed       <- c(DATE_COL, GROUP_COL, SALES_COL, POP_COL)
+missing_cols <- setdiff(needed, names(raw))
+if (length(missing_cols) > 0) {
+  stop("Column(s) not found in `", DF_NAME, "`: ", paste(missing_cols, collapse = ", "),
+       "\n  Available: ", paste(names(raw), collapse = ", "))
+}
+
+dat <- data.frame(
+  date       = as.Date(format(as.Date(raw[[DATE_COL]]), "%Y-%m-01")),
+  fruit      = as.character(raw[[GROUP_COL]]),
+  sales      = as.numeric(raw[[SALES_COL]]),
+  population = as.numeric(raw[[POP_COL]]),
+  stringsAsFactors = FALSE
+)
+
+cat(sprintf("   `%s`: %d rows | %s values: %s\n", DF_NAME, nrow(dat), GROUP_COL,
+            paste(unique(dat$fruit), collapse = ", ")))
+cat(sprintf("   %s: %s..%s | %s: %s..%s\n",
+            POP_COL,   ym(min(dat$date[!is.na(dat$population)])), ym(max(dat$date[!is.na(dat$population)])),
+            SALES_COL, ym(min(dat$date[!is.na(dat$sales)])),      ym(max(dat$date[!is.na(dat$sales)]))))
+
+# ---------------------------------------------------------------------
+# 2. Helpers
+# ---------------------------------------------------------------------
+# Safe indexing: NA for indices outside the vector
+at <- function(v, i) {
+  out <- rep(NA_real_, length(i))
+  ok  <- !is.na(i) & i >= 1 & i <= length(v)
+  out[ok] <- v[i[ok]]
+  out
+}
+
+first_obs <- function(y) {
+  w <- which(!is.na(y))
+  if (length(w) == 0) NA_integer_ else w[1]
+}
+
+# 12-month total; NA if any month is missing
+total <- function(x) if (length(x) == 0 || any(is.na(x))) NA_real_ else sum(x)
+
+# Seasonal factors (length 12, mean 1) using history up to origin `org`
+#   blk_*    : complete 12-month blocks counted back from the origin
+#   cma_mean : classical 2x12 centred moving average
+seasonal_factors <- function(y, org, months, type) {
+  first <- first_obs(y)
+  if (is.na(first) || org - first + 1 < 12) return(rep(NA_real_, 12))
+
+  if (type == "cma_mean") {
+    yy <- y
+    yy[seq_along(yy) > org] <- NA
+    cma   <- as.numeric(stats::filter(yy, c(0.5, rep(1, 11), 0.5) / 12, sides = 2))
+    ratio <- yy / cma
+    f <- tapply(ratio, factor(months, levels = 1:12), mean, na.rm = TRUE)
+  } else {
+    n_blk <- floor((org - first + 1) / 12)
+    r <- matrix(NA_real_, n_blk, 12)
+    for (b in seq_len(n_blk)) {
+      idx <- (org - 12 * b + 1):(org - 12 * (b - 1))
+      r[b, months[idx]] <- y[idx] / mean(y[idx])
+    }
+    f <- switch(type,
+                blk_mean   = colMeans(r),
+                blk_median = apply(r, 2, median),
+                blk_latest = r[1, ])
+  }
+  f <- as.numeric(f)
+  if (any(!is.finite(f))) return(rep(NA_real_, 12))
+  f / mean(f)
+}
+
+# Mean of the last m deseasonalised values
+deseason_level <- function(y, f, org, m, months) {
+  idx <- (org - m + 1):org
+  if (any(idx < 1) || any(is.na(f))) return(NA_real_)
+  mean(y[idx] / f[months[idx]])
+}
+
+# Exponentially weighted level of the deseasonalised series
+ewma_level <- function(y, f, org, alpha, months) {
+  first <- first_obs(y)
+  if (is.na(first) || first > org || any(is.na(f))) return(NA_real_)
+  d   <- y[first:org] / f[months[first:org]]
+  lev <- d[1]
+  for (x in d[-1]) lev <- alpha * x + (1 - alpha) * lev
+  lev
+}
+
+# ---------------------------------------------------------------------
+# 3. Base methods (each returns 12-month TOTAL forecasts)
+#    Sh = sales with everything after the origin set to NA (no leakage)
+# ---------------------------------------------------------------------
+sales_only_forecasts <- function(Sh, org, months) {
+  t     <- org + seq_len(HORIZON)
+  base  <- at(Sh, t - 12)                  # same month last year
+  first <- first_obs(Sh)
+  out   <- numeric(0)
+
+  # 1. Seasonal naive
+  out["SNAIVE"] <- total(base)
+
+  # 2. Momentum: last m months vs the same months a year earlier
+  for (m in c(1, 3, 6, 12)) {
+    rec <- (org - m + 1):org
+    g   <- total(at(Sh, rec)) / total(at(Sh, rec - 12))
+    out[sprintf("MOM|m=%d", m)] <- total(base * g)
+  }
+
+  # 3. Long-run drift: average year-over-year growth over all history
+  g_d <- NA_real_
+  if (first + 12 <= org) {
+    ks  <- (first + 12):org
+    g_d <- exp(mean(log(Sh[ks] / Sh[ks - 12])))
+  }
+  out["DRIFT"] <- total(base * g_d)
+
+  # 4. Seasonal factors: deseasonalised mean of last m months x target factor
+  for (type in c("blk_mean", "blk_median", "blk_latest", "cma_mean")) {
+    f <- seasonal_factors(Sh, org, months, type)
+    for (m in c(1, 3, 6)) {
+      lev <- deseason_level(Sh, f, org, m, months)
+      out[sprintf("SEASF|f=%s|m=%d", type, m)] <- total(lev * f[months[t]])
+    }
+  }
+
+  # 5. EWMA of deseasonalised sales
+  f <- seasonal_factors(Sh, org, months, "blk_mean")
+  for (a in c(0.2, 0.5, 0.8)) {
+    lev <- ewma_level(Sh, f, org, a, months)
+    out[sprintf("EWMA|a=%s", a)] <- total(lev * f[months[t]])
+  }
+  out
+}
+
+pop_forecasts_one_lag <- function(Sh, P, org, L, months) {
+  t     <- org + seq_len(HORIZON)
+  n     <- length(Sh)
+  first <- first_obs(Sh)
+  PL    <- function(i) at(P, i - L)        # population lagged by L months
+  base  <- at(Sh, t - 12)
+  g     <- PL(t) / PL(t - 12)              # 1-year population growth at lag L
+  out   <- numeric(0)
+
+  # 6. Population ratio
+  out["RATIO"] <- total(base * g)
+
+  # 7. Smoothed ratio: growth of a w-month average of population
+  for (w in c(3, 6)) {
+    gw <- vapply(t, function(tt) {
+      win <- (tt - w + 1):tt
+      mean(PL(win)) / mean(PL(win - 12))
+    }, numeric(1))
+    out[sprintf("SMOOTH|w=%d", w)] <- total(base * gw)
+  }
+
+  # 8. Dampened / amplified growth (elasticity k; k = 1 is RATIO)
+  for (k in c(0.5, 1.5, 2)) out[sprintf("DAMP|k=%s", k)] <- total(base * g^k)
+
+  # 9. Additive: last year + population change x recent sales per person
+  recent <- (org - 11):org
+  pc     <- mean(at(Sh, recent) / PL(recent))
+  out["ADD"] <- total(base + (PL(t) - PL(t - 12)) * pc)
+
+  # 10. Multi-year per-capita: average of up to y past same-month per-capita values
+  for (y in c(2, 3, Inf)) {
+    fc <- vapply(t, function(tt) {
+      js <- seq_len(max(0, floor((tt - first) / 12)))
+      js <- js[seq_len(min(y, length(js)))]
+      if (length(js) == 0) return(NA_real_)
+      mean(at(Sh, tt - 12 * js) / PL(tt - 12 * js)) * PL(tt)
+    }, numeric(1))
+    out[sprintf("PCMY|y=%s", if (is.infinite(y)) "all" else y)] <- total(fc)
+  }
+
+  # 11. Split growth: population growth x per-person sales growth (last m months)
+  for (m in c(3, 6, 12)) {
+    rec     <- (org - m + 1):org
+    pc_now  <- total(at(Sh, rec))      / total(PL(rec))
+    pc_prev <- total(at(Sh, rec - 12)) / total(PL(rec - 12))
+    out[sprintf("SPLIT|m=%d", m)] <- total(base * g * pc_now / pc_prev)
+  }
+
+  # 12. Per-capita seasonal factors
+  ypc <- Sh / PL(seq_len(n))
+  for (type in c("blk_mean", "cma_mean")) {
+    f <- seasonal_factors(ypc, org, months, type)
+    for (m in c(3, 6)) {
+      lev <- deseason_level(ypc, f, org, m, months)
+      out[sprintf("PCSEAS|f=%s|m=%d", type, m)] <- total(lev * f[months[t]] * PL(t))
+    }
+  }
+
+  # 13. Per-capita EWMA
+  f <- seasonal_factors(ypc, org, months, "blk_mean")
+  for (a in c(0.2, 0.5, 0.8)) {
+    lev <- ewma_level(ypc, f, org, a, months)
+    out[sprintf("PCEWMA|a=%s", a)] <- total(lev * f[months[t]] * PL(t))
+  }
+
+  # 14. Multiple base years (uses the 2-year term only where it exists)
+  fc1 <- base * g
+  fc2 <- at(Sh, t - 24) * PL(t) / PL(t - 24)
+  out["MULTIBASE"] <- total(ifelse(is.na(fc2), fc1, (fc1 + fc2) / 2))
+  out
+}
+
+# ---------------------------------------------------------------------
+# 4. Grid runner for one fruit
+# ---------------------------------------------------------------------
+prepare_fruit <- function(df, fruit_name) {
+  d    <- df %>% filter(fruit == fruit_name) %>% arrange(date)
+  full <- data.frame(date = seq(min(d$date), max(d$date), by = "month"))
+  d    <- full %>% left_join(d, by = "date")
+  if (any(is.na(d$population))) {
+    stop("`", POP_COL, "` has missing months for ", GROUP_COL, " = ", fruit_name)
+  }
+  d
+}
+
+ape_of <- function(TOT, ACT) {
+  abs(sweep(TOT, 2, ACT, "-")) / matrix(ACT, nrow(TOT), ncol(TOT), byrow = TRUE)
+}
+
+run_base_grid <- function(d, fruit_name) {
+  dates   <- d$date
+  S       <- d$sales
+  P       <- d$population
+  months  <- as.integer(format(dates, "%m"))
+  n       <- length(dates)
+  first   <- first_obs(S)
+  last    <- max(which(!is.na(S)))
+  origins <- (first + MIN_HISTORY - 1):(last - HORIZON)
+
+  lag_pairs <- combn(LAGS, 2)
+  pair_lab  <- paste0(lag_pairs[1, ], "+", lag_pairs[2, ])
+  tot_list  <- vector("list", length(origins))
+  ACT       <- numeric(length(origins))
+
+  for (fi in seq_along(origins)) {
+    org <- origins[fi]
+    Sh  <- S
+    Sh[seq_len(n) > org] <- NA             # history only
+
+    s_only  <- sales_only_forecasts(Sh, org, months)
+    pop_mat <- sapply(LAGS, function(L) pop_forecasts_one_lag(Sh, P, org, L, months))
+
+    single_names <- outer(rownames(pop_mat), LAGS,
+                          function(a, b) paste0(a, "|lags=", b))
+    pair_mat <- (pop_mat[, match(lag_pairs[1, ], LAGS), drop = FALSE] +
+                 pop_mat[, match(lag_pairs[2, ], LAGS), drop = FALSE]) / 2
+    pair_names <- outer(rownames(pop_mat), pair_lab,
+                        function(a, b) paste0(a, "|lags=", b))
+
+    tot_list[[fi]] <- c(s_only,
+                        setNames(as.vector(pop_mat),  as.vector(single_names)),
+                        setNames(as.vector(pair_mat), as.vector(pair_names)))
+    ACT[fi] <- sum(S[org + seq_len(HORIZON)])
+
+    cat(sprintf("   [%s] fold %2d/%d | train %s..%s | test %s..%s | %d configs\n",
+                fruit_name, fi, length(origins), ym(dates[first]), ym(dates[org]),
+                ym(dates[org + 1]), ym(dates[org + HORIZON]), length(tot_list[[fi]])))
+    flush.console()
+  }
+
+  list(TOT = do.call(cbind, tot_list), ACT = ACT, origins = origins,
+       dates = dates, first = first)
+}
+
+# ---------------------------------------------------------------------
+# 5. Ensembles of family champions
+# ---------------------------------------------------------------------
+ens_specs <- list()
+for (size in 2:4) {
+  combiners <- if (size == 2) c("mean", "invw") else c("mean", "median", "invw")
+  for (s in combn(ALL_FAMILIES, size, simplify = FALSE)) {
+    for (cb in combiners) {
+      ens_specs[[length(ens_specs) + 1]] <- list(
+        idx  = match(s, ALL_FAMILIES), how = cb,
+        name = paste0("ENS|", cb, "|", paste(s, collapse = "+")))
+    }
+  }
+}
+ens_names <- c(vapply(ens_specs, `[[`, character(1), "name"),
+               "ENS|mean|ALL", "ENS|median|ALL",
+               "ENS|mean|BEST_SALES+BEST_POP", "ROLLING|best-of-last-12")
+
+combine <- function(x, err, how) {
+  if (length(x) == 0 || any(is.na(x))) return(NA_real_)
+  switch(how,
+         mean   = mean(x),
+         median = median(x),
+         invw   = { w <- 1 / pmax(err, 1e-6); sum(w * x) / sum(w) })
+}
+
+build_ensembles <- function(TOT, APE, origins, fruit_name) {
+  fam      <- sub("\\|.*", "", rownames(TOT))
+  fam_rows <- lapply(ALL_FAMILIES, function(f) which(fam == f))
+  is_sales <- ALL_FAMILIES %in% SALES_FAMILIES
+  n_f      <- ncol(TOT)
+  n_spec   <- length(ens_specs)
+  E        <- matrix(NA_real_, length(ens_names), n_f,
+                     dimnames = list(ens_names, NULL))
+  roll_log <- list()
+
+  for (fi in seq_len(n_f)) {
+    # only folds whose whole test year ended by this origin
+    done <- which(origins <= origins[fi] - HORIZON)
+    if (length(done) < MIN_DONE_FOLDS) next
+
+    ape_done <- APE[, done, drop = FALSE]
+    n_ok <- rowSums(!is.na(ape_done))
+    prev <- rowMeans(ape_done, na.rm = TRUE)
+    prev[n_ok < MIN_DONE_FOLDS | is.na(TOT[, fi])] <- NA
+
+    champ <- vapply(fam_rows, function(r) {
+      p <- prev[r]
+      if (all(is.na(p))) NA_integer_ else r[which.min(p)]
+    }, integer(1))
+    ch_tot <- TOT[champ, fi]
+    ch_err <- prev[champ]
+
+    E[seq_len(n_spec), fi] <- vapply(
+      ens_specs, function(s) combine(ch_tot[s$idx], ch_err[s$idx], s$how), numeric(1))
+    E["ENS|mean|ALL", fi]   <- combine(ch_tot, ch_err, "mean")
+    E["ENS|median|ALL", fi] <- combine(ch_tot, ch_err, "median")
+
+    bs <- which(is_sales)[which.min(ch_err[is_sales])]
+    bp <- which(!is_sales)[which.min(ch_err[!is_sales])]
+    if (length(bs) && length(bp)) {
+      E["ENS|mean|BEST_SALES+BEST_POP", fi] <- mean(ch_tot[c(bs, bp)])
+    }
+
+    # rolling selection: best single base config over the last completed folds
+    win <- tail(done, ROLL_WINDOW)
+    rp  <- rowMeans(APE[, win, drop = FALSE])
+    rp[is.na(TOT[, fi])] <- NA
+    if (any(!is.na(rp))) {
+      pick <- which.min(rp)
+      E["ROLLING|best-of-last-12", fi] <- TOT[pick, fi]
+      roll_log[[length(roll_log) + 1]] <- data.frame(
+        fruit = fruit_name, origin_fold = fi, picked = rownames(TOT)[pick])
+    }
+
+    cat(sprintf("   [%s] ensembles fold %2d/%d | %d completed folds used\n",
+                fruit_name, fi, n_f, length(done)))
+    flush.console()
+  }
+  list(E = E, roll_log = bind_rows(roll_log))
+}
+
+# ---------------------------------------------------------------------
+# 6. Long results table
+# ---------------------------------------------------------------------
+to_long <- function(TOT, APE, fruit_name, g) {
+  n_cfg  <- nrow(TOT)
+  n_f    <- ncol(TOT)
+  method <- rep(rownames(TOT), times = n_f)
+  fi     <- rep(seq_len(n_f), each = n_cfg)
+  org    <- g$origins[fi]
+  out <- data.frame(
+    fruit          = fruit_name,
+    method         = method,
+    family         = sub("\\|.*", "", method),
+    lags           = ifelse(grepl("lags=", method), sub(".*lags=", "", method), NA_character_),
+    train_start    = g$dates[g$first],
+    train_end      = g$dates[org],
+    test_start     = g$dates[org + 1],
+    test_end       = g$dates[org + HORIZON],
+    actual_sales   = g$ACT[fi],
+    forecast_sales = as.vector(TOT),
+    mape           = 100 * as.vector(APE),
+    stringsAsFactors = FALSE
+  )
+  out[!is.na(out$forecast_sales), ]
+}
+
+# ---------------------------------------------------------------------
+# 7. Run everything
+# ---------------------------------------------------------------------
+results_list <- list()
+summary_list <- list()
+plot_list    <- list()
+roll_logs    <- list()
+
+for (fr in unique(dat$fruit)) {
+  cat(sprintf("\n== 2. %s: base grid ==\n", toupper(fr)))
+  d   <- prepare_fruit(dat, fr)
+  g   <- run_base_grid(d, fr)
+  APE <- ape_of(g$TOT, g$ACT)
+  cat(sprintf("   base grid done: %d configs x %d folds\n", nrow(g$TOT), ncol(g$TOT)))
+
+  cat(sprintf("\n== 3. %s: ensembles ==\n", toupper(fr)))
+  en <- build_ensembles(g$TOT, APE, g$origins, fr)
+  roll_logs[[fr]] <- en$roll_log
+
+  TOT_all <- rbind(g$TOT, en$E)
+  APE_all <- ape_of(TOT_all, g$ACT)
+
+  cat(sprintf("\n== 4. %s: ranking ==\n", toupper(fr)))
+  common   <- which(colSums(!is.na(en$E)) > 0)     # folds where ensembles exist
+  eligible <- rowSums(is.na(APE_all[, common, drop = FALSE])) == 0
+  cat(sprintf("   ranking on %d common folds (origins %s..%s)\n",
+              length(common), ym(g$dates[g$origins[min(common)]]),
+              ym(g$dates[g$origins[max(common)]])))
+  cat(sprintf("   %d of %d configs have forecasts on all common folds (%d dropped)\n",
+              sum(eligible), nrow(TOT_all), sum(!eligible)))
+
+  avg     <- rowMeans(APE_all[eligible, common, drop = FALSE]) * 100
+  rank_df <- data.frame(method = names(avg), avg_mape = round(avg, 3),
+                        stringsAsFactors = FALSE) %>% arrange(avg_mape)
+
+  best      <- rank_df$method[1]
+  best_base <- rank_df %>% filter(!grepl("^(ENS|ROLLING)", method)) %>% slice(1)
+  best_sale <- rank_df %>% filter(sub("\\|.*", "", method) %in% SALES_FAMILIES) %>% slice(1)
+  snaive    <- if ("SNAIVE" %in% rank_df$method) rank_df$avg_mape[rank_df$method == "SNAIVE"] else NA
+
+  # configs whose totals are identical to the winner on every common fold
+  M    <- TOT_all[eligible, common, drop = FALSE]
+  bv   <- TOT_all[best, common]
+  same <- rowSums(abs(sweep(M, 2, bv, "-")) <=
+                    1e-9 * matrix(abs(bv), nrow(M), ncol(M), byrow = TRUE)) == ncol(M)
+  ties <- setdiff(rownames(M)[same], best)
+
+  cat("   top 10:\n")
+  print(head(rank_df, 10), row.names = FALSE)
+  cat(sprintf("   best overall      : %s (%.2f%%)\n", best, rank_df$avg_mape[1]))
+  if (length(ties)) cat(sprintf("   identical totals  : %s\n", paste(head(ties, 10), collapse = ", ")))
+  cat(sprintf("   best non-ensemble : %s (%.2f%%)\n", best_base$method, best_base$avg_mape))
+  cat(sprintf("   best sales-only   : %s (%.2f%%)\n", best_sale$method, best_sale$avg_mape))
+  cat(sprintf("   seasonal naive    : %.2f%%\n", snaive))
+
+  lag_tab <- rank_df %>%
+    mutate(lags = ifelse(grepl("lags=", method), sub(".*lags=", "", method), NA)) %>%
+    filter(!is.na(lags), !grepl("\\+", lags)) %>%
+    mutate(lag = as.integer(lags)) %>%
+    group_by(lag) %>%
+    summarise(best_mape = min(avg_mape),
+              best_method = method[which.min(avg_mape)], .groups = "drop") %>%
+    mutate(band = cut(lag, c(-1, 5, 11, 18),
+                      labels = c("short 0-5", "mid 6-11", "long 12-18")))
+  cat("   best single-lag config per lag:\n")
+  print(as.data.frame(lag_tab), row.names = FALSE)
+
+  res_fr <- to_long(TOT_all, APE_all, fr, g)
+  results_list[[fr]] <- res_fr
+
+  summary_list[[fr]] <- data.frame(
+    fruit = fr, best_method = best, best_avg_mape = rank_df$avg_mape[1],
+    best_non_ensemble = best_base$method, best_non_ensemble_mape = best_base$avg_mape,
+    best_sales_only = best_sale$method, best_sales_only_mape = best_sale$avg_mape,
+    snaive_mape = snaive, n_common_folds = length(common), n_ties = length(ties),
+    stringsAsFactors = FALSE)
+
+  # top 5 DISTINCT models: skip configs whose totals duplicate one already picked
+  TOP_N <- 5
+  top_methods <- character(0)
+  for (m in rank_df$method) {
+    v   <- TOT_all[m, common]
+    dup <- any(vapply(top_methods, function(k)
+      all(abs(TOT_all[k, common] - v) <= 1e-9 * abs(v)), logical(1)))
+    if (!dup) top_methods <- c(top_methods, m)
+    if (length(top_methods) == TOP_N) break
+  }
+  top_tab <- rank_df %>% filter(method %in% top_methods)
+  cat(sprintf("   top %d distinct models (plotted):\n", TOP_N))
+  print(top_tab, row.names = FALSE)
+
+  # plot: top 5 models, plus seasonal naive as a grey dashed benchmark
+  lab_of <- setNames(sprintf("%d. %s (%.2f%%)", seq_along(top_methods), top_methods,
+                             top_tab$avg_mape[match(top_methods, top_tab$method)]),
+                     top_methods)
+  pd <- res_fr %>%
+    filter(method %in% top_methods) %>%
+    mutate(series = factor(lab_of[method], levels = lab_of))
+  bench <- res_fr %>% filter(method == "SNAIVE")
+
+  plot_list[[fr]] <- ggplot(pd, aes(train_end, mape, colour = series)) +
+    geom_line(data = bench, aes(train_end, mape), inherit.aes = FALSE,
+              colour = "grey60", linetype = "dashed") +
+    geom_line() +
+    geom_point(size = 1.4) +
+    geom_vline(xintercept = g$dates[g$origins[min(common)]],
+               linetype = "dotted", colour = "grey40") +
+    labs(title = sprintf("%s = %s: top %d models, total-year MAPE of %s",
+                         GROUP_COL, fr, TOP_N, SALES_COL),
+         subtitle = sprintf("Grey dashed = seasonal naive (avg %.2f%%). Averages in legend use common folds (right of dotted line).",
+                            snaive),
+         x = "Train end (forecast origin)", y = "Total-year MAPE (%)", colour = NULL) +
+    guides(colour = guide_legend(ncol = 1)) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+
+# put YOUR column names back on every output
+restore_names <- function(x) {
+  nm <- names(x)
+  nm[nm == "fruit"]          <- GROUP_COL
+  nm[nm == "actual_sales"]   <- paste0("actual_", SALES_COL)
+  nm[nm == "forecast_sales"] <- paste0("forecast_", SALES_COL)
+  names(x) <- nm
+  x
+}
+
+results     <- restore_names(bind_rows(results_list))
+best_models <- restore_names(bind_rows(summary_list))
+roll_log    <- restore_names(bind_rows(roll_logs))
+
+cat("\n== 5. Summary ==\n")
+cat(sprintf("   results: %s rows | columns: %s\n",
+            format(nrow(results), big.mark = ","), paste(names(results), collapse = ", ")))
+print(best_models, row.names = FALSE)
+cat(sprintf("   (with oracle %s, short lags can look better than they will with a forecasted %s)\n",
+            POP_COL, POP_COL))
+
+for (p in plot_list) print(p)
+
+cat(sprintf("\nDone in %.1f minutes.\n",
+            as.numeric(difftime(Sys.time(), t_start, units = "mins"))))
