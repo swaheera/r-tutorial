@@ -1,4 +1,4 @@
-# 2=====================================================================
+#v3 =====================================================================
 #  Naive population-lag forecasting of fruit sales
 #  Expanding-window cross-validation grid
 #
@@ -14,6 +14,9 @@
 #  Ensembles    : family champions (picked on COMPLETED earlier folds only),
 #                 all subsets of 2-4 families x {mean, median, inverse-error},
 #                 plus ALL-mean, ALL-median, best-sales + best-pop, rolling selection
+#
+#  Series        : GROUP_A, GROUP_B, their TOTAL (A + B), any other groups,
+#                  and a derived B forecast = total forecast - A forecast
 #
 #  To use your own data: delete the SIMULATED DATA block and fill in the
 #  data frame name and column names in the INPUT block.
@@ -57,6 +60,11 @@ GROUP_COL <- "fruit"           # series identifier, e.g. "product"
 SALES_COL <- "sales"           # target, e.g. "units_sold"
 POP_COL   <- "population"      # driver, e.g. "pop_total"
 
+GROUP_A      <- "apple"         # value in GROUP_COL for series A
+GROUP_B      <- "banana"        # value in GROUP_COL for series B
+TOTAL_NAME   <- "total"         # label for the A + B series
+DERIVED_NAME <- paste0(GROUP_B, " (", TOTAL_NAME, " - ", GROUP_A, ")")  # B forecast as total - A
+
 t_start <- Sys.time()
 ym <- function(x) format(x, "%Y-%m")
 
@@ -68,11 +76,91 @@ HORIZON        <- 12     # test window length (months)
 MIN_HISTORY    <- 12     # months of sales needed before the first forecast origin
 MIN_DONE_FOLDS <- 6      # completed earlier folds needed before ensembles start
 ROLL_WINDOW    <- 12     # completed folds used by rolling selection
+RANK_STAT      <- "mean" # rank models by "mean" or "median" MAPE across folds
+if (!RANK_STAT %in% c("mean", "median")) stop('RANK_STAT must be "mean" or "median"')
 
 SALES_FAMILIES <- c("SNAIVE", "MOM", "DRIFT", "SEASF", "EWMA")
 POP_FAMILIES   <- c("RATIO", "SMOOTH", "DAMP", "ADD", "PCMY", "SPLIT",
                     "PCSEAS", "PCEWMA", "MULTIBASE")
 ALL_FAMILIES   <- c(SALES_FAMILIES, POP_FAMILIES)
+
+# ---------------------------------------------------------------------
+# 0b. Readable model names (internal codes stay in `method_code`)
+# ---------------------------------------------------------------------
+FAMILY_LABEL <- c(
+  SNAIVE    = "Same month last year",
+  MOM       = "Sales momentum",
+  DRIFT     = "Long-run sales growth",
+  SEASF     = "Seasonal pattern",
+  EWMA      = "Smoothed seasonal pattern",
+  RATIO     = "Pop growth",
+  SMOOTH    = "Smoothed pop growth",
+  DAMP      = "Elastic pop growth",
+  ADD       = "Added people x sales per person",
+  PCMY      = "Sales per person, multi-year",
+  SPLIT     = "Pop growth x per-person growth",
+  PCSEAS    = "Per-person seasonal pattern",
+  PCEWMA    = "Per-person smoothed seasonal",
+  MULTIBASE = "Two base years x pop growth",
+  ENS       = "Ensemble",
+  ROLLING   = "Rolling pick",
+  COMBO     = "Total minus A"
+)
+FACTOR_LABEL   <- c(blk_mean = "avg of past years", blk_median = "median of past years",
+                    blk_latest = "last year only", cma_mean = "centred moving avg")
+COMBINER_LABEL <- c(mean = "Avg of best", median = "Median of best",
+                    invw = "Error-weighted avg of best")
+
+pretty_one <- function(code) {
+  parts <- strsplit(code, "|", fixed = TRUE)[[1]]
+  fam   <- parts[1]
+
+  if (fam == "ENS") {
+    how <- parts[2]; members <- parts[3]
+    if (members == "ALL") {
+      return(sprintf("%s: all %d families", COMBINER_LABEL[[how]], length(ALL_FAMILIES)))
+    }
+    if (members == "BEST_SALES+BEST_POP") return("Avg of best sales-only + best pop model")
+    fams <- strsplit(members, "+", fixed = TRUE)[[1]]
+    return(paste0(COMBINER_LABEL[[how]], ": ", paste(FAMILY_LABEL[fams], collapse = " + ")))
+  }
+  if (fam == "ROLLING") return(sprintf("Rolling pick: best single model of last %d folds", ROLL_WINDOW))
+  if (fam == "COMBO")   return(sprintf("Best %s model - best %s model", TOTAL_NAME, GROUP_A))
+
+  kv <- parts[-1]
+  p  <- setNames(sub(".*=", "", kv), sub("=.*", "", kv))
+  details <- switch(fam,
+    MOM    = sprintf("last %s mo", p[["m"]]),
+    SEASF  = sprintf("%s, level of last %s mo", FACTOR_LABEL[[p[["f"]]]], p[["m"]]),
+    EWMA   = sprintf("weight %s on newest month", p[["a"]]),
+    SMOOTH = sprintf("%s-mo avg", p[["w"]]),
+    DAMP   = sprintf("elasticity %s", p[["k"]]),
+    PCMY   = if (p[["y"]] == "all") "all years" else sprintf("last %s yrs", p[["y"]]),
+    SPLIT  = sprintf("per-person growth of last %s mo", p[["m"]]),
+    PCSEAS = sprintf("%s, level of last %s mo", FACTOR_LABEL[[p[["f"]]]], p[["m"]]),
+    PCEWMA = sprintf("weight %s on newest month", p[["a"]]),
+    NULL)
+
+  lag_txt <- NULL
+  if ("lags" %in% names(p)) {
+    l <- strsplit(p[["lags"]], "+", fixed = TRUE)[[1]]
+    lag_txt <- if (length(l) == 1) sprintf("lag %s", l) else sprintf("avg of lags %s", paste(l, collapse = " & "))
+  }
+  paste0(FAMILY_LABEL[[fam]],
+         if (!is.null(details)) paste0(" (", details, ")"),
+         if (!is.null(lag_txt)) paste0(", ", lag_txt))
+}
+
+# vectorised with caching (results has many repeated codes)
+pretty_name <- function(codes) {
+  u <- unique(codes)
+  unname(vapply(u, pretty_one, character(1))[match(codes, u)])
+}
+
+# wrap long legend labels
+wrap_label <- function(x, width = 75) {
+  vapply(x, function(s) paste(strwrap(s, width), collapse = "\n    "), character(1), USE.NAMES = FALSE)
+}
 
 # ---------------------------------------------------------------------
 # 1. Read input using the configured names
@@ -141,6 +229,27 @@ if (nrow(dups) > 0) {
   stop("Duplicate ", DATE_COL, " values within ", GROUP_COL, " (shown above). ",
        "Aggregate to one row per month first.")
 }
+
+# total = A + B, only for months where both have sales
+missing_grp <- setdiff(c(GROUP_A, GROUP_B), sales_rows$fruit)
+if (length(missing_grp) > 0) {
+  stop("GROUP_A/GROUP_B value(s) not found in `", GROUP_COL, "`: ",
+       paste(missing_grp, collapse = ", "),
+       "\n  Available: ", paste(unique(sales_rows$fruit), collapse = ", "))
+}
+if (TOTAL_NAME %in% sales_rows$fruit) {
+  stop("TOTAL_NAME '", TOTAL_NAME, "' already exists in `", GROUP_COL, "`; pick another label.")
+}
+total_rows <- sales_rows %>%
+  filter(fruit %in% c(GROUP_A, GROUP_B)) %>%
+  group_by(date) %>%
+  summarise(sales = if (n() == 2 && !anyNA(sales)) sum(sales) else NA_real_,
+            .groups = "drop") %>%
+  mutate(fruit = TOTAL_NAME) %>%
+  select(date, fruit, sales)
+sales_rows <- bind_rows(sales_rows, total_rows)
+cat(sprintf("   built `%s` = %s + %s (%d months)\n",
+            TOTAL_NAME, GROUP_A, GROUP_B, sum(!is.na(total_rows$sales))))
 
 # sales outside the population range cannot be forecast with population
 outside <- sales_rows %>%
@@ -474,7 +583,7 @@ build_ensembles <- function(TOT, APE, origins, fruit_name) {
       pick <- which.min(rp)
       E["ROLLING|best-of-last-12", fi] <- TOT[pick, fi]
       roll_log[[length(roll_log) + 1]] <- data.frame(
-        fruit = fruit_name, origin_fold = fi, picked = rownames(TOT)[pick])
+        fruit = fruit_name, origin_fold = fi, picked = pretty_name(rownames(TOT)[pick]))
     }
 
     cat(sprintf("   [%s] ensembles fold %2d/%d | %d completed folds used\n",
@@ -495,8 +604,9 @@ to_long <- function(TOT, APE, fruit_name, g) {
   org    <- g$origins[fi]
   out <- data.frame(
     fruit          = fruit_name,
-    method         = method,
-    family         = sub("\\|.*", "", method),
+    method         = pretty_name(method),
+    method_code    = method,
+    family         = unname(FAMILY_LABEL[sub("\\|.*", "", method)]),
     lags           = ifelse(grepl("lags=", method), sub(".*lags=", "", method), NA_character_),
     train_start    = g$dates[g$first],
     train_end      = g$dates[org],
@@ -511,12 +621,121 @@ to_long <- function(TOT, APE, fruit_name, g) {
 }
 
 # ---------------------------------------------------------------------
-# 7. Run everything
+# 7. Ranking, reporting and plotting (used for direct and derived series)
+# ---------------------------------------------------------------------
+TOP_N <- 5
+
+rank_and_report <- function(label, TOT_all, APE_all, g, common) {
+  eligible <- rowSums(is.na(APE_all[, common, drop = FALSE])) == 0
+  cat(sprintf("   ranking on %d common folds (origins %s..%s)\n",
+              length(common), ym(g$dates[g$origins[min(common)]]),
+              ym(g$dates[g$origins[max(common)]])))
+  cat(sprintf("   %d of %d configs have forecasts on all common folds (%d dropped)\n",
+              sum(eligible), nrow(TOT_all), sum(!eligible)))
+
+  fold_ape  <- APE_all[eligible, common, drop = FALSE] * 100
+  mean_mape <- rowMeans(fold_ape)
+  med_mape  <- apply(fold_ape, 1, median)
+  score     <- if (RANK_STAT == "median") med_mape else mean_mape
+  cat(sprintf("   ranking by %s MAPE across folds\n", RANK_STAT))
+  rank_df <- data.frame(method = names(score), model = pretty_name(names(score)),
+                        mean_mape = round(mean_mape, 3), median_mape = round(med_mape, 3),
+                        score = score, stringsAsFactors = FALSE) %>%
+    arrange(score, mean_mape)          # mean breaks ties (common with the median)
+
+  best      <- rank_df$method[1]
+  best_base <- rank_df %>% filter(!grepl("^(ENS|ROLLING|COMBO)", method)) %>% slice(1)
+  best_sale <- rank_df %>% filter(sub("\\|.*", "", method) %in% SALES_FAMILIES) %>% slice(1)
+  snaive    <- if ("SNAIVE" %in% rank_df$method) rank_df$score[rank_df$method == "SNAIVE"] else NA
+
+  # configs whose totals are identical to the winner on every common fold
+  M    <- TOT_all[eligible, common, drop = FALSE]
+  bv   <- TOT_all[best, common]
+  same <- rowSums(abs(sweep(M, 2, bv, "-")) <=
+                    1e-9 * matrix(abs(bv), nrow(M), ncol(M), byrow = TRUE)) == ncol(M)
+  ties <- setdiff(rownames(M)[same], best)
+
+  cat("   top 10:\n")
+  print(head(rank_df[, c("model", "mean_mape", "median_mape")], 10), row.names = FALSE, right = FALSE)
+  cat(sprintf("   best overall      : %s (%s %.2f%%)\n", pretty_name(best), RANK_STAT, rank_df$score[1]))
+  if (length(ties)) cat(sprintf("   identical totals  : %s\n",
+                                paste(pretty_name(head(ties, 10)), collapse = "; ")))
+  cat(sprintf("   best non-ensemble : %s (%.2f%%)\n", best_base$model, best_base$score))
+  cat(sprintf("   best sales-only   : %s (%.2f%%)\n", best_sale$model, best_sale$score))
+  cat(sprintf("   seasonal naive    : %.2f%%\n", snaive))
+
+  lag_tab <- rank_df %>%
+    mutate(lags = ifelse(grepl("lags=", method), sub(".*lags=", "", method), NA)) %>%
+    filter(!is.na(lags), !grepl("\\+", lags)) %>%
+    mutate(lag = as.integer(lags)) %>%
+    group_by(lag) %>%
+    summarise(best_mape = min(score),
+              best_model = model[which.min(score)], .groups = "drop") %>%
+    mutate(band = cut(lag, c(-1, 5, 11, 18),
+                      labels = c("short 0-5", "mid 6-11", "long 12-18")))
+  cat("   best single-lag config per lag:\n")
+  print(as.data.frame(lag_tab), row.names = FALSE)
+
+  res <- to_long(TOT_all, APE_all, label, g)
+
+  summary <- data.frame(
+    fruit = label, rank_stat = RANK_STAT,
+    best_model = pretty_name(best), best_mape = rank_df$score[1],
+    best_non_ensemble = best_base$model, best_non_ensemble_mape = best_base$score,
+    best_sales_only = best_sale$model, best_sales_only_mape = best_sale$score,
+    snaive_mape = snaive, n_common_folds = length(common), n_ties = length(ties),
+    best_model_code = best, stringsAsFactors = FALSE)
+
+  # top N DISTINCT models: skip configs whose totals duplicate one already picked
+  top_methods <- character(0)
+  for (m in rank_df$method) {
+    v   <- TOT_all[m, common]
+    dup <- any(vapply(top_methods, function(k)
+      all(abs(TOT_all[k, common] - v) <= 1e-9 * abs(v)), logical(1)))
+    if (!dup) top_methods <- c(top_methods, m)
+    if (length(top_methods) == TOP_N) break
+  }
+  top_tab <- rank_df %>% filter(method %in% top_methods)
+  cat(sprintf("   top %d distinct models (plotted):\n", TOP_N))
+  print(top_tab[, c("model", "mean_mape", "median_mape")], row.names = FALSE, right = FALSE)
+
+  ii     <- match(top_methods, top_tab$method)
+  lab_of <- setNames(wrap_label(sprintf("%d. %s (mean %.2f%%, median %.2f%%)", seq_along(top_methods),
+                                        pretty_name(top_methods),
+                                        top_tab$mean_mape[ii], top_tab$median_mape[ii])),
+                     top_methods)
+  pd <- res %>%
+    filter(method_code %in% top_methods) %>%
+    mutate(series = factor(lab_of[method_code], levels = lab_of))
+  bench <- res %>% filter(method_code == "SNAIVE")
+
+  plot <- ggplot(pd, aes(train_end, mape, colour = series)) +
+    geom_line(data = bench, aes(train_end, mape), inherit.aes = FALSE,
+              colour = "grey60", linetype = "dashed") +
+    geom_line() +
+    geom_point(size = 1.4) +
+    geom_vline(xintercept = g$dates[g$origins[min(common)]],
+               linetype = "dotted", colour = "grey40") +
+    labs(title = sprintf("%s: top %d models for 12-month total %s", label, TOP_N, SALES_COL),
+         subtitle = sprintf("Ranked by %s MAPE. Grey dashed = same month last year (%s %.2f%%). Legend stats use common folds (right of dotted line).",
+                            RANK_STAT, RANK_STAT, snaive),
+         x = "Train end (forecast origin)", y = "Total-year MAPE (%)", colour = NULL) +
+    guides(colour = guide_legend(ncol = 1)) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+
+  list(rank_df = rank_df, best = best, snaive = snaive, common = common,
+       res = res, summary = summary, plot = plot)
+}
+
+# ---------------------------------------------------------------------
+# 8. Run the grid for every series (A, B, total, and any other groups)
 # ---------------------------------------------------------------------
 results_list <- list()
 summary_list <- list()
 plot_list    <- list()
 roll_logs    <- list()
+store        <- list()
 
 for (fr in unique(sales_rows$fruit)) {
   cat(sprintf("\n== 2. %s: base grid ==\n", toupper(fr)))
@@ -538,104 +757,111 @@ for (fr in unique(sales_rows$fruit)) {
 
   TOT_all <- rbind(g$TOT, en$E)
   APE_all <- ape_of(TOT_all, g$ACT)
+  common  <- which(colSums(!is.na(en$E)) > 0)     # folds where ensembles exist
 
   cat(sprintf("\n== 4. %s: ranking ==\n", toupper(fr)))
-  common   <- which(colSums(!is.na(en$E)) > 0)     # folds where ensembles exist
-  eligible <- rowSums(is.na(APE_all[, common, drop = FALSE])) == 0
-  cat(sprintf("   ranking on %d common folds (origins %s..%s)\n",
-              length(common), ym(g$dates[g$origins[min(common)]]),
-              ym(g$dates[g$origins[max(common)]])))
-  cat(sprintf("   %d of %d configs have forecasts on all common folds (%d dropped)\n",
-              sum(eligible), nrow(TOT_all), sum(!eligible)))
+  out <- rank_and_report(fr, TOT_all, APE_all, g, common)
 
-  avg     <- rowMeans(APE_all[eligible, common, drop = FALSE]) * 100
-  rank_df <- data.frame(method = names(avg), avg_mape = round(avg, 3),
-                        stringsAsFactors = FALSE) %>% arrange(avg_mape)
+  store[[fr]]        <- list(TOT_all = TOT_all, g = g, out = out)
+  results_list[[fr]] <- out$res
+  summary_list[[fr]] <- out$summary
+  plot_list[[fr]]    <- out$plot
+}
 
-  best      <- rank_df$method[1]
-  best_base <- rank_df %>% filter(!grepl("^(ENS|ROLLING)", method)) %>% slice(1)
-  best_sale <- rank_df %>% filter(sub("\\|.*", "", method) %in% SALES_FAMILIES) %>% slice(1)
-  snaive    <- if ("SNAIVE" %in% rank_df$method) rank_df$avg_mape[rank_df$method == "SNAIVE"] else NA
+# ---------------------------------------------------------------------
+# 9. Derived forecast for B: total - A
+#    (a) every config: total forecast - A forecast with the SAME config
+#    (b) COMBO: best total model - best A model
+#    Note: for methods that are linear in sales (SNAIVE, RATIO, SMOOTH,
+#    DAMP, ADD, PCMY, MULTIBASE) (a) equals the direct B forecast exactly;
+#    differences come from MOM, DRIFT, SEASF, EWMA, SPLIT, PCSEAS, PCEWMA,
+#    the ensembles and the COMBO.
+# ---------------------------------------------------------------------
+banana_comparison <- NULL
+if (all(c(TOTAL_NAME, GROUP_A, GROUP_B) %in% names(store))) {
+  cat(sprintf("\n== 5. %s ==\n", toupper(DERIVED_NAME)))
+  sT <- store[[TOTAL_NAME]]
+  sA <- store[[GROUP_A]]
+  sB <- store[[GROUP_B]]
 
-  # configs whose totals are identical to the winner on every common fold
-  M    <- TOT_all[eligible, common, drop = FALSE]
-  bv   <- TOT_all[best, common]
-  same <- rowSums(abs(sweep(M, 2, bv, "-")) <=
-                    1e-9 * matrix(abs(bv), nrow(M), ncol(M), byrow = TRUE)) == ncol(M)
-  ties <- setdiff(rownames(M)[same], best)
+  # align folds by forecast origin (all series share the same monthly timeline)
+  orgs <- Reduce(intersect, list(sT$g$origins, sA$g$origins, sB$g$origins))
+  iT <- match(orgs, sT$g$origins)
+  iA <- match(orgs, sA$g$origins)
+  iB <- match(orgs, sB$g$origins)
 
-  cat("   top 10:\n")
-  print(head(rank_df, 10), row.names = FALSE)
-  cat(sprintf("   best overall      : %s (%.2f%%)\n", best, rank_df$avg_mape[1]))
-  if (length(ties)) cat(sprintf("   identical totals  : %s\n", paste(head(ties, 10), collapse = ", ")))
-  cat(sprintf("   best non-ensemble : %s (%.2f%%)\n", best_base$method, best_base$avg_mape))
-  cat(sprintf("   best sales-only   : %s (%.2f%%)\n", best_sale$method, best_sale$avg_mape))
-  cat(sprintf("   seasonal naive    : %.2f%%\n", snaive))
+  rn  <- intersect(rownames(sT$TOT_all), rownames(sA$TOT_all))
+  DER <- sT$TOT_all[rn, iT, drop = FALSE] - sA$TOT_all[rn, iA, drop = FALSE]
 
-  lag_tab <- rank_df %>%
-    mutate(lags = ifelse(grepl("lags=", method), sub(".*lags=", "", method), NA)) %>%
-    filter(!is.na(lags), !grepl("\\+", lags)) %>%
-    mutate(lag = as.integer(lags)) %>%
-    group_by(lag) %>%
-    summarise(best_mape = min(avg_mape),
-              best_method = method[which.min(avg_mape)], .groups = "drop") %>%
-    mutate(band = cut(lag, c(-1, 5, 11, 18),
-                      labels = c("short 0-5", "mid 6-11", "long 12-18")))
-  cat("   best single-lag config per lag:\n")
-  print(as.data.frame(lag_tab), row.names = FALSE)
+  combo_name <- sprintf("COMBO|best %s - best %s", TOTAL_NAME, GROUP_A)
+  combo      <- sT$TOT_all[sT$out$best, iT] - sA$TOT_all[sA$out$best, iA]
+  DER        <- rbind(DER, combo)
+  rownames(DER)[nrow(DER)] <- combo_name
+  cat(sprintf("   COMBO = %s: [%s]\n   minus  %s: [%s]\n",
+              TOTAL_NAME, pretty_name(sT$out$best), GROUP_A, pretty_name(sA$out$best)))
 
-  res_fr <- to_long(TOT_all, APE_all, fr, g)
-  results_list[[fr]] <- res_fr
+  ACT_D <- sB$g$ACT[iB]                       # actual B totals
+  APE_D <- ape_of(DER, ACT_D)
+  gD    <- list(dates = sB$g$dates, origins = orgs, first = sB$g$first, ACT = ACT_D)
 
-  summary_list[[fr]] <- data.frame(
-    fruit = fr, best_method = best, best_avg_mape = rank_df$avg_mape[1],
-    best_non_ensemble = best_base$method, best_non_ensemble_mape = best_base$avg_mape,
-    best_sales_only = best_sale$method, best_sales_only_mape = best_sale$avg_mape,
-    snaive_mape = snaive, n_common_folds = length(common), n_ties = length(ties),
-    stringsAsFactors = FALSE)
+  is_ens  <- grepl("^(ENS|ROLLING)", rownames(DER))
+  commonD <- which(colSums(!is.na(DER[is_ens, , drop = FALSE])) > 0)
+  commonD <- intersect(commonD, which(!is.na(DER[combo_name, ])))
 
-  # top 5 DISTINCT models: skip configs whose totals duplicate one already picked
-  TOP_N <- 5
-  top_methods <- character(0)
-  for (m in rank_df$method) {
-    v   <- TOT_all[m, common]
-    dup <- any(vapply(top_methods, function(k)
-      all(abs(TOT_all[k, common] - v) <= 1e-9 * abs(v)), logical(1)))
-    if (!dup) top_methods <- c(top_methods, m)
-    if (length(top_methods) == TOP_N) break
-  }
-  top_tab <- rank_df %>% filter(method %in% top_methods)
-  cat(sprintf("   top %d distinct models (plotted):\n", TOP_N))
-  print(top_tab, row.names = FALSE)
+  outD <- rank_and_report(DERIVED_NAME, DER, APE_D, gD, commonD)
+  results_list[[DERIVED_NAME]] <- outD$res
+  summary_list[[DERIVED_NAME]] <- outD$summary
+  plot_list[[DERIVED_NAME]]    <- outD$plot
 
-  # plot: top 5 models, plus seasonal naive as a grey dashed benchmark
-  lab_of <- setNames(sprintf("%d. %s (%.2f%%)", seq_along(top_methods), top_methods,
-                             top_tab$avg_mape[match(top_methods, top_tab$method)]),
-                     top_methods)
-  pd <- res_fr %>%
-    filter(method %in% top_methods) %>%
-    mutate(series = factor(lab_of[method], levels = lab_of))
-  bench <- res_fr %>% filter(method == "SNAIVE")
+  # ---- direct B vs derived B, on the folds both have -------------------
+  cmp_dates <- as.Date(intersect(sB$g$dates[sB$g$origins[sB$out$common]],
+                                 gD$dates[gD$origins[commonD]]),
+                       origin = "1970-01-01")
+  pick <- c(sprintf("Direct %s forecast: %s", GROUP_B, pretty_name(sB$out$best)),
+            sprintf("Best %s model - best %s model", TOTAL_NAME, GROUP_A),
+            sprintf("Best %s - %s variant: %s", TOTAL_NAME, GROUP_A, pretty_name(outD$best)),
+            "Same month last year")
+  cmp <- bind_rows(
+    sB$out$res %>% filter(method_code == sB$out$best) %>% mutate(series = pick[1]),
+    outD$res   %>% filter(method_code == combo_name)  %>% mutate(series = pick[2]),
+    if (outD$best != combo_name)
+      outD$res %>% filter(method_code == outD$best)   %>% mutate(series = pick[3]),
+    sB$out$res %>% filter(method_code == "SNAIVE")    %>% mutate(series = pick[4])
+  ) %>%
+    filter(train_end %in% cmp_dates) %>%
+    distinct(series, train_end, .keep_all = TRUE)
 
-  plot_list[[fr]] <- ggplot(pd, aes(train_end, mape, colour = series)) +
-    geom_line(data = bench, aes(train_end, mape), inherit.aes = FALSE,
-              colour = "grey60", linetype = "dashed") +
+  banana_comparison <- cmp %>%
+    group_by(series) %>%
+    summarise(mean_mape = round(mean(mape), 3), median_mape = round(median(mape), 3),
+              n_folds = n(), .groups = "drop") %>%
+    arrange(if (RANK_STAT == "median") median_mape else mean_mape)
+  cat(sprintf("\n   %s: direct vs derived (%d shared folds)\n", GROUP_B, length(cmp_dates)))
+  print(as.data.frame(banana_comparison), row.names = FALSE, right = FALSE)
+
+  lab_cmp <- setNames(wrap_label(sprintf("%s (mean %.2f%%, median %.2f%%)", banana_comparison$series,
+                                         banana_comparison$mean_mape, banana_comparison$median_mape)),
+                      banana_comparison$series)
+  plot_list[["comparison"]] <- ggplot(
+      cmp %>% mutate(series = factor(lab_cmp[series], levels = lab_cmp[pick[pick %in% names(lab_cmp)]])),
+      aes(train_end, mape, colour = series)) +
     geom_line() +
     geom_point(size = 1.4) +
-    geom_vline(xintercept = g$dates[g$origins[min(common)]],
-               linetype = "dotted", colour = "grey40") +
-    labs(title = sprintf("%s = %s: top %d models, total-year MAPE of %s",
-                         GROUP_COL, fr, TOP_N, SALES_COL),
-         subtitle = sprintf("Grey dashed = seasonal naive (avg %.2f%%). Averages in legend use common folds (right of dotted line).",
-                            snaive),
+    labs(title = sprintf("%s: direct forecast vs %s - %s", GROUP_B, TOTAL_NAME, GROUP_A),
+         subtitle = "Total-year MAPE on folds where all series have forecasts",
          x = "Train end (forecast origin)", y = "Total-year MAPE (%)", colour = NULL) +
     guides(colour = guide_legend(ncol = 1)) +
     theme_minimal() +
     theme(legend.position = "bottom")
+} else {
+  cat("\n== 5. Derived forecast skipped: need", TOTAL_NAME, ",", GROUP_A, "and", GROUP_B, "==\n")
 }
 
-# put YOUR column names back on every output
+# ---------------------------------------------------------------------
+# 10. Outputs with YOUR column names
+# ---------------------------------------------------------------------
 restore_names <- function(x) {
+  if (is.null(x)) return(x)
   nm <- names(x)
   nm[nm == "fruit"]          <- GROUP_COL
   nm[nm == "actual_sales"]   <- paste0("actual_", SALES_COL)
@@ -644,11 +870,12 @@ restore_names <- function(x) {
   x
 }
 
-results     <- restore_names(bind_rows(results_list))
-best_models <- restore_names(bind_rows(summary_list))
-roll_log    <- restore_names(bind_rows(roll_logs))
+results           <- restore_names(bind_rows(results_list))
+best_models       <- restore_names(bind_rows(summary_list))
+roll_log          <- restore_names(bind_rows(roll_logs))
+banana_comparison <- restore_names(banana_comparison)
 
-cat("\n== 5. Summary ==\n")
+cat("\n== 6. Summary ==\n")
 cat(sprintf("   results: %s rows | columns: %s\n",
             format(nrow(results), big.mark = ","), paste(names(results), collapse = ", ")))
 print(best_models, row.names = FALSE)
