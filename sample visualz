@@ -1,4 +1,4 @@
-# =====================================================================
+# 2=====================================================================
 #  Naive population-lag forecasting of fruit sales
 #  Expanding-window cross-validation grid
 #
@@ -29,14 +29,23 @@ suppressPackageStartupMessages({
 # SIMULATED DATA -- delete this block when using your own data
 # ---------------------------------------------------------------------
 set.seed(42)
-sim_dates  <- seq(as.Date("2017-01-01"), as.Date("2026-09-01"), by = "month")
-population <- 5e6 + cumsum(rnorm(length(sim_dates), mean = 8000, sd = 6000))
+sim_dates   <- seq(as.Date("2017-01-01"), as.Date("2026-09-01"), by = "month")
+sales_start <- as.Date("2021-04-01")
+population  <- 5e6 + cumsum(rnorm(length(sim_dates), mean = 8000, sd = 6000))
 
-df <- expand.grid(date = sim_dates, fruit = c("apple", "banana"),
-                  stringsAsFactors = FALSE)
+# before sales start: one row per month, fruit and sales NA, population filled
+early <- data.frame(date  = sim_dates[sim_dates < sales_start],
+                    fruit = NA_character_, sales = NA_real_)
+
+# from sales start: one row per month per fruit
+later <- expand.grid(date = sim_dates[sim_dates >= sales_start],
+                     fruit = c("apple", "banana"), stringsAsFactors = FALSE)
+later$sales <- rnorm(nrow(later), mean = ifelse(later$fruit == "apple", 50000, 80000), sd = 3000)
+
+df <- rbind(early, later)
 df$population <- population[match(df$date, sim_dates)]
-df$sales      <- rnorm(nrow(df), mean = ifelse(df$fruit == "apple", 50000, 80000), sd = 3000)
-df$sales[df$date < as.Date("2021-04-01")] <- NA   # sales start Apr 2021
+df <- df[order(df$date, df$fruit), c("date", "population", "fruit", "sales")]
+rownames(df) <- NULL
 # ---------------------------------------------------------------------
 
 # ---------------------------------------------------------------------
@@ -83,17 +92,70 @@ if (length(missing_cols) > 0) {
 
 dat <- data.frame(
   date       = as.Date(format(as.Date(raw[[DATE_COL]]), "%Y-%m-01")),
-  fruit      = as.character(raw[[GROUP_COL]]),
+  fruit      = trimws(as.character(raw[[GROUP_COL]])),
   sales      = as.numeric(raw[[SALES_COL]]),
   population = as.numeric(raw[[POP_COL]]),
   stringsAsFactors = FALSE
 )
 
+# rows without a date cannot be used at all
+bad_date <- is.na(dat$date)
+if (any(bad_date)) {
+  cat(sprintf("   WARNING: dropping %d row(s) with missing/unreadable `%s`\n",
+              sum(bad_date), DATE_COL))
+  dat <- dat[!bad_date, ]
+}
+dat$fruit[!is.na(dat$fruit) & dat$fruit == ""] <- NA
+
+# population: ONE series by date, taken from ALL rows (incl. rows with no group,
+# e.g. early months where only population exists)
+pop_series <- dat %>%
+  filter(!is.na(population)) %>%
+  distinct(date, population) %>%
+  arrange(date)
+conflicts <- pop_series %>% count(date) %>% filter(n > 1)
+if (nrow(conflicts) > 0) {
+  print(head(pop_series %>% filter(date %in% conflicts$date), 10))
+  stop("`", POP_COL, "` has different values for the same ", DATE_COL,
+       " (shown above). It must be one value per month.")
+}
+pop_range <- seq(min(pop_series$date), max(pop_series$date), by = "month")
+pop_gaps  <- setdiff(pop_range, pop_series$date)
+if (length(pop_gaps) > 0) {
+  stop("`", POP_COL, "` is missing for ", length(pop_gaps), " month(s), first: ",
+       ym(as.Date(pop_gaps[1], origin = "1970-01-01")))
+}
+
+# sales: rows WITH a group; rows without a group only contribute population
+n_nogrp <- sum(is.na(dat$fruit))
+if (n_nogrp > 0) {
+  cat(sprintf("   %d row(s) with no `%s` used for `%s` only\n", n_nogrp, GROUP_COL, POP_COL))
+}
+sales_rows <- dat %>% filter(!is.na(fruit)) %>% select(date, fruit, sales)
+if (nrow(sales_rows) == 0) stop("No rows with a `", GROUP_COL, "` value.")
+
+# the same month twice within a group would break the monthly series
+dups <- sales_rows %>% count(fruit, date) %>% filter(n > 1)
+if (nrow(dups) > 0) {
+  print(head(dups, 10))
+  stop("Duplicate ", DATE_COL, " values within ", GROUP_COL, " (shown above). ",
+       "Aggregate to one row per month first.")
+}
+
+# sales outside the population range cannot be forecast with population
+outside <- sales_rows %>%
+  filter(!is.na(sales), date < min(pop_series$date) | date > max(pop_series$date))
+if (nrow(outside) > 0) {
+  cat(sprintf("   WARNING: %d `%s` month(s) fall outside the `%s` range and are ignored\n",
+              nrow(outside), SALES_COL, POP_COL))
+}
+
 cat(sprintf("   `%s`: %d rows | %s values: %s\n", DF_NAME, nrow(dat), GROUP_COL,
-            paste(unique(dat$fruit), collapse = ", ")))
+            paste(unique(sales_rows$fruit), collapse = ", ")))
 cat(sprintf("   %s: %s..%s | %s: %s..%s\n",
-            POP_COL,   ym(min(dat$date[!is.na(dat$population)])), ym(max(dat$date[!is.na(dat$population)])),
-            SALES_COL, ym(min(dat$date[!is.na(dat$sales)])),      ym(max(dat$date[!is.na(dat$sales)]))))
+            POP_COL,   ym(min(pop_series$date)), ym(max(pop_series$date)),
+            SALES_COL, ym(min(sales_rows$date[!is.na(sales_rows$sales)])),
+                       ym(max(sales_rows$date[!is.na(sales_rows$sales)]))))
 
 # ---------------------------------------------------------------------
 # 2. Helpers
@@ -282,14 +344,13 @@ pop_forecasts_one_lag <- function(Sh, P, org, L, months) {
 # ---------------------------------------------------------------------
 # 4. Grid runner for one fruit
 # ---------------------------------------------------------------------
-prepare_fruit <- function(df, fruit_name) {
-  d    <- df %>% filter(fruit == fruit_name) %>% arrange(date)
-  full <- data.frame(date = seq(min(d$date), max(d$date), by = "month"))
-  d    <- full %>% left_join(d, by = "date")
-  if (any(is.na(d$population))) {
-    stop("`", POP_COL, "` has missing months for ", GROUP_COL, " = ", fruit_name)
-  }
-  d
+prepare_fruit <- function(fruit_name) {
+  # full monthly timeline = population range; this group's sales joined by date
+  s <- sales_rows %>% filter(fruit == fruit_name) %>% select(date, sales)
+  data.frame(date = pop_range) %>%
+    left_join(pop_series, by = "date") %>%
+    left_join(s, by = "date") %>%
+    mutate(fruit = fruit_name)
 }
 
 ape_of <- function(TOT, ACT) {
@@ -457,9 +518,16 @@ summary_list <- list()
 plot_list    <- list()
 roll_logs    <- list()
 
-for (fr in unique(dat$fruit)) {
+for (fr in unique(sales_rows$fruit)) {
   cat(sprintf("\n== 2. %s: base grid ==\n", toupper(fr)))
-  d   <- prepare_fruit(dat, fr)
+  d   <- prepare_fruit(fr)
+  n_sales <- sum(!is.na(d$sales))
+  need    <- MIN_HISTORY + 2 * HORIZON + MIN_DONE_FOLDS
+  if (n_sales < need) {
+    cat(sprintf("   SKIPPED: only %d months of `%s`; need at least %d\n",
+                n_sales, SALES_COL, need))
+    next
+  }
   g   <- run_base_grid(d, fr)
   APE <- ape_of(g$TOT, g$ACT)
   cat(sprintf("   base grid done: %d configs x %d folds\n", nrow(g$TOT), ncol(g$TOT)))
