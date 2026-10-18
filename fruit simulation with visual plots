@@ -1,0 +1,1095 @@
+# =============================================================================
+# Fruit sales forecasting with coherent pipelines
+#
+# A PIPELINE forecasts two series with one model each and derives the third, so that
+# fruit A + fruit B = total always holds. Four strategies:
+#   1. A + B          : forecast A and B; total = A + B
+#   2. total - A      : forecast total and A; B = total - A
+#   3. total - B      : forecast total and B; A = total - B
+#   4. total x A share: forecast total and A's share of total; A = total * share, B = total * (1 - share)
+#
+# HETEROGENEOUS pipelines: the two forecasted series may use different models (e.g. ARIMA for total, ETS for A)
+# HOMOGENEOUS pipelines  : the same model is used for both forecasted series (simpler to explain)
+#
+# Every model is evaluated with rolling-origin cross-validation (12-month horizon).
+# Metrics per series: monthly MAPE and yearly MAPE (|sum actual - sum fc| / sum actual over 12 months).
+# The winner minimises the average of the 6 MAPEs (3 series x monthly/yearly).
+#
+# Population effect: in every CV fold each fitted model also forecasts two what-if scenarios -
+# population unchanged from a year earlier vs population POP_GROWTH (e.g. 0.5%) higher than a year earlier.
+# The difference = extra sales per month due to that population growth. No extra model fitting is needed.
+# =============================================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(forecast)
+library(ranger)
+library(xgboost)
+
+# =============================================================================
+# SIMULATED DEMO DATA - delete this block when using your own data
+# =============================================================================
+set.seed(123)
+
+sim_dates <- seq(as.Date("2019-01-01"), as.Date("2026-09-01"), by = "month")
+sim_t     <- seq_along(sim_dates)
+sim_mon   <- as.integer(format(sim_dates, "%m"))
+
+# population: ~1.5%/yr growth + a 2% step in mid-2022 (e.g. immigration wave)
+sim_pop <- round(1e6 * exp(0.015 * sim_t / 12) *
+                   (1 + 0.02 * (sim_dates >= as.Date("2022-07-01"))) *
+                   (1 + rnorm(length(sim_t), 0, 0.001)))
+
+# per-capita sales: own trend + seasonality + noise
+apple_pc  <- 0.020 * (1 + 0.020 * sim_t / 12) * (1 + 0.15 * sin(2 * pi * (sim_mon - 3) / 12)) *
+  exp(rnorm(length(sim_t), 0, 0.04))
+banana_pc <- 0.015 * (1 + 0.010 * sim_t / 12) * (1 + 0.10 * cos(2 * pi * (sim_mon - 7) / 12)) *
+  exp(rnorm(length(sim_t), 0, 0.05))
+
+# long format: date, population, fruit, sales (sales only from 2020-04)
+df <- bind_rows(
+  tibble(date = sim_dates, population = sim_pop, fruit = "apple",  sales = sim_pop * apple_pc),
+  tibble(date = sim_dates, population = sim_pop, fruit = "banana", sales = sim_pop * banana_pc)
+) |>
+  mutate(sales = if_else(date < as.Date("2020-04-01"), NA_real_, round(sales))) |>
+  arrange(date, fruit)
+
+cat("Simulated demo data 'df':", nrow(df), "rows\n")
+# ============================ end of simulated data ============================
+
+# ---- 0a. Data config: edit these to match your data ---------------------------
+# Expected input: long format, one row per date x fruit, monthly dates without gaps.
+DF_NAME   <- "df"              # name of your data frame object (as a string)
+DATE_COL  <- "date"            # date column (Date, or something as.Date() can parse)
+POP_COL   <- "population"      # population column
+FRUIT_COL <- "fruit"           # column holding the fruit name
+SALES_COL <- "sales"           # sales column
+FRUIT_A   <- "apple"           # value in FRUIT_COL for the first fruit
+FRUIT_B   <- "banana"          # value in FRUIT_COL for the second fruit
+
+# ---- 0b. Model / CV settings ----------------------------------------------------
+H         <- 12     # forecast horizon (months)
+INITIAL   <- 36     # months in the first training window
+STEP      <- 3      # months between forecast origins
+WINDOW    <- NULL   # NULL = expanding window (train from first month); a number (e.g. 36) = sliding window
+TIE_TOL   <- 0.02   # candidates within 2% of the best score count as "near ties"
+TOP_K     <- 20     # number of top heterogeneous pipelines used to count which models show up most
+TOP_N_UNC <- 10     # number of top heterogeneous pipelines shown in the uncertainty plot
+BAND      <- c(0.10, 0.90)  # spread bars in MAPE uncertainty plots: 10th to 90th percentile across folds
+POP_MODE  <- "forecast"  # "forecast" = population in the test period is forecast with auto.arima
+                         #              from data up to the origin (realistic)
+                         # "actual"   = actual future population is used (optimistic upper bound)
+ARIMA_DEEP <- FALSE      # TRUE = full auto.arima search (stepwise = FALSE, approximation = FALSE); slower
+POP_GROWTH <- 0.005      # population effect scenario: population this much higher than a year earlier
+                         # (0.005 = 0.5%), compared with population unchanged from a year earlier
+PLOT_DIR   <- "plots"    # every plot is also saved here as PNG (full size, readable)
+PLOT_W     <- 14         # PNG width (inches)
+PLOT_H     <- 8.5        # PNG height (inches)
+stopifnot(POP_MODE %in% c("forecast", "actual"))
+
+log_msg <- function(...) cat(format(Sys.time(), "%H:%M:%S"), "|", sprintf(...), "\n")
+section <- function(title) cat("\n==== ", title, " ", strrep("=", max(0, 60 - nchar(title))), "\n", sep = "")
+ym      <- function(x) format(x, "%Y-%m")
+pct_lab <- function(x) paste0(x, "%")
+fmt_num <- function(x) format(round(x), big.mark = ",", scientific = FALSE, trim = TRUE)
+
+# auto.arima wrapper so the search depth is set in one place
+aa <- function(y, ...) auto.arima(y, stepwise = !ARIMA_DEEP, approximation = !ARIMA_DEEP, ...)
+
+FA <- FRUIT_A
+FB <- FRUIT_B
+stopifnot(FA != FB,
+          !any(c(FA, FB) %in% c("date", "population", "total", "share", "pop_yoy")))
+
+# labels used in tables and plots
+S_AB <- paste(FA, "+", FB)
+S_TA <- paste("total -", FA)
+S_TB <- paste("total -", FB)
+S_TS <- paste("total x", FA, "share")
+strategy_cols <- setNames(c("steelblue", "darkgreen", "orange", "purple"), c(S_AB, S_TA, S_TB, S_TS))
+series_lvls   <- c(FA, FB, "total")
+
+theme_fc <- theme_bw(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey20", size = 9.5),
+        plot.caption  = element_text(hjust = 0, colour = "grey35", size = 8.5),
+        strip.text    = element_text(face = "bold"),
+        legend.position = "bottom")
+
+# save every plot as PNG, then try to draw it; a too-small plot pane no longer stops the script
+dir.create(PLOT_DIR, showWarnings = FALSE)
+show_plot <- function(p, name) {
+  file <- file.path(PLOT_DIR, paste0(name, ".png"))
+  ggsave(file, p, width = PLOT_W, height = PLOT_H, dpi = 150)
+  tryCatch(print(p),
+           error = function(e) log_msg("Plot pane too small to draw '%s' - open %s instead", name, file))
+  log_msg("Saved %s", file)
+}
+
+# ---- 2. Read input and prepare series ------------------------------------------
+section("2. Read input and prepare series")
+
+raw <- get(DF_NAME)
+missing_cols <- setdiff(c(DATE_COL, POP_COL, FRUIT_COL, SALES_COL), names(raw))
+if (length(missing_cols) > 0) stop("Columns not found in ", DF_NAME, ": ", paste(missing_cols, collapse = ", "))
+
+# map user columns onto internal names
+dat <- raw |>
+  transmute(date       = as.Date(.data[[DATE_COL]]),
+            population = as.numeric(.data[[POP_COL]]),
+            fruit      = as.character(.data[[FRUIT_COL]]),
+            sales      = as.numeric(.data[[SALES_COL]]))
+
+found <- unique(dat$fruit)
+if (!all(c(FA, FB) %in% found)) stop("Fruit values not found. Available: ", paste(found, collapse = ", "))
+dat <- filter(dat, fruit %in% c(FA, FB))
+
+log_msg("'%s': %d rows | dates %s to %s | sales from %s",
+        DF_NAME, nrow(dat), ym(min(dat$date)), ym(max(dat$date)),
+        ym(min(dat$date[!is.na(dat$sales)])))
+print(head(filter(dat, !is.na(sales)), 6))
+
+# population: one value per date
+pop_df <- dat |>
+  group_by(date) |>
+  summarise(population = first(na.omit(population)), .groups = "drop")
+
+latest_pop  <- tail(na.omit(pop_df$population), 1)
+growth_txt  <- sprintf("%.1f%%", 100 * POP_GROWTH)
+people_txt  <- fmt_num(POP_GROWTH * latest_pop)
+log_msg("Population effect scenario: population %s higher than a year earlier (about %s people at the latest level of %s) vs unchanged",
+        growth_txt, people_txt, fmt_num(latest_pop))
+
+# sales: one column per fruit
+wide <- dat |>
+  select(date, fruit, sales) |>
+  pivot_wider(names_from = fruit, values_from = sales, values_fn = sum) |>
+  full_join(pop_df, by = "date") |>
+  arrange(date) |>
+  mutate(total    = .data[[FA]] + .data[[FB]],
+         share    = .data[[FA]] / total,                   # share of fruit A in total
+         pop_yoy  = population / lag(population, 12) - 1, # uses population history before sales start
+         sales_ok = !is.na(.data[[FA]]) & !is.na(.data[[FB]]))
+
+make_series <- function(s) {
+  wide |>
+    transmute(date, pop = population, pop_yoy, sales_ok, y = .data[[s]]) |>
+    mutate(pop_lag12 = lag(pop, 12),      # population same month last year
+           y_lag12   = lag(y, 12),        # value same month last year
+           y_pc      = y / pop,           # per capita
+           pc_lag12  = lag(y_pc, 12)) |>  # per capita same month last year
+    filter(sales_ok) |>                   # same months for every series, so CV folds line up
+    mutate(t      = row_number(),
+           month  = as.integer(format(date, "%m")),
+           growth = y_pc / pc_lag12)      # YoY growth of per-capita value (ML target)
+}
+
+series_list <- sapply(c(FA, FB, "total", "share"), make_series, simplify = FALSE)
+for (s in names(series_list)) {
+  d <- series_list[[s]]
+  log_msg("%-8s: %d months (%s to %s), mean = %.3g", s, nrow(d), ym(min(d$date)), ym(max(d$date)), mean(d$y))
+}
+pop_rng <- range(series_list[[FA]]$pop_yoy, na.rm = TRUE) * 100
+log_msg("Population growth vs a year earlier ranges %.2f%% to %.2f%% (growth-based effects need variation here)",
+        pop_rng[1], pop_rng[2])
+
+# ---- 3. Models ---------------------------------------------------------------
+# Each model is a function(train) that fits ONCE and returns a predictor function(test) -> forecast.
+# The same fitted model can then forecast the real test period and the population what-if scenarios.
+
+to_ts <- function(x, d) {
+  ts(x, frequency = 12,
+     start = c(as.integer(format(d$date[1], "%Y")), as.integer(format(d$date[1], "%m"))))
+}
+
+ml_features <- c("month", "pop_yoy", "t")
+ml_train    <- function(tr) filter(tr, !is.na(growth), !is.na(pop_yoy))
+
+# ADL data: g = log sales growth vs last year, pg = log population growth vs last year, plus 1-month lags
+adl_data <- function(d) {
+  d |>
+    mutate(g = log(y / y_lag12), pg = log(pop / pop_lag12), g_l1 = lag(g), pg_l1 = lag(pg))
+}
+adl_fit <- function(d) {
+  lm(g ~ g_l1 + pg + pg_l1, data = filter(adl_data(d), !is.na(g), !is.na(g_l1), !is.na(pg), !is.na(pg_l1)))
+}
+
+# models for sales levels (fruit A, fruit B, total)
+sales_models <- list(
+  # -- univariate: sales history only, no population --
+  snaive       = function(tr) { y <- to_ts(tr$y, tr); function(te) snaive(y, h = nrow(te))$mean },
+  ets          = function(tr) { fit <- ets(to_ts(tr$y, tr)); function(te) forecast(fit, h = nrow(te))$mean },
+  arima        = function(tr) { fit <- aa(to_ts(tr$y, tr)); function(te) forecast(fit, h = nrow(te))$mean },
+  # -- statistical models using population --
+  arima_pop    = function(tr) {
+    fit <- aa(to_ts(tr$y, tr), xreg = tr$pop)
+    function(te) forecast(fit, xreg = te$pop)$mean
+  },
+  ets_percap   = function(tr) {
+    fit <- ets(to_ts(tr$y_pc, tr))
+    function(te) forecast(fit, h = nrow(te))$mean * te$pop
+  },
+  arima_percap = function(tr) {
+    fit <- aa(to_ts(tr$y_pc, tr))
+    function(te) forecast(fit, h = nrow(te))$mean * te$pop
+  },
+  lm_logpop    = function(tr) {
+    fit <- lm(log(y) ~ log(pop) + t + factor(month), data = tr)
+    function(te) exp(predict(fit, newdata = te))
+  },
+  # sales growth vs last year = a + b x population growth vs last year (in logs)
+  lm_growth    = function(tr) {
+    fit <- lm(log(y / y_lag12) ~ log(1 + pop_yoy), data = filter(tr, !is.na(y_lag12), !is.na(pop_yoy)))
+    function(te) te$y_lag12 * exp(predict(fit, newdata = te))
+  },
+  # ADL: g_t = a + phi*g_(t-1) + b0*pg_t + b1*pg_(t-1); forecast recursively month by month
+  adl          = function(tr) {
+    cf   <- coef(adl_fit(tr))
+    hist <- adl_data(tr)
+    g0   <- tail(hist$g, 1)
+    pg0  <- tail(hist$pg, 1)
+    function(te) {
+      pg_te   <- log(te$pop / te$pop_lag12)
+      g_prev  <- g0
+      pg_prev <- pg0
+      out     <- numeric(nrow(te))
+      for (k in seq_len(nrow(te))) {
+        g_k     <- cf[["(Intercept)"]] + cf[["g_l1"]] * g_prev + cf[["pg"]] * pg_te[k] + cf[["pg_l1"]] * pg_prev
+        out[k]  <- te$y_lag12[k] * exp(g_k)
+        g_prev  <- g_k
+        pg_prev <- pg_te[k]
+      }
+      out
+    }
+  },
+  # -- ML models using population growth --
+  rf_growth    = function(tr) {
+    fit <- ranger(growth ~ month + pop_yoy + t, data = ml_train(tr), num.trees = 500, seed = 1)
+    function(te) predict(fit, te[, ml_features])$predictions * te$pc_lag12 * te$pop
+  },
+  xgb_growth   = function(tr) {
+    trm <- ml_train(tr)
+    X   <- function(d) as.matrix(d[, ml_features])
+    fit <- xgb.train(params  = list(objective = "reg:squarederror", eta = 0.05, max_depth = 3),
+                     data    = xgb.DMatrix(X(trm), label = trm$growth),
+                     nrounds = 200, verbose = 0)
+    function(te) predict(fit, xgb.DMatrix(X(te))) * te$pc_lag12 * te$pop
+  }
+)
+AVG3_PARTS <- c("ets_percap", "arima_pop", "xgb_growth")  # models averaged into "avg3"
+
+# models for fruit A's share (a proportion, so no population scaling).
+# Names that match a sales model (snaive, ets, arima) let the share strategy count as homogeneous.
+share_models <- list(
+  snaive    = function(tr) { y <- to_ts(tr$y, tr); function(te) snaive(y, h = nrow(te))$mean },
+  ets       = function(tr) { fit <- ets(to_ts(tr$y, tr)); function(te) forecast(fit, h = nrow(te))$mean },
+  arima     = function(tr) { fit <- aa(to_ts(tr$y, tr)); function(te) forecast(fit, h = nrow(te))$mean },
+  lm_season = function(tr) { fit <- lm(y ~ t + factor(month), data = tr); function(te) predict(fit, newdata = te) }
+)
+
+# model type, for tables
+model_type <- c(snaive = "univariate", ets = "univariate", arima = "univariate", lm_season = "univariate",
+                arima_pop = "population", ets_percap = "population", arima_percap = "population",
+                lm_logpop = "population", lm_growth = "population", adl = "population",
+                rf_growth = "ML + population", xgb_growth = "ML + population", avg3 = "ensemble")
+
+# ---- 4. Rolling-origin CV: base forecasts + population scenarios ----------------
+section("4. Cross-validation (base forecasts + population scenarios)")
+# Expanding window: train on months 1..o. Sliding window: train on the last WINDOW months up to o.
+# Forecast the next H months, then move the origin by STEP. Origins are counted back from the end,
+# so the last fold always ends at the latest month.
+# Each model is fitted once per fold and forecasts three versions of the test period:
+#   fc  = real forecast (population actual or forecast, see POP_MODE)
+#   fc0 = what-if: population in every forecast month equal to the same month a year earlier (0% growth)
+#   fcg = what-if: population POP_GROWTH higher than the same month a year earlier
+log_msg("Population in test periods: %s | ARIMA search: %s",
+        POP_MODE, if (ARIMA_DEEP) "full (slower)" else "stepwise (default)")
+
+cv_origins <- function(d) rev(seq(nrow(d) - H, INITIAL, by = -STEP))
+cv_split   <- function(d, o) {
+  start <- if (is.null(WINDOW)) 1 else max(1, o - WINDOW + 1)
+  list(tr = d[start:o, ], te = d[(o + 1):(o + H), ])
+}
+
+# what-if test set: population = same month a year earlier x (1 + g)
+scenario <- function(te, g) {
+  te$pop     <- te$pop_lag12 * (1 + g)
+  te$pop_yoy <- g
+  te
+}
+
+# Population forecast per origin: auto.arima on all population history up to the origin
+# (including months before sales start). Cached, since every series uses the same origins.
+pop_cache <- list()
+get_pop_fc <- function(origin_date, h) {
+  k <- as.character(origin_date)
+  if (is.null(pop_cache[[k]])) {
+    hist <- filter(pop_df, date <= origin_date, !is.na(population))
+    pop_cache[[k]] <<- as.numeric(forecast(aa(to_ts(hist$population, hist)), h = h)$mean)
+  }
+  pop_cache[[k]]
+}
+
+run_cv <- function(d, model_list, name) {
+  stopifnot(H <= 12)  # 12-month lags are used; H <= 12 keeps them leak-free
+  origins <- cv_origins(d)
+  log_msg("[%s] %s window | %d folds | %d models",
+          name, if (is.null(WINDOW)) "expanding" else paste0("sliding ", WINDOW, "-month"),
+          length(origins), length(model_list))
+  out <- list()
+  for (i in seq_along(origins)) {
+    o  <- origins[i]
+    sp <- cv_split(d, o)
+    tr <- sp$tr
+    te <- sp$te
+    te_list <- list(fc0 = scenario(te, 0), fcg = scenario(te, POP_GROWTH))  # scenarios use actual history
+    if (POP_MODE == "forecast") {
+      pop_actual <- te$pop
+      te$pop     <- get_pop_fc(d$date[o], H)
+      te$pop_yoy <- te$pop / te$pop_lag12 - 1
+      pop_note   <- sprintf("pop fc error %.2f%%", 100 * mean(abs(te$pop - pop_actual) / pop_actual))
+    } else {
+      pop_note <- "pop actual"
+    }
+    te_list <- c(list(fc = te), te_list)
+
+    res <- lapply(names(model_list), function(m) {
+      tryCatch({
+        pred <- model_list[[m]](tr)                              # fit once
+        lapply(te_list, function(x) as.numeric(pred(x)))         # predict 3 versions
+      }, error = function(e) {
+        log_msg("  ! [%s] %s failed on fold %d: %s", name, m, i, conditionMessage(e))
+        lapply(te_list, function(x) rep(NA_real_, nrow(te)))
+      })
+    })
+    names(res) <- names(model_list)
+    if (all(AVG3_PARTS %in% names(res))) {                       # simple model average
+      res$avg3 <- setNames(lapply(names(te_list), function(k) rowMeans(sapply(res[AVG3_PARTS], `[[`, k))),
+                           names(te_list))
+    }
+    out[[i]] <- bind_rows(lapply(names(res), function(m) {
+      tibble(origin = d$date[o], date = te$date, model = m,
+             fc = res[[m]]$fc, fc0 = res[[m]]$fc0, fcg = res[[m]]$fcg)
+    }))
+    log_msg("[%s] fold %2d/%d | train %s to %s (%d mo) | test %s to %s | %s",
+            name, i, length(origins), ym(tr$date[1]), ym(tr$date[nrow(tr)]), nrow(tr),
+            ym(te$date[1]), ym(te$date[H]), pop_note)
+  }
+  bind_rows(out)
+}
+
+base <- bind_rows(
+  lapply(c(FA, FB, "total"),
+         function(s) run_cv(series_list[[s]], sales_models, s) |> mutate(series = s)),
+  run_cv(series_list[["share"]], share_models, "share") |> mutate(series = "share")
+)
+log_msg("Base forecasts: %d rows", nrow(base))
+
+# ---- Scoring helpers ------------------------------------------------------------
+actuals <- wide |>
+  select(date, all_of(c(FA, FB)), total, share) |>
+  pivot_longer(-date, names_to = "series", values_to = "actual")
+
+# per fold: monthly MAPE and yearly APE over the 12-month window
+fold_scores <- function(x, ...) {
+  x |>
+    group_by(..., origin) |>
+    summarise(window_end = max(date),
+              monthly    = mean(abs(actual - fc) / actual) * 100,
+              yearly     = abs(sum(actual) - sum(fc)) / sum(actual) * 100,
+              .groups    = "drop")
+}
+# average over folds, plus the spread across folds (BAND percentiles)
+avg_scores <- function(f, ...) {
+  f |>
+    group_by(...) |>
+    summarise(monthly_mape = mean(monthly), yearly_mape = mean(yearly),
+              m_lo = quantile(monthly, BAND[1], na.rm = TRUE), m_hi = quantile(monthly, BAND[2], na.rm = TRUE),
+              y_lo = quantile(yearly,  BAND[1], na.rm = TRUE), y_hi = quantile(yearly,  BAND[2], na.rm = TRUE),
+              .groups = "drop")
+}
+
+# ---- 5. Individual models, each on its own series (diagnostic) ----------------
+section("5. Individual models on their own series (diagnostic, not coherent)")
+
+model_metrics <- base |>
+  select(origin, date, model, fc, series) |>
+  left_join(actuals, by = c("date", "series")) |>
+  fold_scores(series, model) |>
+  avg_scores(series, model) |>
+  mutate(avg_mape = (monthly_mape + yearly_mape) / 2, type = unname(model_type[model])) |>
+  group_by(series) |>
+  arrange(avg_mape, .by_group = TRUE) |>
+  mutate(rank = row_number()) |>
+  ungroup()
+
+print(select(model_metrics, series, rank, model, type, monthly_mape, yearly_mape, avg_mape), n = Inf)
+cat("\nBest individual model per series:\n")
+print(select(filter(model_metrics, rank == 1), series, model, type, monthly_mape, yearly_mape))
+
+mm_plot <- model_metrics |>
+  filter(series %in% series_lvls) |>
+  mutate(series = factor(series, levels = series_lvls), best = rank == 1)
+
+p_models <- ggplot(mm_plot, aes(monthly_mape, yearly_mape)) +
+  geom_point(aes(colour = best), size = 3) +
+  geom_text_repel(aes(label = model, colour = best), size = 3, show.legend = FALSE, max.overlaps = Inf) +
+  scale_colour_manual(values = c(`FALSE` = "grey40", `TRUE` = "red"),
+                      labels = c(`FALSE` = "Other models", `TRUE` = "Best model for this series"), name = NULL) +
+  scale_x_continuous(breaks = scales::breaks_pretty(8), labels = pct_lab) +
+  scale_y_continuous(breaks = scales::breaks_pretty(8), labels = pct_lab) +
+  facet_wrap(~ series) +
+  labs(x = "Monthly MAPE (average over CV folds)", y = "Yearly MAPE (average over CV folds)",
+       title = "Diagnostic: how well does each model forecast each series on its own?",
+       subtitle = paste0("Each dot = one model fitted directly to that series. Red = best model for that series.\n",
+                         "These forecasts are NOT coherent (", FA, " + ", FB,
+                         " need not equal total) - use the pipeline results below for decisions."),
+       caption = "Lower-left is better. Axes are shared across panels.") +
+  theme_fc
+show_plot(p_models, "01_diagnostic_single_models")
+
+# ---- 6. Build all coherent pipelines ------------------------------------------
+section("6. Build coherent pipelines")
+
+get_fc <- function(s) base |> filter(series == s) |> select(origin, date, model, fc)
+
+A  <- get_fc(FA)      |> rename(m_a = model, a   = fc)
+B  <- get_fc(FB)      |> rename(m_b = model, b   = fc)
+Tt <- get_fc("total") |> rename(m_t = model, tot = fc)
+S  <- get_fc("share") |> rename(m_s = model, s   = fc)
+
+key   <- c("origin", "date")
+cross <- function(x, y) inner_join(x, y, by = key, relationship = "many-to-many")  # all model pairs
+
+grid <- bind_rows(
+  cross(A, B) |>
+    transmute(origin, date, strategy = S_AB, m_a, m_b,
+              combo = paste0(FA, ":", m_a, " | ", FB, ":", m_b),
+              !!FA := a, !!FB := b, total = a + b),
+  cross(Tt, A) |>
+    transmute(origin, date, strategy = S_TA, m_t, m_a,
+              combo = paste0("total:", m_t, " | ", FA, ":", m_a),
+              !!FA := a, !!FB := tot - a, total = tot),
+  cross(Tt, B) |>
+    transmute(origin, date, strategy = S_TB, m_t, m_b,
+              combo = paste0("total:", m_t, " | ", FB, ":", m_b),
+              !!FA := tot - b, !!FB := b, total = tot),
+  cross(Tt, S) |>
+    transmute(origin, date, strategy = S_TS, m_t, m_s,
+              combo = paste0("total:", m_t, " | share:", m_s),
+              !!FA := tot * s, !!FB := tot * (1 - s), total = tot)
+)
+
+combo_parts <- distinct(grid, strategy, combo, m_t, m_a, m_b, m_s)
+print(count(combo_parts, strategy, name = "n_pipelines"))
+log_msg("Total pipelines: %d", nrow(combo_parts))
+
+grid_long <- grid |>
+  pivot_longer(all_of(series_lvls), names_to = "series", values_to = "fc") |>
+  left_join(actuals, by = c("date", "series"))
+
+# ---- 7. Score all pipelines ----------------------------------------------------
+section("7. Score all pipelines")
+
+fold_metrics <- fold_scores(grid_long, strategy, combo, series)   # one row per pipeline x series x fold
+metrics      <- avg_scores(fold_metrics, strategy, combo, series) # averaged over folds
+n_folds      <- n_distinct(fold_metrics$origin)
+
+# a pipeline is homogeneous if both forecasted series use the same model name
+same_model <- function(...) {
+  m <- cbind(...)
+  apply(m, 1, function(r) {
+    r <- r[!is.na(r)]
+    if (length(unique(r)) == 1) r[1] else NA_character_
+  })
+}
+
+# overall score per pipeline: average of the 6 MAPEs (3 series x monthly/yearly), equal weights.
+# Change the weighting here if e.g. total matters more than fruit B.
+overall <- metrics |>
+  group_by(strategy, combo) |>
+  summarise(score = mean((monthly_mape + yearly_mape) / 2), .groups = "drop") |>
+  left_join(combo_parts, by = c("strategy", "combo")) |>
+  mutate(single_model = same_model(m_t, m_a, m_b, m_s)) |>
+  arrange(score) |>
+  mutate(rank = row_number())
+
+summary_tbl <- metrics |>
+  select(strategy, combo, series, monthly_mape, yearly_mape) |>
+  pivot_wider(names_from = series, values_from = c(monthly_mape, yearly_mape)) |>
+  left_join(select(overall, strategy, combo, single_model, score), by = c("strategy", "combo")) |>
+  arrange(score)
+
+log_msg("Scored %d pipelines over %d folds, of which %d are homogeneous",
+        nrow(overall), n_folds, sum(!is.na(overall$single_model)))
+
+# helper: print clear winner or near ties
+report_ties <- function(cands, label) {
+  best <- cands$score[1]
+  ties <- filter(cands, score <= best * (1 + TIE_TOL))
+  if (nrow(ties) == 1) {
+    log_msg("%s: clear winner %s (score %.2f)", label, cands$combo[1], best)
+  } else {
+    log_msg("%s: no clear winner, %d candidates within %.0f%% of best score (%.2f):",
+            label, nrow(ties), TIE_TOL * 100, best)
+    print(select(ties, any_of(c("single_model", "strategy", "combo", "score"))), n = Inf)
+  }
+}
+
+# ---- Shared plot text and axes ----------------------------------------------------
+lims_main <- list(x = range(metrics$monthly_mape, na.rm = TRUE), y = range(metrics$yearly_mape, na.rm = TRUE))
+scale_xy  <- list(scale_x_continuous(breaks = scales::breaks_pretty(8), labels = pct_lab),
+                  scale_y_continuous(breaks = scales::breaks_pretty(8), labels = pct_lab))
+
+pipeline_expl <- sprintf(paste0("A pipeline forecasts two series (one model each) and derives the third, so %s + %s = total always holds.\n",
+                                "Strategies: [%s]  [%s]  [%s]  [%s]."), FA, FB, S_AB, S_TA, S_TB, S_TS)
+het_expl  <- "HETEROGENEOUS = the two forecasted series may use different models (e.g. ARIMA for total, ETS for one fruit)."
+hom_expl  <- "HOMOGENEOUS = the same model is used for both forecasted series (simpler to explain)."
+cv_note   <- sprintf("Evaluation: %d rolling-origin CV folds (%s window), %d-month horizon, population %s in the forecast period.",
+                     n_folds, if (is.null(WINDOW)) "expanding" else paste0(WINDOW, "-month sliding"),
+                     H, if (POP_MODE == "forecast") "forecast" else "actual (optimistic)")
+mape_note <- "Monthly MAPE = average % error per month. Yearly MAPE = % error of the 12-month total. Lower-left is better."
+notation  <- sprintf("Notation: 'total:arima_pop | %s:ets' = total forecast with arima_pop, %s with ets, %s = total - %s.",
+                     FA, FA, FB, FA)
+band_note <- sprintf("Dot = average over %d folds. Bars = spread across folds (%dth to %dth percentile): long bars = unstable accuracy.",
+                     n_folds, round(BAND[1] * 100), round(BAND[2] * 100))
+
+# uncertainty plot: dot = average over folds, bars = BAND spread across folds
+plot_unc <- function(d, label_col, title, subtitle, caption, lims) {
+  ggplot(d, aes(monthly_mape, yearly_mape, colour = is_winner)) +
+    geom_segment(aes(x = monthly_mape, xend = monthly_mape, y = y_lo, yend = y_hi), alpha = 0.6) +
+    geom_segment(aes(x = m_lo, xend = m_hi, y = yearly_mape, yend = yearly_mape), alpha = 0.6) +
+    geom_point(size = 2.6) +
+    geom_text_repel(aes(label = .data[[label_col]]), size = 2.9, show.legend = FALSE,
+                    max.overlaps = Inf, min.segment.length = 0) +
+    scale_colour_manual(values = c(`TRUE` = "red", `FALSE` = "grey30"),
+                        labels = c(`TRUE` = "Winner", `FALSE` = "Others"), name = NULL) +
+    scale_xy +
+    coord_cartesian(xlim = lims$x, ylim = lims$y) +
+    facet_wrap(~ series) +
+    labs(x = "Monthly MAPE", y = "Yearly MAPE", title = title, subtitle = subtitle, caption = caption) +
+    theme_fc
+}
+
+# =============================================================================
+# A. HETEROGENEOUS PIPELINES (models may differ per component)
+# =============================================================================
+section("A. Heterogeneous pipelines")
+
+best_combo <- overall$combo[1]
+best_score <- overall$score[1]
+
+cat("\nTop 10 pipelines (lower score = better):\n")
+print(head(summary_tbl, 10), width = Inf)
+
+cat("\nBest pipeline per strategy:\n")
+print(overall |> group_by(strategy) |> slice_min(score, n = 1, with_ties = FALSE) |>
+        ungroup() |> arrange(score) |> select(strategy, combo, score))
+
+report_ties(overall, "Heterogeneous")
+
+# which individual models keep showing up among the top pipelines?
+role_lbl <- c(m_t = "total", m_a = FA, m_b = FB, m_s = "share")
+model_freq <- overall |>
+  slice_head(n = TOP_K) |>
+  pivot_longer(c(m_t, m_a, m_b, m_s), names_to = "role", values_to = "model", values_drop_na = TRUE) |>
+  mutate(role = unname(role_lbl[role])) |>
+  count(role, model, name = "n_in_top") |>
+  arrange(role, desc(n_in_top))
+
+cat(sprintf("\nHow often each model appears in the top %d pipelines, by the series it forecasts:\n", TOP_K))
+print(model_freq, n = Inf)
+cat(sprintf("\nStrategies in the top %d pipelines:\n", TOP_K))
+print(count(slice_head(overall, n = TOP_K), strategy, sort = TRUE))
+
+p_freq <- ggplot(model_freq, aes(n_in_top, reorder(model, n_in_top))) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = n_in_top), hjust = -0.3, size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  facet_wrap(~ role, scales = "free_y") +
+  labs(x = sprintf("Number of times used in the top %d heterogeneous pipelines", TOP_K), y = NULL,
+       title = sprintf("Heterogeneous pipelines: which models make up the top %d?", TOP_K),
+       subtitle = paste0("Each panel = the series a model forecasts inside a pipeline.\n",
+                         "Models that appear often are robust building blocks, even if no single pipeline clearly wins.")) +
+  theme_fc
+show_plot(p_freq, "02_heterogeneous_model_frequency")
+
+# best pipeline for each series on its own (ignores the other two series)
+per_series_best <- metrics |>
+  group_by(series) |>
+  slice_min(monthly_mape + yearly_mape, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(series = factor(series, levels = series_lvls))
+cat("\nBest pipeline per series on its own:\n")
+print(select(per_series_best, series, strategy, combo, monthly_mape, yearly_mape))
+
+plot1_df <- metrics |>
+  mutate(series = factor(series, levels = series_lvls), winner = combo == best_combo)
+
+p_het <- ggplot(plot1_df, aes(monthly_mape, yearly_mape)) +
+  geom_point(aes(colour = strategy), alpha = 0.45, size = 1.8) +
+  geom_point(data = per_series_best, shape = 21, size = 5, stroke = 1.1, colour = "black", fill = NA) +
+  geom_point(data = filter(plot1_df, winner), colour = "red", size = 4) +
+  geom_label_repel(data = filter(plot1_df, winner), aes(label = "winner"), colour = "red", size = 3,
+                   min.segment.length = 0, nudge_x = 0.3, nudge_y = 0.3) +
+  scale_colour_manual(values = strategy_cols) +
+  scale_xy +
+  coord_cartesian(xlim = lims_main$x, ylim = lims_main$y) +
+  facet_wrap(~ series) +
+  labs(x = "Monthly MAPE (average over CV folds)", y = "Yearly MAPE (average over CV folds)",
+       colour = "Strategy",
+       title = "Heterogeneous pipelines: which combination of models forecasts best?",
+       subtitle = paste0(pipeline_expl, "\n", het_expl, "\n",
+                         sprintf("Each dot = one of %d pipelines. RED = winner (lowest average of the 6 MAPEs = %.2f%%): %s\n",
+                                 nrow(overall), best_score, best_combo),
+                         "Black ring = best pipeline for that series alone (can differ per series)."),
+       caption = paste(cv_note, mape_note, notation, "Axes are shared across panels and with the homogeneous plot.", sep = "\n")) +
+  theme_fc
+show_plot(p_het, "03_heterogeneous_pipelines")
+
+unc1_df <- metrics |>
+  inner_join(select(slice_head(overall, n = TOP_N_UNC), combo, rank), by = "combo") |>
+  mutate(series = factor(series, levels = series_lvls), is_winner = combo == best_combo,
+         lbl = paste0("#", rank))
+
+# =============================================================================
+# B. HOMOGENEOUS PIPELINES (same model for both components)
+# =============================================================================
+section("B. Homogeneous pipelines")
+
+single <- filter(overall, !is.na(single_model))
+
+cat("\nScore of each model under each strategy (NA = model not available for the share):\n")
+print(single |>
+        select(single_model, strategy, score) |>
+        pivot_wider(names_from = strategy, values_from = score) |>
+        arrange(single_model), width = Inf)
+
+# each model represented by its best strategy -> one dot per model
+single_best <- single |>
+  group_by(single_model) |>
+  slice_min(score, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(score)
+
+cat("\nHomogeneous pipelines ranked (each model with its best strategy):\n")
+print(single_best |>
+        mutate(type = unname(model_type[single_model])) |>
+        select(single_model, type, strategy, combo, score), n = Inf)
+
+best_single_combo <- single_best$combo[1]
+best_single_score <- single_best$score[1]
+report_ties(single_best, "Homogeneous")
+
+plot2_df <- metrics |>
+  inner_join(select(single_best, combo, single_model), by = "combo") |>
+  mutate(series = factor(series, levels = series_lvls), is_winner = combo == best_single_combo)
+
+p_hom <- ggplot(plot2_df, aes(monthly_mape, yearly_mape)) +
+  geom_point(aes(colour = strategy), size = 3) +
+  geom_point(data = filter(plot2_df, is_winner), shape = 21, size = 5.5, stroke = 1.3, colour = "red", fill = NA) +
+  geom_text_repel(aes(label = single_model), size = 2.9, max.overlaps = Inf, min.segment.length = 0) +
+  scale_colour_manual(values = strategy_cols) +
+  scale_xy +
+  coord_cartesian(xlim = lims_main$x, ylim = lims_main$y) +
+  facet_wrap(~ series) +
+  labs(x = "Monthly MAPE (average over CV folds)", y = "Yearly MAPE (average over CV folds)",
+       colour = "Strategy that works best for this model",
+       title = "Homogeneous pipelines: which single model forecasts best?",
+       subtitle = paste0(pipeline_expl, "\n", hom_expl, "\n",
+                         "Each dot = one model, shown with the strategy that suits it best.\n",
+                         sprintf("RED ring = winner: %s (average of the 6 MAPEs = %.2f%%; best heterogeneous pipeline = %.2f%%).",
+                                 best_single_combo, best_single_score, best_score)),
+       caption = paste(cv_note, mape_note, notation, "Axes are shared across panels and with the heterogeneous plot.", sep = "\n")) +
+  theme_fc
+show_plot(p_hom, "04_homogeneous_pipelines")
+
+# ---- MAPE uncertainty versions (shared axes) -------------------------------------
+unc2_df  <- plot2_df |> mutate(lbl = single_model)
+lims_unc <- list(x = range(c(unc1_df$m_lo, unc1_df$m_hi, unc2_df$m_lo, unc2_df$m_hi), na.rm = TRUE),
+                 y = range(c(unc1_df$y_lo, unc1_df$y_hi, unc2_df$y_lo, unc2_df$y_hi), na.rm = TRUE))
+rank_key <- slice_head(overall, n = TOP_N_UNC) |> mutate(txt = paste0("#", rank, " = ", combo))
+cat("\nKey for the heterogeneous uncertainty plot (#rank = pipeline):\n")
+cat(paste0("  ", rank_key$txt, collapse = "\n"), "\n")
+
+p_het_unc <- plot_unc(
+  unc1_df, "lbl",
+  title    = sprintf("Heterogeneous pipelines: how stable is the accuracy of the top %d?", TOP_N_UNC),
+  subtitle = paste0(het_expl, "\nRed = winner (#1). ", band_note),
+  caption  = paste(sprintf("#n = rank of the pipeline (key printed in the console; #1 = %s).", best_combo),
+                   cv_note, sep = "\n"),
+  lims     = lims_unc)
+show_plot(p_het_unc, "05_heterogeneous_uncertainty")
+
+p_hom_unc <- plot_unc(
+  unc2_df, "lbl",
+  title    = "Homogeneous pipelines: how stable is the accuracy of each model?",
+  subtitle = paste0(hom_expl, "\nRed = winner (", best_single_combo, "). ", band_note),
+  caption  = paste(cv_note, "Axes are shared with the heterogeneous uncertainty plot.", sep = "\n"),
+  lims     = lims_unc)
+show_plot(p_hom_unc, "06_homogeneous_uncertainty")
+
+# =============================================================================
+# C. HETEROGENEOUS vs HOMOGENEOUS - what does simplicity cost?
+# =============================================================================
+section("C. Heterogeneous vs homogeneous")
+
+same_winner <- best_combo == best_single_combo
+if (same_winner) {
+  log_msg("The best heterogeneous pipeline is itself homogeneous: %s", best_combo)
+} else {
+  log_msg("Best heterogeneous: %s (score %.2f)", best_combo, best_score)
+  log_msg("Best homogeneous  : %s (score %.2f)", best_single_combo, best_single_score)
+  log_msg("Using one model costs %.2f MAPE points on average (%.1f%% worse)",
+          best_single_score - best_score, 100 * (best_single_score / best_score - 1))
+}
+
+cat("\nSide by side (all six MAPEs):\n")
+print(summary_tbl |>
+        filter(combo %in% c(best_combo, best_single_combo)) |>
+        mutate(type = if_else(combo == best_combo, "best heterogeneous", "best homogeneous")) |>
+        relocate(type), width = Inf)
+
+# ---- Track record of the winners over time (6 graphs) --------------------------
+# x = last month of each 12-month forecast window, so the last point is the latest month of data.
+lbl_combo  <- if (same_winner) "Best pipeline (heterogeneous = homogeneous)" else "Best heterogeneous pipeline"
+lbl_single <- "Best homogeneous pipeline"
+
+time_df <- bind_rows(
+  fold_metrics |> filter(combo == best_combo) |> mutate(winner = lbl_combo),
+  if (!same_winner) fold_metrics |> filter(combo == best_single_combo) |> mutate(winner = lbl_single)
+) |>
+  pivot_longer(c(monthly, yearly), names_to = "metric", values_to = "mape") |>
+  mutate(metric = recode(metric, monthly = "Monthly MAPE", yearly = "Yearly MAPE"),
+         series = factor(series, levels = series_lvls),
+         winner = factor(winner, levels = c(lbl_single, lbl_combo)))  # heterogeneous drawn last (on top)
+
+cat("\nMAPE per fold for the winner(s):\n")
+print(time_df |>
+        select(winner, window_end, series, metric, mape) |>
+        pivot_wider(names_from = c(series, metric), values_from = mape) |>
+        arrange(winner, window_end), width = Inf)
+
+last_df  <- time_df |> filter(window_end == max(window_end))
+x_breaks <- sort(unique(time_df$window_end))
+dodge    <- position_dodge(width = 25)  # small horizontal offset (days) so overlapping lines stay visible
+
+p_time <- ggplot(time_df, aes(window_end, mape, colour = winner, linetype = winner, group = winner)) +
+  geom_line(position = dodge) +
+  geom_point(size = 2, position = dodge) +
+  geom_label_repel(data = last_df, aes(label = sprintf("%.1f%%", mape)), size = 2.8, show.legend = FALSE,
+                   nudge_x = 60, direction = "y", min.segment.length = 0, segment.colour = "grey60") +
+  scale_colour_manual(values = setNames(c("steelblue", "red"), c(lbl_single, lbl_combo))) +
+  scale_linetype_manual(values = setNames(c("dashed", "solid"), c(lbl_single, lbl_combo))) +
+  scale_x_date(breaks = x_breaks, date_labels = "%Y-%m", expand = expansion(mult = c(0.03, 0.15))) +
+  scale_y_continuous(breaks = scales::breaks_pretty(8), labels = pct_lab) +
+  facet_grid(metric ~ series, scales = "free_y", switch = "y") +
+  labs(x = "End of the 12-month forecast window", y = NULL, colour = NULL, linetype = NULL,
+       title = "Track record: how accurate would each 12-month forecast of the winning pipeline(s) have been?",
+       subtitle = if (same_winner) {
+         paste("Winner (best heterogeneous and best homogeneous pipeline):", best_combo)
+       } else {
+         paste0("Red = best heterogeneous pipeline: ", best_combo,
+                "\nBlue dashed = best homogeneous pipeline: ", best_single_combo)
+       },
+       caption = paste0("Each point = one CV fold: a forecast made 12 months before the date shown, scored against actual sales.\n",
+                        "Last point = window ending ", format(max(time_df$window_end), "%b %Y"),
+                        " (labelled). Each row shares its y-axis across series. ",
+                        "Where lines overlap, both pipelines give the same forecast for that series.\n", cv_note)) +
+  theme_fc +
+  theme(strip.placement = "outside", axis.text.x = element_text(angle = 90, vjust = 0.5))
+show_plot(p_time, "07_track_record_over_time")
+
+# =============================================================================
+# D. POPULATION EFFECT OF EVERY MODEL AND OF THE WINNING PIPELINES
+# =============================================================================
+section("D. Population effect")
+# Comes straight from the CV - no refitting. In each fold the fitted model forecast the 12 test months
+# twice: population unchanged from a year earlier (fc0) and population POP_GROWTH higher than a year earlier (fcg).
+# Effect = average of (fcg - fc0) over the 12 months = extra sales per month due to that population growth.
+# The spread across folds shows how stable the effect is when the model is refitted on more data.
+
+eff_finish <- function(x) mutate(x, lo = estimate - 1.96 * sd, hi = estimate + 1.96 * sd, crosses_zero = lo < 0 & hi > 0)
+
+# individual population-using models, each on its own series
+pop_models <- names(model_type)[model_type %in% c("population", "ML + population", "ensemble")]
+ind_eff <- base |>
+  filter(series %in% series_lvls, model %in% pop_models) |>
+  group_by(series, model, origin) |>
+  summarise(e = mean(fcg - fc0), .groups = "drop") |>
+  group_by(series, label = model) |>
+  summarise(estimate = mean(e, na.rm = TRUE), sd = sd(e, na.rm = TRUE), .groups = "drop") |>
+  mutate(kind = "Single model on its own series") |>
+  eff_finish()
+
+# winning pipelines: rebuild the three series under both scenarios, per strategy
+pipeline_eff <- function(combo_name, kind) {
+  row  <- filter(overall, combo == combo_name)
+  comp <- function(m, s, nm) {
+    if (is.na(m)) return(NULL)
+    base |> filter(model == m, series == s) |>
+      transmute(origin, date, !!paste0(nm, "0") := fc0, !!paste0(nm, "g") := fcg)
+  }
+  parts <- Filter(Negate(is.null), list(comp(row$m_t, "total", "t"), comp(row$m_a, FA, "a"),
+                                        comp(row$m_b, FB, "b"), comp(row$m_s, "share", "s")))
+  dd <- Reduce(function(x, y) inner_join(x, y, by = c("origin", "date")), parts)
+  derive <- function(v) {
+    t <- dd[[paste0("t", v)]]; a <- dd[[paste0("a", v)]]; b <- dd[[paste0("b", v)]]; sh <- dd[[paste0("s", v)]]
+    if (row$strategy == S_AB) return(setNames(list(a, b, a + b), series_lvls))
+    if (row$strategy == S_TA) return(setNames(list(a, t - a, t), series_lvls))
+    if (row$strategy == S_TB) return(setNames(list(t - b, b, t), series_lvls))
+    setNames(list(t * sh, t * (1 - sh), t), series_lvls)
+  }
+  d0 <- derive("0")
+  dg <- derive("g")
+  bind_rows(lapply(series_lvls, function(s) {
+    tibble(origin = dd$origin, diff = dg[[s]] - d0[[s]]) |>
+      group_by(origin) |>
+      summarise(e = mean(diff), .groups = "drop") |>
+      summarise(estimate = mean(e, na.rm = TRUE), sd = sd(e, na.rm = TRUE)) |>
+      mutate(series = s, label = combo_name, kind = kind)
+  })) |>
+    eff_finish()
+}
+
+kind_het <- if (same_winner) "Winning pipeline (heterogeneous = homogeneous)" else "Best heterogeneous pipeline"
+kind_hom <- "Best homogeneous pipeline"
+pipe_eff <- bind_rows(
+  pipeline_eff(best_combo, kind_het),
+  if (!same_winner) pipeline_eff(best_single_combo, kind_hom)
+)
+
+eff_df <- bind_rows(ind_eff, pipe_eff) |>
+  mutate(series = factor(series, levels = series_lvls),
+         kind   = factor(kind, levels = c("Single model on its own series", kind_hom, kind_het)))
+# y order (bottom to top): models by average effect, winning pipelines on top
+lvl_order <- c(ind_eff |> group_by(label) |> summarise(m = mean(estimate, na.rm = TRUE)) |> arrange(m) |> pull(label),
+               rev(unique(pipe_eff$label)))
+eff_df <- mutate(eff_df, label = factor(label, levels = unique(lvl_order)))
+
+cat(sprintf("\nPopulation effect: extra sales per month if population is %s higher than a year earlier (vs unchanged):\n",
+            growth_txt))
+print(eff_df |> arrange(series, kind, desc(estimate)) |>
+        mutate(across(c(estimate, sd, lo, hi), round)) |>
+        select(series, kind, label, estimate, sd, lo, hi, crosses_zero), n = Inf, width = Inf)
+
+kind_cols <- setNames(c("grey35", "steelblue", "red"),
+                      c("Single model on its own series", kind_hom, kind_het))
+eff_expl  <- sprintf(paste0("Effect = extra sales per month if population is %s higher than in the same month a year earlier ",
+                            "(about %s people today),\ncompared with population unchanged from a year earlier. ",
+                            "Same fitted model and same history - only the population in the 12 forecast months differs.\n",
+                            "Computed in each of the %d CV folds."),
+                     growth_txt, people_txt, n_folds)
+eff_cap   <- paste0("Univariate models (snaive, ets, arima) do not use population (effect exactly 0) and are not shown.\n",
+                    "Pipelines: the scenario passes through both component models; derived series (e.g. ", FB, " = total - ", FA,
+                    ") get the difference of the two effects.\n",
+                    "The fold spread shows how stable the effect is when the model is refitted.\n",
+                    "Formal coefficients and p-values for the regression models are printed in the console. ",
+                    "Change the scenario with POP_GROWTH.")
+
+p_eff_forest <- ggplot(eff_df, aes(estimate, label, colour = kind)) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_segment(aes(x = lo, xend = hi, y = label, yend = label), linewidth = 0.8) +
+  geom_point(size = 2.6) +
+  scale_colour_manual(values = kind_cols, drop = TRUE) +
+  scale_x_continuous(breaks = scales::breaks_pretty(8), labels = scales::label_comma()) +
+  facet_wrap(~ series) +
+  labs(x = sprintf("Extra sales per month when population is %s above a year earlier (dot = average over folds, bar = ± 1.96 SD)",
+                   growth_txt),
+       y = NULL, colour = NULL,
+       title = sprintf("Population effect: if population is %s higher than a year ago, how many more sales per month?", growth_txt),
+       subtitle = paste0(eff_expl, " If a bar crosses the dashed line at 0, even the direction of the effect is not reliable."),
+       caption = eff_cap) +
+  theme_fc
+show_plot(p_eff_forest, "08_population_effect_forest")
+
+p_eff_scatter <- ggplot(eff_df, aes(estimate, sd, colour = kind)) +
+  geom_abline(slope =  1 / 1.96, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_abline(slope = -1 / 1.96, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = 0) +
+  geom_point(size = 2.8) +
+  geom_text_repel(aes(label = label), size = 2.7, show.legend = FALSE, max.overlaps = Inf, min.segment.length = 0) +
+  scale_colour_manual(values = kind_cols, drop = TRUE) +
+  scale_x_continuous(breaks = scales::breaks_pretty(8), labels = scales::label_comma()) +
+  scale_y_continuous(breaks = scales::breaks_pretty(6), labels = scales::label_comma()) +
+  facet_wrap(~ series) +
+  labs(x = sprintf("Extra sales per month when population is %s above a year earlier (average over folds)", growth_txt),
+       y = "Uncertainty: SD of the effect across folds", colour = NULL,
+       title = "Population effect vs its uncertainty",
+       subtitle = paste0(eff_expl, "\nPoints ABOVE the dashed V lines: the ±1.96 SD interval includes 0, so the effect is not reliable. ",
+                         "Below the lines and away from 0 = a clear, stable effect."),
+       caption = eff_cap) +
+  theme_fc
+show_plot(p_eff_scatter, "09_population_effect_scatter")
+
+# ---- Plain-English population effect of the winning pipelines -------------------
+section("Population effect of the winners, in plain English")
+
+for (k in unique(pipe_eff$kind)) {
+  pe <- filter(pipe_eff, kind == k)
+  cat(sprintf("\n%s: %s\n", k, pe$label[1]))
+  for (s in series_lvls) {
+    r         <- filter(pe, series == s)
+    avg_sales <- mean(tail(series_list[[s]]$y, 12))
+    cat(sprintf(paste0("  - %s: if population is %s higher than a year ago (about %s people) instead of unchanged,\n",
+                       "      %s sales are about %s higher per month (fold range %s to %s%s). Current level ~%s per month.\n"),
+                s, growth_txt, people_txt, s, fmt_num(r$estimate), fmt_num(r$lo), fmt_num(r$hi),
+                if (r$crosses_zero) ", includes 0: NOT reliable" else "", fmt_num(avg_sales)))
+  }
+}
+
+# ---- Formal statistics for the winners' component models -----------------------
+section("Formal coefficients and p-values of the winners' components")
+# Each component model is refitted on ALL data. Effects are for population POP_GROWTH higher than a year
+# earlier (vs unchanged), at the current sales level (average of the last 12 months).
+
+fmt_p <- function(p) if (p < 0.001) "p < 0.001" else sprintf("p = %.3f", p)
+sig   <- function(p) if (p < 0.05) "significant at 5%" else "NOT significant at 5%"
+
+describe_pop_stats <- function(model, s) {
+  d   <- series_list[[s]]
+  hdr <- sprintf("%s for %s:", model, s)
+  if (s == "share") return(paste(hdr, "share model - no population term."))
+  last_pop  <- tail(d$pop, 1)
+  avg_sales <- mean(tail(d$y, 12))
+  to_sales  <- function(b) avg_sales * ((1 + POP_GROWTH)^b - 1)   # coefficient on log population -> extra sales/month
+  scen      <- sprintf("population %s higher than a year ago (vs unchanged)", growth_txt)
+
+  if (model == "lm_logpop") {
+    fit <- lm(log(y) ~ log(pop) + t + factor(month), data = d)
+    co  <- summary(fit)$coefficients["log(pop)", ]; ci <- confint(fit)["log(pop)", ]
+    return(sprintf("%s %s -> %s more sales per month (95%% CI %s to %s), %s, %s. Holding trend and season fixed.",
+                   hdr, scen, fmt_num(to_sales(co[1])), fmt_num(to_sales(ci[1])), fmt_num(to_sales(ci[2])),
+                   fmt_p(co[4]), sig(co[4])))
+  }
+  if (model == "lm_growth") {
+    fit <- lm(log(y / y_lag12) ~ log(1 + pop_yoy), data = filter(d, !is.na(y_lag12), !is.na(pop_yoy)))
+    nm  <- "log(1 + pop_yoy)"
+    co  <- summary(fit)$coefficients[nm, ]; ci <- confint(fit)[nm, ]
+    return(sprintf("%s %s -> %s more sales per month (95%% CI %s to %s), %s, %s.",
+                   hdr, scen, fmt_num(to_sales(co[1])), fmt_num(to_sales(ci[1])), fmt_num(to_sales(ci[2])),
+                   fmt_p(co[4]), sig(co[4])))
+  }
+  if (model == "adl") {
+    fit   <- adl_fit(d)
+    cf    <- coef(fit); V <- vcov(fit); st <- summary(fit)$coefficients
+    phi   <- cf[["g_l1"]]
+    lr    <- (cf[["pg"]] + cf[["pg_l1"]]) / (1 - phi)                 # long-run effect
+    grad  <- c(0, lr / (1 - phi), 1 / (1 - phi), 1 / (1 - phi))        # delta method: d lr / d coef
+    lr_se <- sqrt(as.numeric(t(grad) %*% V %*% grad))
+    lr_p  <- 2 * pnorm(-abs(lr / lr_se))
+    sr_se <- st["pg", 2]
+    return(sprintf(paste0("%s %s ->\n",
+                          "      short run (same month): %s more sales per month (95%% CI %s to %s), %s, %s;\n",
+                          "      long run (fully adjusted): %s more sales per month (95%% CI %s to %s), %s, %s."),
+                   hdr, scen,
+                   fmt_num(to_sales(cf[["pg"]])), fmt_num(to_sales(cf[["pg"]] - 1.96 * sr_se)),
+                   fmt_num(to_sales(cf[["pg"]] + 1.96 * sr_se)), fmt_p(st["pg", 4]), sig(st["pg", 4]),
+                   fmt_num(to_sales(lr)), fmt_num(to_sales(lr - 1.96 * lr_se)), fmt_num(to_sales(lr + 1.96 * lr_se)),
+                   fmt_p(lr_p), sig(lr_p)))
+  }
+  if (model == "arima_pop") {
+    fit    <- aa(to_ts(d$y, d), xreg = d$pop)
+    k      <- grep("xreg", names(coef(fit)), value = TRUE)[1]
+    b      <- coef(fit)[k]; se <- sqrt(diag(fit$var.coef))[k]; p <- 2 * pnorm(-abs(b / se))
+    people <- POP_GROWTH * last_pop / (1 + POP_GROWTH)   # extra people vs a year earlier
+    return(sprintf("%s %s; %s (about %s people) -> %s more sales per month (95%% CI %s to %s), %s, %s.",
+                   hdr, tryCatch(as.character(fit), error = function(e) "ARIMA"), scen, fmt_num(people),
+                   fmt_num(b * people), fmt_num((b - 1.96 * se) * people), fmt_num((b + 1.96 * se) * people),
+                   fmt_p(p), sig(p)))
+  }
+  if (model %in% c("ets_percap", "arima_percap")) {
+    return(sprintf("%s per-capita model: sales move in proportion to population by assumption -> %s = about %s more sales per month (no p-value).",
+                   hdr, scen, fmt_num(avg_sales * POP_GROWTH)))
+  }
+  if (model %in% c("rf_growth", "xgb_growth")) {
+    return(paste(hdr, "ML model: no coefficient or p-value; see the population effect plots."))
+  }
+  if (model == "avg3") {
+    parts <- vapply(AVG3_PARTS, function(m) describe_pop_stats(m, s), character(1))
+    return(paste0(hdr, " average of ", paste(AVG3_PARTS, collapse = ", "),
+                  "; its combined effect is in the population effect plots. Components:\n",
+                  paste0("      * ", parts, collapse = "\n")))
+  }
+  paste(hdr, "univariate model - does not use population.")
+}
+
+derived_note <- c(setNames(paste(FB, "is derived as total -", FA), S_TA),
+                  setNames(paste(FA, "is derived as total -", FB), S_TB),
+                  setNames("total is derived as the sum of the two fruit forecasts", S_AB),
+                  setNames(paste(FA, "and", FB, "are derived as total x share"), S_TS))
+
+report_pop <- function(combo_name, label) {
+  row <- filter(overall, combo == combo_name)
+  cat(sprintf("\n%s: %s  (%s)\n", label, combo_name, derived_note[[row$strategy]]))
+  parts <- c(m_t = row$m_t, m_a = row$m_a, m_b = row$m_b, m_s = row$m_s)
+  for (r in names(parts)[!is.na(parts)]) {
+    cat("  -", describe_pop_stats(parts[[r]], unname(role_lbl[r])), "\n")
+  }
+}
+
+report_pop(best_combo, kind_het)
+if (!same_winner) report_pop(best_single_combo, kind_hom)
+cat("\nNote: lm() p-values assume independent errors; with autocorrelated monthly data they can be optimistic.\n")
+
+# =============================================================================
+# E. CV TABLE FOR THE WINNER(S): one row per fold
+# =============================================================================
+section("E. CV table per fold for the winner(s)")
+# actual / forecast = sum over the 12 test months
+# monthly_mape = average % error per month; yearly_mape = % error of the 12-month sum
+
+cv_table <- function(combo_name) {
+  d       <- series_list[[FA]]
+  o       <- cv_origins(d)
+  tr_from <- if (is.null(WINDOW)) rep(1, length(o)) else pmax(1, o - WINDOW + 1)
+  folds   <- tibble(origin = d$date[o],
+                    trained_on = paste(ym(d$date[tr_from]), "to", ym(d$date[o])),
+                    tested_on  = paste(ym(d$date[o + 1]), "to", ym(d$date[o + H])))
+
+  wide_tbl <- grid_long |>
+    filter(combo == combo_name) |>
+    group_by(origin, series) |>
+    summarise(monthly_mape = mean(abs(actual - fc) / actual) * 100,
+              act_sum      = sum(actual),
+              fc_sum       = sum(fc),
+              .groups      = "drop") |>
+    mutate(yearly_mape = abs(act_sum - fc_sum) / act_sum * 100) |>
+    rename(actual = act_sum, forecast = fc_sum) |>
+    pivot_wider(names_from = series, values_from = c(actual, forecast, monthly_mape, yearly_mape),
+                names_glue = "{series}_{.value}")
+
+  cols <- unlist(lapply(c("total", FA, FB),
+                        function(s) paste0(s, c("_actual", "_forecast", "_monthly_mape", "_yearly_mape"))))
+  tbl <- folds |>
+    left_join(wide_tbl, by = "origin") |>
+    select(trained_on, tested_on, all_of(cols)) |>
+    mutate(across(ends_with(c("_actual", "_forecast")), round),
+           across(ends_with("_mape"), ~ round(.x, 2)))
+
+  # last row: average MAPE over folds
+  avg_row <- tbl |>
+    summarise(across(ends_with("_mape"), ~ round(mean(.x, na.rm = TRUE), 2))) |>
+    mutate(trained_on = "Average over folds", tested_on = "")
+  bind_rows(tbl, avg_row)
+}
+
+cv_tbl_het <- cv_table(best_combo)
+cat(sprintf("\n%s: %s\n", kind_het, best_combo))
+print(cv_tbl_het, n = Inf, width = Inf)
+write.csv(cv_tbl_het, "cv_table_best_heterogeneous.csv", row.names = FALSE)
+log_msg("Saved cv_table_best_heterogeneous.csv")
+
+if (!same_winner) {
+  cv_tbl_hom <- cv_table(best_single_combo)
+  cat(sprintf("\n%s: %s\n", kind_hom, best_single_combo))
+  print(cv_tbl_hom, n = Inf, width = Inf)
+  write.csv(cv_tbl_hom, "cv_table_best_homogeneous.csv", row.names = FALSE)
+  log_msg("Saved cv_table_best_homogeneous.csv")
+}
+
+section("Done")
+log_msg("Best heterogeneous pipeline: %s [%s]", best_combo, overall$strategy[1])
+log_msg("Best homogeneous pipeline  : %s [%s]", best_single_combo, single_best$strategy[1])
