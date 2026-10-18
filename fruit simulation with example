@@ -1,0 +1,534 @@
+# =============================================================================
+# Fruit sales forecasting: combinatorial grid of COHERENT forecast strategies
+#
+# Every strategy produces fruit A, fruit B and total with total = A + B:
+#   1. A + B          : forecast A and B (each its own model); total = A + B
+#   2. total - A      : forecast total and A; B = total - A
+#   3. total - B      : forecast total and B; A = total - B
+#   4. total x A share: forecast total and A's share; A = total * share, B = total * (1 - share)
+#
+# PART 1 - best combination: components may use different models (e.g. ARIMA for total, ETS for A)
+# PART 2 - best single model: the same model is used for every component (easier to explain)
+#
+# Metrics per series: monthly MAPE and yearly MAPE (|sum actual - sum fc| / sum actual),
+# from rolling-origin CV with a 12-month horizon.
+# =============================================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forecast)
+library(ranger)
+library(xgboost)
+
+# =============================================================================
+# SIMULATED DEMO DATA - delete this block when using your own data
+# =============================================================================
+set.seed(123)
+
+sim_dates <- seq(as.Date("2019-01-01"), as.Date("2026-09-01"), by = "month")
+sim_t     <- seq_along(sim_dates)
+sim_mon   <- as.integer(format(sim_dates, "%m"))
+
+# population: ~1.5%/yr growth + a 2% step in mid-2022 (e.g. immigration wave)
+sim_pop <- round(1e6 * exp(0.015 * sim_t / 12) *
+                   (1 + 0.02 * (sim_dates >= as.Date("2022-07-01"))) *
+                   (1 + rnorm(length(sim_t), 0, 0.001)))
+
+# per-capita sales: own trend + seasonality + noise
+apple_pc  <- 0.020 * (1 + 0.020 * sim_t / 12) * (1 + 0.15 * sin(2 * pi * (sim_mon - 3) / 12)) *
+  exp(rnorm(length(sim_t), 0, 0.04))
+banana_pc <- 0.015 * (1 + 0.010 * sim_t / 12) * (1 + 0.10 * cos(2 * pi * (sim_mon - 7) / 12)) *
+  exp(rnorm(length(sim_t), 0, 0.05))
+
+# long format: date, population, fruit, sales (sales only from 2020-04)
+df <- bind_rows(
+  tibble(date = sim_dates, population = sim_pop, fruit = "apple",  sales = sim_pop * apple_pc),
+  tibble(date = sim_dates, population = sim_pop, fruit = "banana", sales = sim_pop * banana_pc)
+) |>
+  mutate(sales = if_else(date < as.Date("2020-04-01"), NA_real_, round(sales))) |>
+  arrange(date, fruit)
+
+cat("Simulated demo data 'df':", nrow(df), "rows\n")
+# ============================ end of simulated data ============================
+
+# ---- 0a. Data config: edit these to match your data ---------------------------
+# Expected input: long format, one row per date x fruit, monthly dates without gaps.
+DF_NAME   <- "df"              # name of your data frame object (as a string)
+DATE_COL  <- "date"            # date column (Date, or something as.Date() can parse)
+POP_COL   <- "population"      # population column
+FRUIT_COL <- "fruit"           # column holding the fruit name
+SALES_COL <- "sales"           # sales column
+FRUIT_A   <- "apple"           # value in FRUIT_COL for the first fruit
+FRUIT_B   <- "banana"          # value in FRUIT_COL for the second fruit
+
+# ---- 0b. Model / CV settings ----------------------------------------------------
+H       <- 12    # forecast horizon (months)
+INITIAL <- 36    # months in the first training window
+STEP    <- 3     # months between forecast origins
+WINDOW  <- NULL  # NULL = expanding window (train from first month); a number (e.g. 36) = sliding window
+TIE_TOL <- 0.02  # candidates within 2% of the best score count as "near ties"
+TOP_K   <- 20    # number of top combos used to count which individual models show up most
+
+log_msg <- function(...) cat(format(Sys.time(), "%H:%M:%S"), "|", sprintf(...), "\n")
+section <- function(title) cat("\n==== ", title, " ", strrep("=", max(0, 60 - nchar(title))), "\n", sep = "")
+ym      <- function(x) format(x, "%Y-%m")
+
+FA <- FRUIT_A
+FB <- FRUIT_B
+stopifnot(FA != FB,
+          !any(c(FA, FB) %in% c("date", "population", "total", "share", "pop_yoy")))
+
+# labels used in tables and plots
+S_AB <- paste(FA, "+", FB)
+S_TA <- paste("total -", FA)
+S_TB <- paste("total -", FB)
+S_TS <- paste("total x", FA, "share")
+strategy_cols <- setNames(c("steelblue", "darkgreen", "orange", "purple"), c(S_AB, S_TA, S_TB, S_TS))
+series_lvls   <- c(FA, FB, "total")
+
+# ---- 2. Read input and prepare series ------------------------------------------
+section("2. Read input and prepare series")
+
+raw <- get(DF_NAME)
+missing_cols <- setdiff(c(DATE_COL, POP_COL, FRUIT_COL, SALES_COL), names(raw))
+if (length(missing_cols) > 0) stop("Columns not found in ", DF_NAME, ": ", paste(missing_cols, collapse = ", "))
+
+# map user columns onto internal names
+dat <- raw |>
+  transmute(date       = as.Date(.data[[DATE_COL]]),
+            population = as.numeric(.data[[POP_COL]]),
+            fruit      = as.character(.data[[FRUIT_COL]]),
+            sales      = as.numeric(.data[[SALES_COL]]))
+
+found <- unique(dat$fruit)
+if (!all(c(FA, FB) %in% found)) stop("Fruit values not found. Available: ", paste(found, collapse = ", "))
+dat <- filter(dat, fruit %in% c(FA, FB))
+
+log_msg("'%s': %d rows | dates %s to %s | sales from %s",
+        DF_NAME, nrow(dat), ym(min(dat$date)), ym(max(dat$date)),
+        ym(min(dat$date[!is.na(dat$sales)])))
+print(head(filter(dat, !is.na(sales)), 6))
+
+# population: one value per date
+pop_df <- dat |>
+  group_by(date) |>
+  summarise(population = first(na.omit(population)), .groups = "drop")
+
+# sales: one column per fruit
+wide <- dat |>
+  select(date, fruit, sales) |>
+  pivot_wider(names_from = fruit, values_from = sales, values_fn = sum) |>
+  full_join(pop_df, by = "date") |>
+  arrange(date) |>
+  mutate(total    = .data[[FA]] + .data[[FB]],
+         share    = .data[[FA]] / total,                   # share of fruit A in total
+         pop_yoy  = population / lag(population, 12) - 1, # uses population history before sales start
+         sales_ok = !is.na(.data[[FA]]) & !is.na(.data[[FB]]))
+
+make_series <- function(s) {
+  wide |>
+    transmute(date, pop = population, pop_yoy, sales_ok, y = .data[[s]]) |>
+    mutate(y_pc     = y / pop,            # per capita
+           pc_lag12 = lag(y_pc, 12)) |>   # same month last year
+    filter(sales_ok) |>                   # same months for every series, so CV folds line up
+    mutate(t      = row_number(),
+           month  = as.integer(format(date, "%m")),
+           growth = y_pc / pc_lag12)      # YoY growth of per-capita value (ML target)
+}
+
+series_list <- sapply(c(FA, FB, "total", "share"), make_series, simplify = FALSE)
+for (s in names(series_list)) {
+  d <- series_list[[s]]
+  log_msg("%-8s: %d months (%s to %s), mean = %.3g", s, nrow(d), ym(min(d$date)), ym(max(d$date)), mean(d$y))
+}
+
+# ---- 3. Models ---------------------------------------------------------------
+# Each model: function(train, test) -> numeric forecast of length nrow(test).
+# NOTE: test-period population is taken as known (in production, use a population projection).
+
+to_ts <- function(x, d) {
+  ts(x, frequency = 12,
+     start = c(as.integer(format(d$date[1], "%Y")), as.integer(format(d$date[1], "%m"))))
+}
+
+ml_features <- c("month", "pop_yoy", "t")
+ml_train    <- function(tr) filter(tr, !is.na(growth), !is.na(pop_yoy))
+
+# models for sales levels (fruit A, fruit B, total)
+sales_models <- list(
+  snaive       = function(tr, te) snaive(to_ts(tr$y, tr), h = nrow(te))$mean,
+  ets          = function(tr, te) forecast(ets(to_ts(tr$y, tr)), h = nrow(te))$mean,
+  arima        = function(tr, te) forecast(auto.arima(to_ts(tr$y, tr)), h = nrow(te))$mean,
+  arima_pop    = function(tr, te) {
+    fit <- auto.arima(to_ts(tr$y, tr), xreg = tr$pop)
+    forecast(fit, xreg = te$pop)$mean
+  },
+  ets_percap   = function(tr, te) forecast(ets(to_ts(tr$y_pc, tr)), h = nrow(te))$mean * te$pop,
+  arima_percap = function(tr, te) forecast(auto.arima(to_ts(tr$y_pc, tr)), h = nrow(te))$mean * te$pop,
+  lm_logpop    = function(tr, te) {
+    fit <- lm(log(y) ~ log(pop) + t + factor(month), data = tr)
+    exp(predict(fit, newdata = te))
+  },
+  rf_growth    = function(tr, te) {
+    fit <- ranger(growth ~ month + pop_yoy + t, data = ml_train(tr), num.trees = 500, seed = 1)
+    predict(fit, te[, ml_features])$predictions * te$pc_lag12 * te$pop
+  },
+  xgb_growth   = function(tr, te) {
+    tr  <- ml_train(tr)
+    X   <- function(d) as.matrix(d[, ml_features])
+    fit <- xgb.train(params  = list(objective = "reg:squarederror", eta = 0.05, max_depth = 3),
+                     data    = xgb.DMatrix(X(tr), label = tr$growth),
+                     nrounds = 200, verbose = 0)
+    predict(fit, xgb.DMatrix(X(te))) * te$pc_lag12 * te$pop
+  }
+)
+
+# models for fruit A's share (a proportion, so no population scaling).
+# Names that match a sales model (snaive, ets, arima) let the share strategy count as a single-model pipeline.
+share_models <- list(
+  snaive    = function(tr, te) snaive(to_ts(tr$y, tr), h = nrow(te))$mean,
+  ets       = function(tr, te) forecast(ets(to_ts(tr$y, tr)), h = nrow(te))$mean,
+  arima     = function(tr, te) forecast(auto.arima(to_ts(tr$y, tr)), h = nrow(te))$mean,
+  lm_season = function(tr, te) predict(lm(y ~ t + factor(month), data = tr), newdata = te)
+)
+
+# ---- 4. Rolling-origin CV: base forecasts per series --------------------------
+section("4. Cross-validation (base forecasts)")
+# Expanding window: train on months 1..o. Sliding window: train on the last WINDOW months up to o.
+# Forecast the next H months, then move the origin by STEP.
+
+run_cv <- function(d, model_list, name, h = H, initial = INITIAL, step = STEP, window = WINDOW) {
+  stopifnot(h <= 12)  # ML models use 12-month lags; h <= 12 keeps them leak-free
+  origins <- seq(initial, nrow(d) - h, by = step)
+  log_msg("[%s] %s window | %d folds | %d models",
+          name, if (is.null(window)) "expanding" else paste0("sliding ", window, "-month"),
+          length(origins), length(model_list))
+  out <- list()
+  for (i in seq_along(origins)) {
+    o     <- origins[i]
+    start <- if (is.null(window)) 1 else max(1, o - window + 1)
+    tr    <- d[start:o, ]
+    te    <- d[(o + 1):(o + h), ]
+    fc <- lapply(names(model_list), function(m) {
+      tryCatch(as.numeric(model_list[[m]](tr, te)),
+               error = function(e) {
+                 log_msg("  ! [%s] %s failed on fold %d: %s", name, m, i, conditionMessage(e))
+                 rep(NA_real_, nrow(te))
+               })
+    })
+    names(fc) <- names(model_list)
+    if (all(c("ets_percap", "arima_pop", "xgb_growth") %in% names(fc))) {
+      fc$avg3 <- rowMeans(cbind(fc$ets_percap, fc$arima_pop, fc$xgb_growth))  # simple model average
+    }
+    out[[i]] <- tibble(origin = d$date[o], date = te$date, as_tibble(fc))
+    log_msg("[%s] fold %2d/%d | train %s to %s (%d mo) | test %s to %s",
+            name, i, length(origins), ym(tr$date[1]), ym(tr$date[nrow(tr)]), nrow(tr),
+            ym(te$date[1]), ym(te$date[h]))
+  }
+  bind_rows(out) |>
+    pivot_longer(-c(origin, date), names_to = "model", values_to = "fc")
+}
+
+base <- bind_rows(
+  lapply(c(FA, FB, "total"),
+         function(s) run_cv(series_list[[s]], sales_models, s) |> mutate(series = s)),
+  run_cv(series_list[["share"]], share_models, "share") |> mutate(series = "share")
+)
+log_msg("Base forecasts: %d rows", nrow(base))
+
+# ---- 5. Individual models, each on its own series (diagnostic) ----------------
+section("5. Individual models on their own series")
+
+actuals <- wide |>
+  select(date, all_of(c(FA, FB)), total, share) |>
+  pivot_longer(-date, names_to = "series", values_to = "actual")
+
+# per fold: monthly MAPE and yearly APE; then average over folds
+score_fc <- function(x, ...) {
+  x |>
+    group_by(..., origin) |>
+    summarise(monthly = mean(abs(actual - fc) / actual) * 100,
+              yearly  = abs(sum(actual) - sum(fc)) / sum(actual) * 100,
+              .groups = "drop") |>
+    group_by(...) |>
+    summarise(monthly_mape = mean(monthly), yearly_mape = mean(yearly), .groups = "drop")
+}
+
+model_metrics <- base |>
+  left_join(actuals, by = c("date", "series")) |>
+  score_fc(series, model) |>
+  mutate(avg_mape = (monthly_mape + yearly_mape) / 2) |>
+  group_by(series) |>
+  arrange(avg_mape, .by_group = TRUE) |>
+  mutate(rank = row_number()) |>
+  ungroup()
+
+print(model_metrics, n = Inf)
+cat("\nBest individual model per series:\n")
+print(filter(model_metrics, rank == 1))
+
+p_models <- ggplot(model_metrics, aes(monthly_mape, yearly_mape)) +
+  geom_point(aes(colour = rank == 1), size = 3) +
+  geom_text(aes(label = model), vjust = -0.9, size = 3) +
+  scale_colour_manual(values = c(`FALSE` = "grey40", `TRUE` = "red"), guide = "none") +
+  facet_wrap(~ factor(series, levels = c(series_lvls, "share")), scales = "free") +
+  labs(x = "Monthly MAPE (%)", y = "Yearly MAPE (%)",
+       title = "Individual models, each on its own series", subtitle = "Red = best per series") +
+  theme_bw()
+print(p_models)
+
+# ---- 6. Build the grid of coherent strategies ---------------------------------
+section("6. Build coherent strategy grid")
+
+get_fc <- function(s) base |> filter(series == s) |> select(origin, date, model, fc)
+
+A  <- get_fc(FA)      |> rename(m_a = model, a   = fc)
+B  <- get_fc(FB)      |> rename(m_b = model, b   = fc)
+Tt <- get_fc("total") |> rename(m_t = model, tot = fc)
+S  <- get_fc("share") |> rename(m_s = model, s   = fc)
+
+key   <- c("origin", "date")
+cross <- function(x, y) inner_join(x, y, by = key, relationship = "many-to-many")  # all model pairs
+
+grid <- bind_rows(
+  cross(A, B) |>
+    transmute(origin, date, strategy = S_AB, m_a, m_b,
+              combo = paste0(FA, ":", m_a, " | ", FB, ":", m_b),
+              !!FA := a, !!FB := b, total = a + b),
+  cross(Tt, A) |>
+    transmute(origin, date, strategy = S_TA, m_t, m_a,
+              combo = paste0("total:", m_t, " | ", FA, ":", m_a),
+              !!FA := a, !!FB := tot - a, total = tot),
+  cross(Tt, B) |>
+    transmute(origin, date, strategy = S_TB, m_t, m_b,
+              combo = paste0("total:", m_t, " | ", FB, ":", m_b),
+              !!FA := tot - b, !!FB := b, total = tot),
+  cross(Tt, S) |>
+    transmute(origin, date, strategy = S_TS, m_t, m_s,
+              combo = paste0("total:", m_t, " | share:", m_s),
+              !!FA := tot * s, !!FB := tot * (1 - s), total = tot)
+)
+
+combo_parts <- distinct(grid, strategy, combo, m_t, m_a, m_b, m_s)
+print(count(combo_parts, strategy, name = "n_combos"))
+log_msg("Total combos: %d", nrow(combo_parts))
+
+grid_long <- grid |>
+  pivot_longer(all_of(series_lvls), names_to = "series", values_to = "fc") |>
+  left_join(actuals, by = c("date", "series"))
+
+# ---- 7. Score all combos -------------------------------------------------------
+section("7. Score all combos")
+
+metrics <- score_fc(grid_long, strategy, combo, series)
+
+# a combo is a "single model" pipeline if every component uses the same model name
+same_model <- function(...) {
+  m <- cbind(...)
+  apply(m, 1, function(r) {
+    r <- r[!is.na(r)]
+    if (length(unique(r)) == 1) r[1] else NA_character_
+  })
+}
+
+# overall score per combo: average of the 6 MAPEs (3 series x monthly/yearly), equal weights.
+# Change the weighting here if e.g. total matters more than fruit B.
+overall <- metrics |>
+  group_by(strategy, combo) |>
+  summarise(score = mean((monthly_mape + yearly_mape) / 2), .groups = "drop") |>
+  left_join(combo_parts, by = c("strategy", "combo")) |>
+  mutate(single_model = same_model(m_t, m_a, m_b, m_s)) |>
+  arrange(score)
+
+summary_tbl <- metrics |>
+  pivot_wider(names_from = series, values_from = c(monthly_mape, yearly_mape)) |>
+  left_join(select(overall, strategy, combo, single_model, score), by = c("strategy", "combo")) |>
+  arrange(score)
+
+log_msg("Scored %d combos, of which %d are single-model pipelines",
+        nrow(overall), sum(!is.na(overall$single_model)))
+
+# helper: print clear winner or near ties
+report_ties <- function(cands, label) {
+  best <- cands$score[1]
+  ties <- filter(cands, score <= best * (1 + TIE_TOL))
+  if (nrow(ties) == 1) {
+    log_msg("%s: clear winner %s (score %.2f)", label, cands$combo[1], best)
+  } else {
+    log_msg("%s: no clear winner, %d candidates within %.0f%% of best score (%.2f):",
+            label, nrow(ties), TIE_TOL * 100, best)
+    print(select(ties, any_of(c("single_model", "strategy", "combo", "score"))), n = Inf)
+  }
+}
+
+# =============================================================================
+# PART 1 - BEST COMBINATION OF MODELS
+# =============================================================================
+section("PART 1: best combination of models")
+
+best_combo <- overall$combo[1]
+
+cat("\nTop 10 combinations (lower score = better):\n")
+print(head(summary_tbl, 10), width = Inf)
+
+cat("\nBest combination per strategy:\n")
+print(overall |> group_by(strategy) |> slice_min(score, n = 1, with_ties = FALSE) |>
+        ungroup() |> arrange(score) |> select(strategy, combo, score))
+
+report_ties(overall, "Part 1")
+
+# which individual models keep showing up among the top combos?
+role_lbl <- c(m_t = "total", m_a = FA, m_b = FB, m_s = "share")
+model_freq <- overall |>
+  slice_head(n = TOP_K) |>
+  pivot_longer(c(m_t, m_a, m_b, m_s), names_to = "role", values_to = "model", values_drop_na = TRUE) |>
+  mutate(role = unname(role_lbl[role])) |>
+  count(role, model, name = "n_in_top") |>
+  arrange(role, desc(n_in_top))
+
+cat(sprintf("\nHow often each model appears in the top %d combinations, by role:\n", TOP_K))
+print(model_freq, n = Inf)
+cat(sprintf("\nStrategies in the top %d combinations:\n", TOP_K))
+print(count(slice_head(overall, n = TOP_K), strategy, sort = TRUE))
+
+p_freq <- ggplot(model_freq, aes(n_in_top, reorder(model, n_in_top))) +
+  geom_col(fill = "steelblue") +
+  facet_wrap(~ role, scales = "free_y") +
+  labs(x = sprintf("Appearances in top %d combinations", TOP_K), y = NULL,
+       title = "Part 1: which individual models drive the best combinations?") +
+  theme_bw()
+print(p_freq)
+
+# best combination for each series on its own (ignores the other two series)
+per_series_best <- metrics |>
+  group_by(series) |>
+  slice_min(monthly_mape + yearly_mape, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(series = factor(series, levels = series_lvls))
+cat("\nBest combination per series on its own:\n")
+print(per_series_best)
+
+# scatter: every combo, red = overall winner, black ring = best for that series alone
+plot1_df <- metrics |>
+  mutate(series = factor(series, levels = series_lvls), winner = combo == best_combo)
+
+p_part1 <- ggplot(plot1_df, aes(monthly_mape, yearly_mape)) +
+  geom_point(aes(colour = strategy), alpha = 0.5, size = 1.8) +
+  geom_point(data = per_series_best, shape = 21, size = 4.5, stroke = 1, colour = "black", fill = NA) +
+  geom_point(data = filter(plot1_df, winner), colour = "red", size = 4) +
+  geom_label(data = filter(plot1_df, winner), aes(label = combo),
+             colour = "red", size = 2.8, vjust = -0.6) +
+  scale_colour_manual(values = strategy_cols) +
+  facet_wrap(~ series, scales = "free") +
+  labs(x = "Monthly MAPE (%)", y = "Yearly MAPE (%)", colour = "Strategy",
+       title = "Part 1: all model combinations",
+       subtitle = "Red = best combination overall; black ring = best for that series alone") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+print(p_part1)
+
+# =============================================================================
+# PART 2 - BEST SINGLE MODEL (same model for every component)
+# =============================================================================
+section("PART 2: best single model")
+
+single <- filter(overall, !is.na(single_model))
+
+cat("\nScore of each single model under each strategy (NA = model not available for share):\n")
+print(single |>
+        select(single_model, strategy, score) |>
+        pivot_wider(names_from = strategy, values_from = score) |>
+        arrange(single_model), width = Inf)
+
+# each model represented by its best strategy -> one dot per model
+single_best <- single |>
+  group_by(single_model) |>
+  slice_min(score, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(score)
+
+cat("\nSingle models ranked (each with its best strategy):\n")
+print(select(single_best, single_model, strategy, combo, score), n = Inf)
+
+best_single_combo <- single_best$combo[1]
+report_ties(single_best, "Part 2")
+
+plot2_df <- metrics |>
+  inner_join(select(single_best, combo, single_model), by = "combo") |>
+  mutate(series = factor(series, levels = series_lvls), winner = combo == best_single_combo)
+
+p_part2 <- ggplot(plot2_df, aes(monthly_mape, yearly_mape)) +
+  geom_point(aes(colour = strategy), size = 3) +
+  geom_point(data = filter(plot2_df, winner), colour = "red", size = 4.5) +
+  geom_text(aes(label = single_model), vjust = -0.9, size = 3) +
+  scale_colour_manual(values = strategy_cols) +
+  facet_wrap(~ series, scales = "free") +
+  labs(x = "Monthly MAPE (%)", y = "Yearly MAPE (%)", colour = "Best strategy for this model",
+       title = "Part 2: one model used for every component",
+       subtitle = "One dot per model (at its best strategy); red = best single model") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+print(p_part2)
+
+# =============================================================================
+# PART 1 vs PART 2 - what does simplicity cost?
+# =============================================================================
+section("Part 1 vs Part 2")
+
+score_combo  <- overall$score[overall$combo == best_combo]
+score_single <- overall$score[overall$combo == best_single_combo]
+
+if (best_combo == best_single_combo) {
+  log_msg("The best combination IS a single-model pipeline: %s", best_combo)
+} else {
+  log_msg("Best combination : %s (score %.2f)", best_combo, score_combo)
+  log_msg("Best single model: %s (score %.2f)", best_single_combo, score_single)
+  log_msg("Using one model costs %.2f MAPE points on average (%.1f%% worse)",
+          score_single - score_combo, 100 * (score_single / score_combo - 1))
+}
+
+cat("\nSide by side (all six MAPEs):\n")
+print(summary_tbl |>
+        filter(combo %in% c(best_combo, best_single_combo)) |>
+        mutate(part = if_else(combo == best_combo, "Part 1: best combination", "Part 2: best single model")) |>
+        relocate(part), width = Inf)
+
+# ---- Retrospective: MAPE over time for both winners (6 graphs) -----------------
+# Each point = one CV fold: a 12-month forecast made at that origin, scored against actuals.
+# Rows: monthly / yearly MAPE. Columns: fruit A / fruit B / total.
+winner_lbl <- c(setNames("Best single model", best_single_combo),
+                setNames("Best combination", best_combo))  # if identical, "Best combination" wins
+
+time_df <- grid_long |>
+  filter(combo %in% names(winner_lbl)) |>
+  group_by(combo, series, origin) |>
+  summarise(`Monthly MAPE (%)` = mean(abs(actual - fc) / actual) * 100,
+            `Yearly MAPE (%)`  = abs(sum(actual) - sum(fc)) / sum(actual) * 100,
+            .groups = "drop") |>
+  pivot_longer(c(`Monthly MAPE (%)`, `Yearly MAPE (%)`), names_to = "metric", values_to = "mape") |>
+  mutate(series = factor(series, levels = series_lvls),
+         winner = unname(winner_lbl[combo]))
+
+cat("\nMAPE per fold for the winner(s):\n")
+print(time_df |>
+        select(winner, origin, series, metric, mape) |>
+        pivot_wider(names_from = c(series, metric), values_from = mape) |>
+        arrange(winner, origin), width = Inf)
+
+p_time <- ggplot(time_df, aes(origin, mape, colour = winner)) +
+  geom_line() +
+  geom_point(size = 2) +
+  scale_colour_manual(values = c("Best combination" = "red", "Best single model" = "steelblue")) +
+  facet_grid(metric ~ series, scales = "free_y", switch = "y") +
+  labs(x = "Forecast origin (last month of training data)", y = NULL, colour = NULL,
+       title = "Winners over time",
+       subtitle = paste0("Red = ", best_combo, "   |   Blue = ", best_single_combo,
+                         "\nEach point = error of the 12-month forecast made at that origin")) +
+  theme_bw() +
+  theme(strip.placement = "outside", legend.position = "bottom")
+print(p_time)
+
+section("Done")
+log_msg("Part 1 winner (best combination) : %s [%s]", best_combo, overall$strategy[1])
+log_msg("Part 2 winner (best single model): %s [%s]", best_single_combo, single_best$strategy[1])
