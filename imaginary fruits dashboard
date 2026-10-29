@@ -1,0 +1,817 @@
+# Fruit sales in the headlines --------------------------------------------------
+# Builds one interactive HTML page: monthly sales for apples, bananas and oranges
+# in Canada, with news and government releases pinned to their dates.
+#
+# In the page:
+#   * toggle between apple, banana and orange sales
+#   * switch the y-axis between units sold and % change year over year
+#     (hover the line to see sales a year earlier and now)
+#   * filter stories by source (CBC, Statistics Canada, IRCC) and by kind
+#     (factual vs projection/plan); only national (Canada-wide) stories are used
+#   * pick a date window (from / to month) to zoom in on a period
+#   * five random headlines (each from a different year) are shown on opening;
+#     tick stories in the left panel to add more;
+#     headlines are placed so they never overlap each other, the line, or
+#     another headline's pointer
+#
+# Input:  none needed - the sales data and the news articles are typed in below with dput().
+#   To read them from CSV files instead, delete the dput() block and remove the # in
+#   front of the read.csv() line just above it (each is marked "OPTION 1" / "OPTION 2");
+#   the file names are set in SETTINGS (data_csv, news_csv).
+#   sales data:    a date column (YYYY-MM-DD, first of the month), a class column and a value
+#                  column; set their names (date_col, class_col, var_col) in SETTINGS below
+#   news articles: columns geo, source, type, date, exact, show, headline, url
+#   Year-over-year values need a year of earlier data, so with data from April 2020
+#   they start in April 2021.
+# Output: fruit_sales_headlines.html (one self-contained file), with buttons to
+#   download the chart as JPEG, all references as CSV and all data as CSV.
+# Packages: plotly, htmlwidgets, htmltools, dplyr. Self-contained
+# output needs pandoc, which ships with RStudio.
+
+library(dplyr)
+library(plotly)
+library(htmlwidgets)
+library(htmltools)
+
+# =====================================================================================
+# SETTINGS - change these
+# =====================================================================================
+# File names (in R's working directory, getwd(), or give a full path such as
+# "C:/Users/me/Documents/fruit_sales_data.csv"). The two CSVs are only read if you
+# switch to OPTION 1 further down; out_file is the page this script writes.
+data_csv <- "fruit_sales_data.csv"       # the data (date, class and value columns)
+news_csv <- "fruit_sales_stories.csv"    # the news articles
+out_file <- "fruit_sales_headlines.html"
+
+# Column names in the data
+date_col  <- "date"    # the month, as YYYY-MM-DD (first of the month)
+class_col <- "class"   # the group (apple, banana, orange)
+var_col   <- "sales"   # the number to plot
+
+# The classes: their values in class_col (capitals and spaces don't matter), and the
+# button label for each, in the same order. Buttons appear left to right in this order,
+# and the first one is shown when the page opens. Rows with any other value are left out.
+class_names  <- c("apple", "banana", "orange")
+class_labels <- c("Apple", "Banana", "Orange")
+
+# Text on the page. These are filled in automatically wherever they appear:
+#   {class}     the button picked, e.g. Apple
+#   {first}     first month of data, e.g. Apr 2020      {last} last month of data
+#   {made}      the day the page was built              {yoy_start} first month with a year-over-year value
+panel_title    <- "Fruit sales in the headlines"        # top of the left panel (and the browser tab)
+class_heading  <- "Fruit"                               # label beside the buttons
+title_level    <- "Monthly Fruit Sales in Canada: {class} (Units Sold)"
+title_yoy      <- "Monthly Fruit Sales in Canada: {class} (% Change Year over Year)"
+subtitle       <- "Source: simulated monthly sales data, {first} to {last} (fruit_sales_data.csv)"
+yoy_explainer  <- "How it's calculated: if sales are 1,000 units in January 2021 and 1,100 units in January 2022, the year-over-year change is (1,100 − 1,000) ÷ 1,000 = <b>+10%</b>."
+footer         <- "Made {made}. One value per fruit per month, dated the first of the month. Year-over-year values start in {yoy_start}."
+# =====================================================================================
+
+# ---- Sales data: one row per month and fruit -------------------------------------------
+# OPTION 1: read from a CSV file (remove the # below and delete the OPTION 2 block)
+# sales_data <- read.csv(data_csv, stringsAsFactors = FALSE)
+
+# OPTION 2: the data typed in (delete from here to "end of sales data" to use OPTION 1)
+sales_data <- structure(list(date = c("2020-04-01", "2020-04-01", "2020-04-01", 
+"2020-05-01", "2020-05-01", "2020-05-01", "2020-06-01", "2020-06-01", 
+"2020-06-01", "2020-07-01", "2020-07-01", "2020-07-01", "2020-08-01", 
+"2020-08-01", "2020-08-01", "2020-09-01", "2020-09-01", "2020-09-01", 
+"2020-10-01", "2020-10-01", "2020-10-01", "2020-11-01", "2020-11-01", 
+"2020-11-01", "2020-12-01", "2020-12-01", "2020-12-01", "2021-01-01", 
+"2021-01-01", "2021-01-01", "2021-02-01", "2021-02-01", "2021-02-01", 
+"2021-03-01", "2021-03-01", "2021-03-01", "2021-04-01", "2021-04-01", 
+"2021-04-01", "2021-05-01", "2021-05-01", "2021-05-01", "2021-06-01", 
+"2021-06-01", "2021-06-01", "2021-07-01", "2021-07-01", "2021-07-01", 
+"2021-08-01", "2021-08-01", "2021-08-01", "2021-09-01", "2021-09-01", 
+"2021-09-01", "2021-10-01", "2021-10-01", "2021-10-01", "2021-11-01", 
+"2021-11-01", "2021-11-01", "2021-12-01", "2021-12-01", "2021-12-01", 
+"2022-01-01", "2022-01-01", "2022-01-01", "2022-02-01", "2022-02-01", 
+"2022-02-01", "2022-03-01", "2022-03-01", "2022-03-01", "2022-04-01", 
+"2022-04-01", "2022-04-01", "2022-05-01", "2022-05-01", "2022-05-01", 
+"2022-06-01", "2022-06-01", "2022-06-01", "2022-07-01", "2022-07-01", 
+"2022-07-01", "2022-08-01", "2022-08-01", "2022-08-01", "2022-09-01", 
+"2022-09-01", "2022-09-01", "2022-10-01", "2022-10-01", "2022-10-01", 
+"2022-11-01", "2022-11-01", "2022-11-01", "2022-12-01", "2022-12-01", 
+"2022-12-01", "2023-01-01", "2023-01-01", "2023-01-01", "2023-02-01", 
+"2023-02-01", "2023-02-01", "2023-03-01", "2023-03-01", "2023-03-01", 
+"2023-04-01", "2023-04-01", "2023-04-01", "2023-05-01", "2023-05-01", 
+"2023-05-01", "2023-06-01", "2023-06-01", "2023-06-01", "2023-07-01", 
+"2023-07-01", "2023-07-01", "2023-08-01", "2023-08-01", "2023-08-01", 
+"2023-09-01", "2023-09-01", "2023-09-01", "2023-10-01", "2023-10-01", 
+"2023-10-01", "2023-11-01", "2023-11-01", "2023-11-01", "2023-12-01", 
+"2023-12-01", "2023-12-01", "2024-01-01", "2024-01-01", "2024-01-01", 
+"2024-02-01", "2024-02-01", "2024-02-01", "2024-03-01", "2024-03-01", 
+"2024-03-01", "2024-04-01", "2024-04-01", "2024-04-01", "2024-05-01", 
+"2024-05-01", "2024-05-01", "2024-06-01", "2024-06-01", "2024-06-01", 
+"2024-07-01", "2024-07-01", "2024-07-01", "2024-08-01", "2024-08-01", 
+"2024-08-01", "2024-09-01", "2024-09-01", "2024-09-01", "2024-10-01", 
+"2024-10-01", "2024-10-01", "2024-11-01", "2024-11-01", "2024-11-01", 
+"2024-12-01", "2024-12-01", "2024-12-01", "2025-01-01", "2025-01-01", 
+"2025-01-01", "2025-02-01", "2025-02-01", "2025-02-01", "2025-03-01", 
+"2025-03-01", "2025-03-01", "2025-04-01", "2025-04-01", "2025-04-01", 
+"2025-05-01", "2025-05-01", "2025-05-01", "2025-06-01", "2025-06-01", 
+"2025-06-01", "2025-07-01", "2025-07-01", "2025-07-01", "2025-08-01", 
+"2025-08-01", "2025-08-01", "2025-09-01", "2025-09-01", "2025-09-01", 
+"2025-10-01", "2025-10-01", "2025-10-01", "2025-11-01", "2025-11-01", 
+"2025-11-01", "2025-12-01", "2025-12-01", "2025-12-01", "2026-01-01", 
+"2026-01-01", "2026-01-01", "2026-02-01", "2026-02-01", "2026-02-01", 
+"2026-03-01", "2026-03-01", "2026-03-01", "2026-04-01", "2026-04-01", 
+"2026-04-01", "2026-05-01", "2026-05-01", "2026-05-01", "2026-06-01", 
+"2026-06-01", "2026-06-01", "2026-07-01", "2026-07-01", "2026-07-01", 
+"2026-08-01", "2026-08-01", "2026-08-01", "2026-09-01", "2026-09-01", 
+"2026-09-01"), class = c("apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange", "apple", 
+"banana", "orange", "apple", "banana", "orange", "apple", "banana", 
+"orange", "apple", "banana", "orange", "apple", "banana", "orange", 
+"apple", "banana", "orange", "apple", "banana", "orange"), sales = c(31126L, 
+59607L, 29173L, 31567L, 60699L, 26398L, 34011L, 59336L, 22922L, 
+40958L, 64386L, 22203L, 47015L, 61443L, 24601L, 52259L, 64068L, 
+29058L, 49613L, 61056L, 32750L, 48971L, 59280L, 38987L, 50100L, 
+58245L, 43412L, 38767L, 58753L, 43345L, 37502L, 62529L, 41788L, 
+35704L, 64707L, 37420L, 33413L, 64859L, 33301L, 34115L, 65123L, 
+28844L, 37503L, 66294L, 25404L, 44176L, 66991L, 22737L, 45499L, 
+65986L, 24881L, 53131L, 65682L, 28282L, 52874L, 62264L, 33816L, 
+52670L, 63340L, 39314L, 49007L, 60263L, 41755L, 42996L, 60319L, 
+44121L, 40146L, 61569L, 41566L, 35915L, 69503L, 37812L, 33361L, 
+66695L, 33645L, 35121L, 69564L, 28121L, 37404L, 70142L, 21282L, 
+44778L, 69280L, 20675L, 48455L, 66178L, 21110L, 53496L, 62558L, 
+25100L, 54403L, 66339L, 28082L, 53119L, 63924L, 32905L, 51754L, 
+61218L, 36358L, 47241L, 65549L, 39287L, 40353L, 63313L, 34982L, 
+37227L, 70611L, 33751L, 34960L, 69744L, 34403L, 37759L, 73781L, 
+30063L, 39483L, 73143L, 25619L, 45512L, 68122L, 23563L, 52569L, 
+72025L, 25681L, 56298L, 68658L, 27667L, 54893L, 64675L, 35190L, 
+55607L, 62988L, 39175L, 52450L, 64463L, 43797L, 45465L, 66164L, 
+46852L, 43118L, 66617L, 43553L, 37439L, 67800L, 38178L, 36580L, 
+68185L, 34714L, 38514L, 74645L, 28965L, 41488L, 74923L, 27057L, 
+48156L, 75898L, 24789L, 50541L, 75418L, 26822L, 56033L, 70301L, 
+30519L, 56927L, 69857L, 36376L, 55417L, 68038L, 40078L, 50930L, 
+67105L, 43788L, 48592L, 67815L, 45650L, 41559L, 70556L, 44975L, 
+38248L, 68926L, 40291L, 35582L, 75555L, 36078L, 39951L, 77155L, 
+29979L, 40637L, 76604L, 24737L, 47497L, 78850L, 25997L, 52104L, 
+76749L, 26215L, 57455L, 72924L, 31063L, 58548L, 73584L, 35991L, 
+55933L, 68553L, 41424L, 52948L, 69781L, 45816L, 46339L, 71860L, 
+44660L, 43484L, 76770L, 46526L, 38367L, 72032L, 42435L, 38820L, 
+74901L, 36899L, 39286L, 80512L, 31531L, 42312L, 78850L, 27595L, 
+50245L, 77142L, 25071L, 54764L, 79716L, 26745L, 60440L, 77263L, 
+31221L)), class = "data.frame", row.names = c(NA, -234L))
+# end of sales data
+
+# keep accented letters and symbols in the settings intact even when R is not running in UTF-8
+u8 <- function(x) {
+  if (is.character(x)) { i <- Encoding(x) == "unknown" & validUTF8(x); Encoding(x)[i] <- "UTF-8" }
+  x
+}
+txt <- lapply(list(panel_title = panel_title, class_heading = class_heading, title_level = title_level,
+                   title_yoy = title_yoy, subtitle = subtitle, yoy_explainer = yoy_explainer,
+                   footer = footer), u8)
+if (length(class_names) != length(class_labels))
+  stop("class_names and class_labels at the top need the same number of entries.")
+class_names  <- tolower(trimws(u8(class_names)))
+class_labels <- setNames(u8(class_labels), class_names)
+
+missing <- setdiff(c(date_col, class_col, var_col), names(sales_data))
+if (length(missing)) stop("Column(s) not found in the data: ", paste(missing, collapse = ", "),
+                          ". Check date_col, class_col and var_col at the top.")
+sales <- data.frame(date  = as.Date(sales_data[[date_col]]),
+                    class = tolower(trimws(sales_data[[class_col]])),
+                    sales = as.numeric(gsub(",", "", sales_data[[var_col]])),
+                    stringsAsFactors = FALSE) %>%
+  filter(!is.na(date), !is.na(sales), class %in% class_names) %>%
+  arrange(class, date)
+absent <- setdiff(class_names, sales$class)
+if (length(absent)) stop("No rows in the data for: ", paste(absent, collapse = ", "),
+                         ". Check class_names at the top against the values in ", class_col, ".")
+classes  <- class_names                        # button order = order in class_names
+label_of <- function(k) unname(class_labels[k])
+
+# ---- News articles ------------------------------------------------------------------
+# OPTION 1: read from a CSV file (remove the # below and delete the OPTION 2 block)
+# news_articles <- read.csv(news_csv, stringsAsFactors = FALSE, encoding = "UTF-8")
+
+# OPTION 2: the articles typed in (delete from here to "end of news articles" to use OPTION 1).
+# Accented letters and dashes are written as codes, e.g. \u00e9 = e-acute, \u2014 = long dash.
+news_articles <- structure(list(geo = c("ALL", "ALL", "ALL", "ALL", "ALL", "ALL", 
+"ALL", "ALL", "ALL", "CA", "ALL", "ALL", "ALL", "ALL", "ALL", 
+"ALL", "ALL", "ALL", "ALL", "CA", "ALL", "CA", "ALL", "CA", "CA", 
+"ALL", "CA", "ALL", "ALL", "CA", "ALL", "ALL", "ALL", "CA", "ALL", 
+"ALL", "CA", "ALL", "CA", "ALL", "ALL", "ALL", "ALL", "ALL", 
+"CA", "ALL", "CA", "ALL", "ALL", "CA", "ALL", "CA", "ALL", "CA", 
+"ALL", "CA", "ALL", "CA"), source = c("Statistics Canada", "Statistics Canada", 
+"IRCC", "Statistics Canada", "Statistics Canada", "Statistics Canada", 
+"Statistics Canada", "Statistics Canada", "IRCC", "CBC News", 
+"IRCC", "Statistics Canada", "Statistics Canada", "Statistics Canada", 
+"IRCC", "Statistics Canada", "IRCC", "Statistics Canada", "Statistics Canada", 
+"CBC News", "Statistics Canada", "CBC News", "Statistics Canada", 
+"CBC News", "CBC News", "Statistics Canada", "CBC News", "IRCC", 
+"Statistics Canada", "CBC News", "IRCC", "IRCC", "Statistics Canada", 
+"CBC News", "Statistics Canada", "Statistics Canada", "CBC News", 
+"IRCC", "CBC News", "Statistics Canada", "Statistics Canada", 
+"Statistics Canada", "Statistics Canada", "Statistics Canada", 
+"CBC News", "Statistics Canada", "CBC News", "IRCC", "Statistics Canada", 
+"CBC News", "Statistics Canada", "CBC News", "Statistics Canada", 
+"CBC News", "Statistics Canada", "CBC News", "Statistics Canada", 
+"CBC News"), type = c("Actual", "Actual", "Plan", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Plan", "Actual", 
+"Actual", "Actual", "Plan", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Revision", 
+"Actual", "Actual", "Plan", "Actual", "Actual", "Plan", "Plan", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Plan", "Projection", 
+"Actual", "Actual", "Projection", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Plan", "Preliminary", "Preliminary", "Projection", 
+"Projection", "Preliminary", "Preliminary", "Preliminary", "Preliminary", 
+"Revision", "Revision"), date = c("2020-06-18", "2020-09-29", 
+"2020-10-30", "2020-12-17", "2021-03-18", "2021-06-17", "2021-09-29", 
+"2021-12-16", "2021-12-23", "2022-02-09", "2022-02-14", "2022-03-17", 
+"2022-06-22", "2022-09-28", "2022-11-01", "2022-12-21", "2023-01-03", 
+"2023-01-11", "2023-03-22", "2023-03-22", "2023-06-15", "2023-06-16", 
+"2023-06-28", "2023-06-28", "2023-08-31", "2023-09-27", "2023-09-27", 
+"2023-11-01", "2023-12-19", "2023-12-19", "2024-01-22", "2024-03-21", 
+"2024-03-27", "2024-03-27", "2024-06-19", "2024-09-25", "2024-09-25", 
+"2024-10-24", "2024-10-24", "2024-12-17", "2025-01-16", "2025-01-21", 
+"2025-03-19", "2025-06-18", "2025-06-18", "2025-09-24", "2025-09-24", 
+"2025-11-04", "2025-12-17", "2025-12-17", "2026-02-18", "2026-02-26", 
+"2026-03-18", "2026-03-18", "2026-06-17", "2026-06-17", "2026-09-23", 
+"2026-09-23"), exact = c(TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, 
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, 
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, TRUE, TRUE, 
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, 
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, 
+TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE), show = c(FALSE, 
+FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, 
+FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, 
+TRUE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, 
+FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, 
+FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, 
+FALSE, FALSE, FALSE, TRUE, FALSE, FALSE, FALSE, TRUE, FALSE, 
+FALSE, FALSE, TRUE), headline = c("The Daily: Canada's population estimates, first quarter 2020", 
+"The Daily: Canada's population estimates, second quarter 2020", 
+"IRCC: Government of Canada announces plan to support economic recovery through immigration", 
+"The Daily: Canada's population estimates, third quarter 2020", 
+"The Daily: Canada's population estimates, fourth quarter 2020", 
+"The Daily: Canada's population estimates, first quarter 2021", 
+"The Daily: Canada's population estimates, second quarter 2021", 
+"The Daily: Canada's population estimates, third quarter 2021", 
+"IRCC: Canada welcomes the most immigrants in a single year in its history", 
+"Despite pandemic, Canada's population grows at fastest rate in G7: census", 
+"IRCC: New immigration plan to fill labour market shortages and grow Canada's economy (2022\u20132024 levels plan)", 
+"The Daily: Canada's population estimates, fourth quarter 2021", 
+"The Daily: Canada's population estimates, first quarter 2022", 
+"The Daily: Canada's population estimates, second quarter 2022", 
+"IRCC: An immigration plan to grow the economy (2023\u20132025 levels plan)", 
+"The Daily: Canada's population estimates, third quarter 2022", 
+"IRCC: Canada welcomes historic number of newcomers in 2022", 
+"The Daily: Canada's population estimates: subprovincial areas, July 1, 2022", 
+"The Daily: Canada's population estimates, fourth quarter 2022", 
+"Canada's population grew by record 1 million in 2022, spurred by international migration", 
+"Statistics Canada news release: Canada's population reaches 40 million", 
+"Canada's population surpasses 40 million", "The Daily: Canada's population estimates, first quarter 2023", 
+"Canada welcomes largest number of immigrants in first quarter since at least 1972", 
+"StatsCan to change how it counts non-permanent residents", "The Daily: Canada's population estimates, second quarter 2023", 
+"Migrants are driving a population surge \u2014 and Alberta is the fastest-growing province: StatsCan", 
+"IRCC: Stabilizing Canada's immigration targets to support sustainable growth", 
+"The Daily: Canada's population estimates, third quarter 2023", 
+"Statistics Canada reports record population growth, more than 430,000 in Q3", 
+"IRCC: Canada to stabilize growth and decrease new international student permits to approximately 360,000 for 2024", 
+"IRCC: Minister Miller's announcement on temporary residents (target of 5% of population)", 
+"The Daily: Canada's population estimates, fourth quarter 2023", 
+"Statistics Canada says population growth rate in 2023 was highest since 1957", 
+"The Daily: Canada's population estimates, first quarter 2024", 
+"The Daily: Canada's population estimates, second quarter 2024", 
+"Population growth slows for first time since pandemic as federal government clamps down", 
+"IRCC: Government of Canada reduces immigration (2025\u20132027 levels plan)", 
+"New immigration plan aims to stabilize population growth, housing market: minister", 
+"The Daily: Canada's population estimates, third quarter 2024", 
+"The Daily: Canada's population estimates: subprovincial areas, 2024", 
+"The Daily: Population projections for Canada, provinces and territories, 2024 to 2074", 
+"The Daily: Canada's population estimates, fourth quarter 2024", 
+"The Daily: Canada's population estimates, first quarter 2025", 
+"Canada's population growth at 0.0% so far this year: StatsCan", 
+"The Daily: Canada's population estimates, second quarter 2025", 
+"Canada's population growth almost flat in 2nd quarter as number of non-permanent residents declines", 
+"IRCC: Supplementary information for the 2026-2028 Immigration Levels Plan", 
+"The Daily: Canada's population estimates, third quarter 2025", 
+"Canada's population fell in third quarter, driven by drop in non-permanent residents: StatsCan", 
+"The Daily: Population projections for census divisions and subdivisions", 
+"Zero population growth expected in Canada this year: budget watchdog", 
+"The Daily: Canada's population estimates, fourth quarter 2025", 
+"Canada's population shrank last year \u2014 a first for the country, StatsCan says", 
+"The Daily: Canada's population estimates, first quarter 2026", 
+"Canada's population is dropping, but economists say that could be OK", 
+"The Daily: Canada's population estimates, second quarter 2026", 
+"Canada did not see historic population decline last year, StatsCan says after second look"
+), url = c("https://www150.statcan.gc.ca/n1/daily-quotidien/200618/dq200618b-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/200929/dq200929d-eng.htm", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2020/10/government-of-canada-announces-plan-to-support-economic-recovery-through-immigration.html", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/201217/dq201217b-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/210318/dq210318c-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/210617/dq210617c-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/210929/dq210929c-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/211216/dq211216c-eng.htm", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2021/12/canada-welcomes-the-most-immigrants-in-a-single-year-in-its-history.html", 
+"https://www.cbc.ca/news/politics/census-2021-release-population-cities-1.6344179", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2022/02/new-immigration-plan-to-fill-labour-market-shortages-and-grow-canadas-economy.html", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/220317/dq220317e-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/220622/dq220622d-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/220928/dq220928b-eng.htm", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2022/11/an-immigration-plan-to-grow-the-economy.html", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/221221/dq221221f-eng.htm", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2022/12/canada-welcomes-historic-number-of-newcomers-in-2022.html", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/230111/dq230111c-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/230322/dq230322f-eng.htm", 
+"https://www.cbc.ca/news/canada/canada-record-population-growth-migration-1.6787428", 
+"https://www.statcan.gc.ca/en/about/smr09/smr09_139", "https://www.cbc.ca/news/politics/canada-population-40-million-1.6878211", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/230628/dq230628c-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-record-immigration-1.6891590", 
+"https://www.cbc.ca/news/politics/statscan-to-revise-non-permanent-resident-numbers-1.6953169", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/230927/dq230927b-eng.htm", 
+"https://www.cbc.ca/news/politics/alberta-fastest-growing-population-statscan-1.6979680", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2023/11/stabilizing-canadas-immigration-targets-to-support-sustainable-growth.html", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/231219/dq231219c-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-record-population-growth-1.7063692", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2024/01/canada-to-stabilize-growth-and-decrease-number-of-new-international-student-permits-issued-to-approximately-360000-for-2024.html", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2024/03/speaking-notes-for-the-honourable-marc-miller-minister-of-immigration-refugees-and-citizenship-announcement-related-to-temporary-residents.html", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/240327/dq240327c-eng.htm", 
+"https://www.cbc.ca/news/politics/population-growth-canada-2023-1.7157233", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/240619/dq240619a-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/240925/dq240925d-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-population-growth-slows-1.7333734", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2024/10/government-of-canada-reduces-immigration.html", 
+"https://www.cbc.ca/news/politics/new-immigration-levels-plan-1.7361972", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/241217/dq241217c-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/250116/dq250116b-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/250121/dq250121c-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/250319/dq250319a-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/250618/dq250618a-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-population-growth-stalls-1.7564569", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/250924/dq250924e-eng.htm", 
+"https://www.cbc.ca/news/business/canada-q2-population-1.7642276", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/corporate/immigration-system/levels/supplementary-immigration-levels-2026-2028.html", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/251217/dq251217b-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-population-falls-9.7019359", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/260218/dq260218f-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-zero-population-growth-9.7107361", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/260318/dq260318b-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-population-decline-first-time-9.7133643", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/260617/dq260617a-eng.htm", 
+"https://www.cbc.ca/news/business/population-drop-first-quarter-2026-9.7238364", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/260923/dq260923b-eng.htm", 
+"https://www.cbc.ca/news/politics/statistics-canada-population-growth-9.7361422"
+)), class = "data.frame", row.names = c(NA, -58L))
+# end of news articles
+
+# Columns:
+# geo: CA = Canada, ALL = national release (any other code is a provincial story and is dropped;
+#      every story is shown on every fruit's chart)
+# source: CBC News / Statistics Canada / IRCC
+# type: Actual / Preliminary / Revision / Projection / Plan
+# date: YYYY-MM-DD
+# exact: TRUE when the publication day is known; otherwise the date is placed to the month
+# show: TRUE = headline ticked when the page opens
+# headline, url
+stories <- news_articles %>%
+  mutate(date = as.Date(date), exact = as.logical(exact), show = as.logical(show)) %>%
+  filter(date >= min(sales$date),                # nothing before the first month of data
+         geo %in% c("CA", "ALL")) %>%             # national stories only
+  mutate(id = row_number())
+
+ordinal <- function(n) {
+  suf <- ifelse(n %% 100 %in% 11:13, "th",
+         c("th","st","nd","rd","th","th","th","th","th","th")[n %% 10 + 1])
+  paste0(n, suf)
+}
+stories$date_txt <- ifelse(stories$exact,
+  paste(format(stories$date, "%b"), ordinal(as.integer(format(stories$date, "%d"))), format(stories$date, "%Y")),
+  format(stories$date, "%b %Y"))
+
+ms <- function(d) as.numeric(as.POSIXct(as.Date(d), tz = "UTC")) * 1000
+
+# region names, used in the references download
+regions <- c(ALL = "All regions (national release)", CA = "Canada")
+
+# ---- Source filters shown in the page; `sources_on` are ticked when it opens
+source_labels <- c("CBC News" = "CBC News", "Statistics Canada" = "Statistics Canada", "IRCC" = "IRCC")
+sources_on <- c("CBC News")
+
+# ---- Data handed to the page -------------------------------------------------------------
+G <- list(
+  W = 1180, H = 900,
+  first = format(min(sales$date), "%b %Y"), last = format(max(sales$date), "%b %Y"),
+  made = format(Sys.Date(), "%b %d, %Y"),
+  txt = txt, cols = c(date_col, class_col, var_col),
+  regions = as.list(regions),
+  geos = lapply(classes, function(k) {
+    p <- sales[sales$class == k, ]
+    list(code = k, name = label_of(k), ms = ms(p$date), v = p$sales)
+  }),
+  sources_on = as.list(sources_on),
+  stories = lapply(seq_len(nrow(stories)), function(i) { s <- stories[i, ]
+    list(id = s$id, geo = s$geo, src = s$source, type = s$type, ms = ms(s$date), d = s$date_txt,
+         exact = s$exact, h = s$headline, url = s$url, show = s$show) })
+)
+
+# ---- Base chart (the page redraws it for each view) ---------------------------------------
+fig <- plot_ly(width = G$W, height = G$H, type = "scatter", mode = "lines", x = numeric(0), y = numeric(0)) %>%
+  layout(autosize = FALSE) %>% config(displaylogo = FALSE)
+
+panel <- tags$aside(id = "panel",
+  tags$h2(HTML(txt$panel_title)),
+  tags$div(class = "ctl", tags$span(class = "lbl", HTML(txt$class_heading)),
+    tags$div(class = "seg", id = "fruit",
+      lapply(classes, function(k) tags$button(`data-k` = k, label_of(k))))),
+  tags$div(class = "ctl", tags$span(class = "lbl", "Y-axis"),
+    tags$div(class = "seg", id = "mode",
+      tags$button(`data-m` = "pop", "Units sold"),
+      tags$button(`data-m` = "yoy", "% change, year over year"))),
+  tags$fieldset(class = "flt dates", tags$legend("Date window"),
+    tags$select(id = "d0", title = "From"),
+    tags$span("to"),
+    tags$select(id = "d1", title = "To"),
+    tags$button(id = "b-dall", "All")),
+  tags$fieldset(class = "flt", tags$legend("Sources"),
+    lapply(names(source_labels), function(k) tags$label(
+      tags$input(type = "checkbox", class = "src", value = k, checked = if (k %in% sources_on) NA else NULL),
+      source_labels[[k]], tags$span(class = "n", `data-key` = k)))),
+  tags$fieldset(class = "flt", tags$legend("Kind of story"),
+    tags$label(tags$input(type = "checkbox", class = "kind", value = "fact", checked = NA),
+               "Factual: estimates and updates"),
+    tags$label(tags$input(type = "checkbox", class = "kind", value = "proj", checked = NA),
+               "Projection or plan")),
+  tags$div(class = "btns", tags$button(id = "b-reset", title = "Five random headlines, one from each of five years", "Random 5"), tags$button(id = "b-all", "All"),
+           tags$button(id = "b-none", "None")),
+  tags$div(id = "count", class = "help"),
+  tags$div(class = "list", id = "list")
+)
+
+# Download buttons, bottom-right of the chart
+dl <- tags$div(id = "dl",
+  tags$button(id = "b-jpg", title = "JPEG image of the chart exactly as shown", HTML("&#8681; Download current chart on screen")),
+  tags$button(id = "b-csv", title = "CSV of every story and release, whatever the filters", HTML("&#8681; Download all references")),
+  tags$button(id = "b-data", title = "CSV of the sales for every fruit and month, with year-over-year change", HTML("&#8681; Download all data")))
+
+css <- tags$style(HTML("
+  html,body{margin:0;background:#fff;color:#1a1d21;font-family:Arial,Helvetica,sans-serif}
+  body{padding:0!important}
+  #htmlwidget_container{position:relative;display:flex;align-items:flex-start;gap:16px;height:100vh;overflow:auto;padding:0!important;box-sizing:border-box}
+  #panel{width:350px;flex:none;border-right:1px solid #e3e6e9;padding:14px 14px 0;display:flex;flex-direction:column;gap:8px;box-sizing:border-box;height:100vh;position:sticky;left:0;top:0;background:#fff;z-index:5}
+  #panel h2{margin:0 0 2px;font-size:17px}
+  .ctl{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13px}
+  .ctl label,.lbl{font-weight:600;color:#4a5058}
+  .seg{display:inline-flex;border:1px solid #cfd4d9;border-radius:3px;overflow:hidden}
+  .seg button{font:600 12px Arial;background:#fff;color:#4a5058;border:0;border-left:1px solid #cfd4d9;padding:5px 10px;cursor:pointer}
+  .seg button:first-child{border-left:0}
+  .seg button[aria-pressed=true]{background:#1a1d21;color:#fff}
+  .help,.key{font-size:12px;color:#5d646c;margin:0}
+  .scope{display:inline-block;padding:0 4px;margin-right:5px;border-radius:3px;font:700 10px/15px Arial;letter-spacing:.02em;text-transform:uppercase}
+  .scope.nat{background:#1a1d21;color:#fff}
+  .scope.prov{background:#e3e6e9;color:#1a1d21}
+  .btns{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .btns button{font:600 12px Arial;background:#fff;border:1px solid #cfd4d9;border-radius:3px;padding:3px 10px;cursor:pointer}
+  .btns button:hover{border-color:#4a5058}
+  .flt{border:1px solid #e3e6e9;border-radius:3px;margin:0;padding:4px 8px 6px;display:grid;grid-template-columns:1fr 1fr;gap:2px 10px}
+  .flt legend{font:600 12px Arial;color:#4a5058;padding:0 4px}
+  .flt label{font-size:12px;color:#1a1d21;display:flex;gap:5px;align-items:center;cursor:pointer}
+  .flt label .n{color:#9aa1a8;font-size:11px}
+  .flt input{accent-color:#1a1d21;margin:0}
+  .it .m a{color:#4a5058}
+  .list{overflow-y:auto;flex:1;padding-bottom:10px;margin-top:2px}
+  .yr{font:700 12px Arial;color:#7d848c;padding:10px 0 3px;border-bottom:1px solid #e3e6e9}
+  .it{display:grid;grid-template-columns:18px 1fr;gap:6px;padding:6px 2px;font-size:13px;line-height:1.3;border-bottom:1px solid #f0f2f4;cursor:pointer}
+  .it:hover{background:#fdeeee}
+  .it input{margin:2px 0 0;accent-color:#d6262a;cursor:pointer}
+  .it .m{display:block;font-size:11.5px;color:#7d848c;margin-bottom:1px}
+  .it .nr{display:none;color:#d6262a;font-size:11px}
+  .it.nofit .nr{display:block}
+  .it .pre{display:block;color:#9aa1a8;font-size:11px}
+  .empty{font-size:13px;color:#7d848c;padding:12px 2px}
+  .html-widget{flex:none;margin:12px 0 16px 0}
+  .dates{display:flex;align-items:center;gap:6px;font-size:12px;color:#4a5058}
+  .dates select{font:13px Arial;padding:3px 4px;border:1px solid #cfd4d9;border-radius:3px;flex:1;min-width:0}
+  .dates button{flex:none;font:600 11px Arial;background:#fff;border:1px solid #cfd4d9;border-radius:3px;padding:3px 6px;cursor:pointer;white-space:nowrap}
+  #dl{position:absolute;top:0;left:0;width:max-content;display:flex;flex-direction:row;gap:6px;z-index:6}
+  #dl button{white-space:nowrap;font:600 12px Arial;text-align:left;background:#fff;border:1px solid #cfd4d9;border-radius:3px;padding:6px 9px;cursor:pointer;color:#1a1d21}
+  #dl button:hover{border-color:#1a1d21;background:#f5f6f7}
+"))
+
+js <- r"---(
+function(el, x, G){
+  // the chart fills the space beside the left panel, and the window height
+  let W=G.W,H=G.H;
+  function fit(){const pan=document.getElementById("panel");
+    const used=(pan?pan.offsetWidth:350)+16+28;
+    W=Math.max(900,Math.floor(window.innerWidth-used));H=Math.max(700,Math.min(1100,Math.floor(window.innerHeight-24)));
+    el.style.width=W+"px";el.style.height=H+"px"}
+  fit();
+  let rt=null;window.addEventListener("resize",()=>{clearTimeout(rt);rt=setTimeout(()=>{const w0=W,h0=H;fit();if(W!==w0||H!==h0)draw()},250)});
+  const MON=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const LAG=12;   // monthly data: the same month a year earlier is 12 rows back
+  const geos={};G.geos.forEach(g=>{geos[g.code]=g});
+  const store={get(k){try{return localStorage.getItem(k)}catch(e){return null}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
+  const jget=(k,d)=>{try{const v=JSON.parse(store.get(k)||"null");return Array.isArray(v)?v:d}catch(e){return d}};
+  let geo=store.get("fruit1-class")||G.geos[0].code, mode=store.get("fruit1-mode")||"pop";
+  if(!geos[geo])geo=G.geos[0].code; if(!["pop","yoy"].includes(mode))mode="pop";
+  // date window: picked from the months in the data ("" = first / last)
+  const Q=G.geos[0].ms,fmtQ=t=>MON[new Date(t).getUTCMonth()]+"-"+new Date(t).getUTCFullYear();
+  const qOf=v=>{const t=Date.parse(v||"");return Q.includes(t)?t:null};
+  let d0="",d1="";   // the full date range each time the page opens
+  // months offered: every month in the data; in the year-over-year view, from the first month with a value a year earlier
+  const QQ=()=>mode==="yoy"?Q.slice(LAG):Q;
+  function win(){const Qd=QQ();let a=qOf(d0),b=qOf(d1);if(a!=null&&b!=null&&a>b){const t=a;a=b;b=t}
+    if(a!=null&&a<=Qd[0])a=null;if(b!=null&&b<=Qd[0])b=Qd[1]||null;if(b===Qd[Qd.length-1])b=null;
+    const lo=a==null?Qd[0]:a,hi=b==null?Infinity:b,full=a==null&&b==null;
+    return {lo,hi,r0:a==null?Qd[0]:a,r1:b==null?Qd[Qd.length-1]:b,full,qa:a==null?Qd[0]:a,qb:b==null?Qd[Qd.length-1]:b}}
+  // headlines shown: picked at random each time the page opens (see pick5)
+  let sel=new Set();
+  const srcOn=new Set(jget("fruit1-src",G.sources_on)), kindOn=new Set(jget("fruit1-kind",["fact","proj"]));
+  const kindOf=s=>(s.type==="Projection"||s.type==="Plan")?"proj":"fact";
+  const DM=t=>{const d=new Date(t);return MON[d.getUTCMonth()]+" "+d.getUTCFullYear()};
+  const iso=t=>new Date(t).toISOString().slice(0,10);
+  const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;");
+  const fmtV=v=>Math.round(v).toLocaleString("en-CA");
+  const fmtPct=v=>(v>=0?"+":"")+(v*100).toFixed(2)+"%";
+  const fmtC=v=>v>=1e6?(v/1e6).toFixed(2)+"M":(v>=1e3?(v/1e3).toFixed(1)+"K":Math.round(v)+"");
+  const interp=(S,t)=>{if(t<=S[0][0])return S[0][1];if(t>=S[S.length-1][0])return S[S.length-1][1];
+    for(let k=1;k<S.length;k++)if(t<=S[k][0])return S[k-1][1]+(t-S[k-1][0])/(S[k][0]-S[k-1][0])*(S[k][1]-S[k-1][1])};
+  // national = Canada-wide stories and releases; provincial = about one province or territory
+  const national=s=>s.geo==="CA"||s.geo==="ALL",scopeOf=s=>national(s)?"National":"Provincial";
+  const SYM_OF=s=>national(s)?"star":"square";
+  // ---- data series
+  function popSeries(code){const g=geos[code];return g.ms.map((t,i)=>[t,g.v[i]])}
+  const yoyStart=()=>{const t=Q[LAG];return t?DM(t):"\u2014"};
+  function series(code,m){const P=popSeries(code);if(m==="pop")return P;
+    const out=[];for(let i=LAG;i<P.length;i++)out.push([P[i][0],P[i][1]/P[i-LAG][1]-1,P[i-LAG],P[i]]);return out}
+  // ---- stories: every story applies to every fruit
+  const inGeo=(s,code)=>true;
+  const inWin=s=>{const w=win();return s.ms>=w.lo&&s.ms<=w.hi};
+  const visibleFor=code=>G.stories.filter(s=>inGeo(s,code)&&srcOn.has(s.src)&&kindOn.has(kindOf(s))&&inWin(s));
+  const visibleStories=()=>visibleFor(geo);
+  // ---- label measuring and non-overlapping placement
+  const cv=document.createElement("canvas").getContext("2d");
+  const tw=(s,b)=>{cv.font=(b?"bold ":"")+"12px Arial";return cv.measureText(s).width};
+  const wrap=(h,n)=>{const out=[];let cur="";h.split(" ").forEach(w=>{if((cur+" "+w).trim().length>n&&cur){out.push(cur);cur=w}else cur=(cur+" "+w).trim()});if(cur)out.push(cur);return out};
+  function sizes(s,tail,widths){return widths.map((n,k)=>{const L=wrap(s.h,n),T="("+s.d+") "+tail;
+    const tl=tw(T,false)>tw("x".repeat(n),true)*1.05?wrap(T,n+6):[T];
+    const w=Math.max(...L.map(l=>tw(l,true)),...tl.map(l=>tw(l,false)))+10,h=(L.length+tl.length)*15+8;
+    const html="<b>"+L.map(esc).join("<br>")+"</b><br><span style=\"color:#4a5058\">"+tl.map(esc).join("<br>")+"</span>";
+    return {w,h,html,wide:k>0}})}
+  const hit=(a,b,p)=>a.x<b.x+b.w+p&&a.x+a.w+p>b.x&&a.y<b.y+b.h+p&&a.y+a.h+p>b.y;
+  const pin=(x,y,r,p)=>x>r.x-p&&x<r.x+r.w+p&&y>r.y-p&&y<r.y+r.h+p;
+  function segRect(x1,y1,x2,y2,r,p){const a=r.x-p,b=r.y-p,c=r.x+r.w+p,d=r.y+r.h+p;let t0=0,t1=1;const dx=x2-x1,dy=y2-y1;
+    for(const [q,e] of [[x1-a,-dx],[c-x1,dx],[y1-b,-dy],[d-y1,dy]]){if(e===0){if(q<0)return false}else{const t=q/e;if(e<0){if(t>t1)return false;if(t>t0)t0=t}else{if(t<t0)return false;if(t<t1)t1=t}}}return t0<=t1}
+  const o3=(p,q,r)=>Math.sign((q[0]-p[0])*(r[1]-p[1])-(q[1]-p[1])*(r[0]-p[0]));
+  const cross=(a,b,c,d)=>o3(a,b,c)!==o3(a,b,d)&&o3(c,d,a)!==o3(c,d,b);
+  function place(items,anchors,lines,samples,cap,B){const placed=[],fails=[];let total=0;
+    const lineCross=(a,b)=>{let n=0;lines.forEach(P=>{for(let k=1;k<P.length;k++)if(cross(a,b,P[k-1],P[k]))n++});return n};
+    for(const it of items){let best=null,bs=1e18;
+      for(const sz of it.sizes){for(let y=B.y0+2;y+sz.h<=B.y1-4;y+=8)for(let x=B.x0+4;x+sz.w<=B.x1-2;x+=10){
+        const r={x,y,w:sz.w,h:sz.h},lx=x+sz.w/2,ly=y+sz.h/2;
+        const ex=Math.min(Math.max(it.ax,x),x+sz.w),ey=Math.min(Math.max(it.ay,y),y+sz.h),len=Math.hypot(ex-it.ax,ey-it.ay);
+        if(len<18||len>B.maxLen)continue;let s=Math.pow(len,1.45)+(sz.wide?25:0);if(s>=bs)continue;
+        let ok=true;for(const p of placed)if(hit(r,p.r,7)||segRect(p.ax,p.ay,p.lx,p.ly,r,3)){ok=false;break}if(!ok)continue;
+        for(const a of anchors)if(pin(a[0],a[1],r,8)){ok=false;break}if(!ok)continue;
+        for(const q of samples)if(pin(q[0],q[1],r,5)){ok=false;break}if(!ok)continue;
+        for(const p of placed)if(segRect(it.ax,it.ay,lx,ly,p.r,3)){ok=false;break}if(!ok)continue;
+        for(const p of placed)if(cross([it.ax,it.ay],[lx,ly],[p.ax,p.ay],[p.lx,p.ly])){ok=false;break}if(!ok)continue;
+        s+=150*lineCross([it.ax,it.ay],[lx,ly]);if(s<bs){bs=s;best={r,lx,ly,sz}}}}
+      if(best){placed.push({it,ax:it.ax,ay:it.ay,...best});total+=bs}else{fails.push(it);total+=1e6}
+      if(cap!=null&&total>=cap)return null}
+    return {placed,fails,score:total}}
+  // second pass for headlines that found no clean spot: place them anyway, at the spot that covers
+  // the least (no overlap with other headlines if at all possible; then fewest line points, dots and crossings)
+  function forcePlace(fails,placed,anchors,lines,samples,B){
+    const C=8,nx=Math.ceil((B.x1-B.x0)/C)+2,ny=Math.ceil((B.y1-B.y0)/C)+2,cum=new Float64Array((nx+1)*(ny+1));
+    samples.forEach(q=>{const i=Math.floor((q[0]-B.x0)/C)+1,j=Math.floor((q[1]-B.y0)/C)+1;if(i>=1&&i<=nx&&j>=1&&j<=ny)cum[j*(nx+1)+i]++});
+    for(let j=1;j<=ny;j++)for(let i=1;i<=nx;i++)cum[j*(nx+1)+i]+=cum[(j-1)*(nx+1)+i]+cum[j*(nx+1)+i-1]-cum[(j-1)*(nx+1)+i-1];
+    const cnt=r=>{const i0=Math.max(0,Math.floor((r.x-B.x0)/C)),i1=Math.min(nx,Math.ceil((r.x+r.w-B.x0)/C)),j0=Math.max(0,Math.floor((r.y-B.y0)/C)),j1=Math.min(ny,Math.ceil((r.y+r.h-B.y0)/C));
+      return cum[j1*(nx+1)+i1]-cum[j0*(nx+1)+i1]-cum[j1*(nx+1)+i0]+cum[j0*(nx+1)+i0]};
+    const ov=(a,b)=>Math.max(0,Math.min(a.x+a.w,b.x+b.w)-Math.max(a.x,b.x))*Math.max(0,Math.min(a.y+a.h,b.y+b.h)-Math.max(a.y,b.y));
+    const out=[];
+    for(const it of fails){let best=null,bs=1e18;
+      for(const sz of it.sizes){for(let y=B.y0+2;y+sz.h<=B.y1-2;y+=10)for(let x=B.x0+2;x+sz.w<=B.x1-2;x+=12){
+        const r={x,y,w:sz.w,h:sz.h},lx=x+sz.w/2,ly=y+sz.h/2;
+        const ex=Math.min(Math.max(it.ax,x),x+sz.w),ey=Math.min(Math.max(it.ay,y),y+sz.h),len=Math.hypot(ex-it.ax,ey-it.ay);
+        let s=Math.pow(Math.max(len,18),1.3);if(s>=bs)continue;
+        for(const p of placed)s+=ov(r,p.r)*40;if(s>=bs)continue;
+        s+=cnt(r)*25;if(s>=bs)continue;
+        for(const a of anchors)if(pin(a[0],a[1],r,6))s+=400;if(s>=bs)continue;
+        for(const p of placed){if(cross([it.ax,it.ay],[lx,ly],[p.ax,p.ay],[p.lx,p.ly]))s+=500;if(segRect(it.ax,it.ay,lx,ly,p.r,2)||segRect(p.ax,p.ay,p.lx,p.ly,r,2))s+=500}
+        if(s<bs){bs=s;best={r,lx,ly,sz}}}}
+      if(best){const P={it,ax:it.ax,ay:it.ay,...best};placed.push(P);out.push(P)}}
+    return out}
+  function bestPlacement(items,anchors,lines,samples,B,budget){
+    let seed=7;const rnd=()=>(seed=(seed*16807)%2147483647)/2147483647;
+    const orders=[items.slice(),items.slice().reverse()];
+    for(let n=0;n<100;n++){const q=items.slice();for(let i=q.length-1;i>0;i--){const j=Math.floor(rnd()*(i+1));[q[i],q[j]]=[q[j],q[i]]}orders.push(q)}
+    const rev=q=>q.filter(i=>i.s.type==="Revision").concat(q.filter(i=>i.s.type!=="Revision"));
+    const t0=performance.now();let res=null;
+    for(const q of orders.map(rev)){if(res&&performance.now()-t0>budget)break;const r=place(q,anchors,lines,samples,res?res.score:null,B);if(r&&(!res||r.score<res.score))res=r}
+    return res}
+  // ---- the chart panel
+  function buildPanel(code,B,sfx,yr,compact){
+    const g=geos[code],w=win(),pct=mode!=="pop",Sall=series(code,mode);
+    const S=Sall.filter(p=>p[0]>=w.lo&&p[0]<=w.hi);
+    const [y0,y1]=yr,xa="x"+sfx,ya="y"+sfx;
+    if(S.length<2)return {data:[{x:[],y:[],xaxis:xa,yaxis:ya,type:"scatter",showlegend:false}],ann:[{text:"No "+(pct?"year-over-year values":"data")+" in this date window"+(pct?" (they start in "+yoyStart()+")":""),
+      xref:xa+" domain",yref:ya+" domain",x:0.5,y:0.5,showarrow:false,font:{size:14,color:"#7d848c"}}],placedIds:new Set(),fails:new Set(),early:new Set(),vis:[]};
+    const Sdraw=S;
+    const X=t=>B.x0+(t-w.r0)/(w.r1-w.r0)*(B.x1-B.x0),Y=v=>B.y0+(1-(v-y0)/(y1-y0))*(B.y1-B.y0);
+    const Xi=px=>w.r0+(px-B.x0)/(B.x1-B.x0)*(w.r1-w.r0),Yi=py=>y0+(1-(py-B.y0)/(B.y1-B.y0))*(y1-y0);
+    const lines=[Sdraw.map(p=>[X(p[0]),Y(p[1])])];
+    if(pct)lines.push([[B.x0,Y(0)],[B.x1,Y(0)]]);
+    const samples=[];lines.forEach(P=>{for(let k=1;k<P.length;k++){const [a,b]=P[k-1],[c,d]=P[k],n=Math.ceil(Math.hypot(c-a,d-b)/4);for(let j=0;j<=n;j++){const q=[a+(c-a)*j/n,b+(d-b)*j/n];if(q[0]>=B.x0-4&&q[0]<=B.x1+4)samples.push(q)}}});
+    const tS=S[0][0],tE=S[S.length-1][0];
+    // stories more than half a month before the first point are left off the chart
+    const all=visibleFor(code),early=new Set(all.filter(s=>s.ms<tS-15*864e5).map(s=>s.id));
+    const vis=all.filter(s=>!early.has(s.id)).map(s=>{const t=Math.min(Math.max(s.ms,tS),tE);
+      const v=interp(S,t);let tail=g.name+" sales \u2248 "+fmtV(v),hov=tail;
+      if(pct){const P=popSeries(code),a=interp(P,t-365.25*864e5),b=interp(P,t);
+        tail="y/y \u2248 "+fmtPct(v)+" ("+fmtC(a)+" \u2192 "+fmtC(b)+")";hov=tail}
+      return {s,t,v,ax:X(t),ay:Y(v),tail,hov}});
+    const widths=compact?[22,30,17]:[30,42,24];
+    const items=vis.filter(o=>sel.has(o.s.id)).map(o=>({...o,sizes:sizes(o.s,o.tail,widths)}));
+    const res=bestPlacement(items,vis.map(o=>[o.ax,o.ay]),lines,samples,B,compact?650:1200);
+    if(res.fails.length){forcePlace(res.fails,res.placed,vis.map(o=>[o.ax,o.ay]),lines,samples,B);res.fails=res.fails.filter(f=>!res.placed.some(p=>p.it===f))}
+    const placedIds=new Set(res.placed.map(p=>p.it.s.id)),fails=new Set(res.fails.map(f=>f.s.id));
+    const data=[];
+    const ann=res.placed.map(p=>({x:iso(p.it.t),y:p.it.v,xref:xa,yref:ya,axref:xa,ayref:ya,
+      ax:iso(Xi(p.r.x+p.r.w/2)),ay:Yi(p.r.y+p.r.h/2),
+      text:"<a href=\""+p.it.s.url+"\" target=\"_blank\" style=\"color:#1a1d21\">"+p.sz.html+"</a>",
+      showarrow:true,arrowhead:2,arrowsize:1.1,arrowwidth:1.1,arrowcolor:"rgba(214,38,42,.85)",standoff:6,align:"left",
+      font:{size:12,family:"Arial",color:"#1a1d21"},bgcolor:"rgba(255,255,255,0.92)",borderpad:2}));
+    data.push({x:Sdraw.map(p=>iso(p[0])),y:Sdraw.map(p=>p[1]),xaxis:xa,yaxis:ya,type:"scatter",mode:"lines+markers",cliponaxis:false,
+      name:g.name+" sales, monthly"+(pct?" (% change, year over year)":""),showlegend:!sfx,
+      line:{color:"#5b7fa6",width:2.4},marker:{size:4,color:"#5b7fa6"},
+      text:pct?Sdraw.map(p=>DM(p[2][0])+": "+fmtV(p[2][1])+"<br>"+DM(p[3][0])+": "+fmtV(p[3][1])+"<br><b>"+fmtPct(p[1])+" year over year</b>"):Sdraw.map(p=>DM(p[0])+"<br><b>"+fmtV(p[1])+"</b> units"),
+      hovertemplate:"<b>"+g.name+"</b><br>%{text}<extra></extra>"});
+    data.push({x:vis.map(o=>iso(o.t)),y:vis.map(o=>o.v),xaxis:xa,yaxis:ya,type:"scatter",mode:"markers",
+      name:"Stories",cliponaxis:false,showlegend:false,customdata:vis.map(o=>o.s.url),
+      text:vis.map(o=>"<b>"+esc(o.s.h)+"</b><br>"+o.s.src+" \u00b7 "+o.s.d+" \u00b7 "+o.s.type.toLowerCase()+"<br>"+o.hov),
+      hovertemplate:"%{text}<extra></extra>",
+      marker:{size:vis.map(o=>(placedIds.has(o.s.id)?10:8)+(national(o.s)?3:0)),color:vis.map(o=>placedIds.has(o.s.id)?"#d6262a":"white"),
+        symbol:vis.map(o=>SYM_OF(o.s)),
+        line:{color:vis.map(o=>placedIds.has(o.s.id)?"white":(fails.has(o.s.id)?"#d6262a":"#5b7fa6")),width:1.6}}});
+    // legend entry for the story markers
+    data.push({x:[null],y:[null],xaxis:xa,yaxis:ya,type:"scatter",mode:"markers",name:"News story or release",hoverinfo:"skip",
+      marker:{symbol:"star",size:13,color:"#d6262a",line:{color:"white",width:1}}});
+    return {data,ann,placedIds,fails,early,vis};
+  }
+  function yRange(vals,pct){const lo=Math.min(...vals),hi=Math.max(...vals),sp=(hi-lo)||Math.abs(hi)||1;
+    return pct?[lo-sp*0.18,hi+sp*0.8,hi]:[lo-sp*0.06,hi+sp*0.66,hi]}
+  // ---- draw everything
+  let lastFile="";
+  function draw(){
+    const pct=mode!=="pop",codes=[geo];
+    const w=win();
+    // header rows, in pixels from the top: title, source, legend
+    const hasEx=pct&&!!G.txt.yoy_explainer;
+    const R={title:12,src:44,ex:64,legend:hasEx?90:66};
+    const M={l:86,r:48,t:hasEx?128:104,b:104};
+    const doms=[[0,1]],pw=W-M.l-M.r,ph=H-M.t-M.b;
+    const PX=px=>(px-M.l)/pw,PY=py=>1-(py-M.t)/ph;
+    const inW=p=>p[0]>=w.lo&&p[0]<=w.hi;
+    const ranges=codes.map(c=>{let v=series(c,mode).filter(inW).map(p=>p[1]);
+      if(pct)v.push(0);return v.length?v:[0,1]});
+    const shared=pct?yRange(ranges.flat(),true):null;
+    const layout={autosize:false,width:W,height:H,margin:M,font:{family:"Arial"},showlegend:true,
+      legend:{orientation:"h",x:PX(12),y:PY(R.legend),yanchor:"top",xanchor:"left",font:{size:13}},
+      plot_bgcolor:"white",paper_bgcolor:"white",hoverlabel:{bgcolor:"white",font:{size:13}},annotations:[],images:[],shapes:[]};
+    const head=(text,px,py,size,color,extra)=>layout.annotations.push(Object.assign({text,xref:"paper",yref:"paper",x:PX(px),y:PY(py),
+      xanchor:"left",yanchor:"top",align:"left",showarrow:false,font:{size,color:color||"#1a1d21"}},extra||{}));
+    // title
+    const span=w.full?"":" \u00b7 "+fmtQ(w.qa)+" to "+fmtQ(w.qb);
+    // text from the settings at the top of the R script, with {placeholders} filled in
+    const fill=s=>String(s||"").replace(/\{(\w+)\}/g,(m,k)=>({class:geos[geo].name,first:G.first,last:G.last,made:G.made,yoy_start:yoyStart()})[k]??m);
+    head("<b>"+fill(pct?G.txt.title_yoy:G.txt.title_level)+"</b><span style=\"font-size:15px;color:#7d848c\">"+span+"</span>",14,R.title,21);
+    if(G.txt.subtitle)head(fill(G.txt.subtitle),14,R.src,13,"#7d848c");
+    if(hasEx)head(fill(G.txt.yoy_explainer),14,R.ex,13,"#4a5058");
+    let data=[];const res=[];
+    // x ticks on month starts, always including the first and last month of the window
+    const qs=Q.filter(t=>t>=w.r0&&t<=w.r1),maxT=Math.max(5,Math.floor(pw/62)),STEPS=[1,2,3,6,12,24,36];
+    let k=1;while(Math.ceil((qs.length-1)/k)+1>maxT)k=STEPS[STEPS.indexOf(k)+1]||k+12;
+    const tv=[];for(let j=qs.length-1;j>=0;j-=k)tv.unshift(qs[j]);if(tv[0]!==qs[0]){if((tv[0]-qs[0])<k*0.5*30.4*864e5)tv.shift();tv.unshift(qs[0])}
+    codes.forEach((c,i)=>{const sfx=i?"2":"",B={x0:M.l+doms[i][0]*pw,x1:M.l+doms[i][1]*pw,y0:M.t,y1:H-M.b,maxLen:340};
+      const yr=pct?shared:yRange(ranges[i],false);
+      const P=buildPanel(c,B,sfx,yr,false);res.push(P);data=data.concat(P.data);layout.annotations=layout.annotations.concat(P.ann);
+      layout["xaxis"+sfx]={domain:doms[i],anchor:"y"+sfx,range:[iso(w.r0),iso(w.r1)],showgrid:false,ticks:"outside",fixedrange:true,
+        tickformat:"%b<br>%Y",tickmode:"array",tickvals:tv.map(iso),title:{text:"Month",font:{size:13,color:"#4a5058"}}};
+      layout["yaxis"+sfx]={domain:[0,1],anchor:"x"+sfx,range:[yr[0],yr[1]],tickformat:pct?".1%":(yr[2]>=1e6?".3s":",.0f"),
+        gridcolor:"#e3e6e9",zeroline:pct,zerolinecolor:"#9aa1a8",fixedrange:true,
+        title:{text:pct?"% change, year over year":"Units sold",font:{size:13,color:"#4a5058"}}};
+    });
+    // footer: build date and what the data are
+    {const dlw=(document.getElementById("dl")||{offsetWidth:600}).offsetWidth,room=Math.max(200,W-dlw-60);
+     const ft=fill(G.txt.footer).replace(/<[^>]*>/g,"");
+     if(ft)head(wrap(ft,Math.floor(room/6.2)).join("<br>"),14,H-8,11.5,"#7d848c",{yanchor:"bottom"})}
+    // a rule under the header
+    layout.shapes.push({type:"line",xref:"paper",yref:"paper",x0:PX(14),x1:PX(W-14),y0:PY(R.legend-6),y1:PY(R.legend-6),line:{color:"#eceef0",width:1}});
+    Plotly.react(el,data,layout,{displaylogo:false,displayModeBar:false});
+    // download buttons: bottom-right corner of the chart, beside the footer
+    const dl=document.getElementById("dl");if(dl){dl.style.top=(el.offsetTop+H-36)+"px";dl.style.left=(el.offsetLeft+W-dl.offsetWidth-14)+"px"}
+    lastFile="sales-"+geo+"-"+(pct?"yoy":"units")+(w.full?"":"-"+iso(w.qa).slice(0,7)+"-to-"+iso(w.qb).slice(0,7));
+    renderList(res);syncControls();
+  }
+  function renderList(res){
+    const placed=new Set(),fails=new Set(),onChart=new Set();
+    res.forEach(P=>{P.placedIds.forEach(i=>placed.add(i));P.fails.forEach(i=>{if(!placed.has(i))fails.add(i)});P.vis.forEach(o=>onChart.add(o.s.id))});
+    const L=document.getElementById("list");let h="",yr="";
+    visibleStories().sort((a,b)=>a.ms-b.ms).forEach(s=>{const y=new Date(s.ms).getUTCFullYear();
+      if(y!==yr){yr=y;h+="<div class=\"yr\">"+y+"</div>"}
+      h+="<label class=\"it"+(fails.has(s.id)&&!placed.has(s.id)?" nofit":"")+"\"><input type=\"checkbox\" data-id=\""+s.id+"\""+(sel.has(s.id)?" checked":"")+">"+
+        "<span><span class=\"m\">"+s.src+" \u00b7 "+s.d+" \u00b7 "+s.type.toLowerCase()+" \u00b7 <a href=\""+s.url+"\" target=\"_blank\">open \u2197</a></span>"+esc(s.h)+
+        "<span class=\"nr\">No free space on the chart</span>"+(!onChart.has(s.id)?"<span class=\"pre\">Not on this view: year-over-year values start in "+yoyStart()+"</span>":"")+"</span></label>"});
+    L.innerHTML=h||"<div class=\"empty\">No stories match these filters. Tick more sources or kinds of story, or widen the date window.</div>";
+    L.querySelectorAll("input").forEach(c=>c.addEventListener("change",()=>{const id=+c.dataset.id;c.checked?sel.add(id):sel.delete(id);draw()}));
+    const n=visibleStories().length;
+    document.getElementById("count").textContent=placed.size+" of "+n+" headlines on the chart"+(fails.size?" \u00b7 "+fails.size+" without free space (red-ringed dots)":"");
+  }
+  function syncControls(){
+    document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===mode));
+    document.querySelectorAll("#fruit button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.k===geo));
+    {const w=win(),opts=QQ().map(t=>"<option value=\""+iso(t)+"\">"+fmtQ(t)+"</option>").join("");
+      ["d0","d1"].forEach(id=>{const e=document.getElementById(id);if(e.dataset.m!==mode){e.innerHTML=opts;e.dataset.m=mode}});
+      document.getElementById("d0").value=iso(w.qa);document.getElementById("d1").value=iso(w.qb)}
+    document.querySelectorAll(".src").forEach(c=>{c.checked=srcOn.has(c.value)});
+    document.querySelectorAll(".kind").forEach(c=>{c.checked=kindOn.has(c.value)});
+    document.querySelectorAll(".flt .n").forEach(n=>{n.textContent=G.stories.filter(s=>inGeo(s,geo)&&s.src===n.dataset.key&&kindOn.has(kindOf(s))).length});
+    store.set("fruit1-class",geo);store.set("fruit1-mode",mode);
+    store.set("fruit1-src",JSON.stringify([...srcOn]));store.set("fruit1-kind",JSON.stringify([...kindOn]));
+  }
+  // ---- downloads
+  function saveBlob(blob,name){const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();
+    setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000)}
+  const q=v=>"\""+String(v).replace(/"/g,"\"\"")+"\"";
+  document.getElementById("b-jpg").onclick=()=>{Plotly.downloadImage(el,{format:"jpeg",width:W,height:H,scale:2,filename:lastFile})};
+  document.getElementById("b-csv").onclick=()=>{
+    const rows=[["date_published","date_precision","scope","region","region_code","source","type","headline","link"]];
+    G.stories.slice().sort((a,b)=>a.ms-b.ms).forEach(s=>rows.push([iso(s.ms),s.exact?"day":"month",scopeOf(s),G.regions[s.geo]||s.geo,s.geo,s.src,s.type,s.h,s.url]));
+    saveBlob(new Blob(["\ufeff"+rows.map(r=>r.map(q).join(",")).join("\r\n")],{type:"text/csv;charset=utf-8"}),"fruit-sales-headlines-references.csv")};
+  // all sales data: every fruit and month, with the year-over-year change worked out
+  document.getElementById("b-data").onclick=()=>{
+    const rows=[[G.cols[0],G.cols[1],G.cols[2],G.cols[2]+"_1_year_ago","yoy_pct_change","calculation"]];
+    G.geos.forEach(g=>g.ms.forEach((t,i)=>{const d=new Date(t),v=g.v[i];
+      const j=g.ms.findIndex(u=>{const a=new Date(u);return a.getUTCFullYear()===d.getUTCFullYear()-1&&a.getUTCMonth()===d.getUTCMonth()});
+      if(j<0){rows.push([iso(t),g.code,v,"","",""]);return}
+      const p=g.v[j],pc=(v-p)/p*100,sg=pc>=0?"+":"";
+      rows.push([iso(t),g.code,v,p,pc.toFixed(2),"("+fmtV(v)+" - "+fmtV(p)+") / "+fmtV(p)+" = "+sg+pc.toFixed(2)+"%"])}));
+    saveBlob(new Blob(["\ufeff"+rows.map(r=>r.map(q).join(",")).join("\r\n")],{type:"text/csv;charset=utf-8"}),"fruit-sales-data.csv")};
+  // ---- controls
+  document.querySelectorAll("#fruit button").forEach(b=>b.addEventListener("click",()=>{geo=b.dataset.k;pickIfNone();draw()}));
+  document.getElementById("d0").addEventListener("change",e=>{d0=e.target.value;draw()});
+  document.getElementById("d1").addEventListener("change",e=>{d1=e.target.value;draw()});
+  document.getElementById("b-dall").onclick=()=>{d0="";d1="";draw()};
+  document.querySelectorAll("#mode button").forEach(b=>b.addEventListener("click",()=>{mode=b.dataset.m;pickIfNone();draw()}));
+  document.querySelectorAll(".src").forEach(c=>c.addEventListener("change",()=>{c.checked?srcOn.add(c.value):srcOn.delete(c.value);draw()}));
+  document.querySelectorAll(".kind").forEach(c=>c.addEventListener("change",()=>{c.checked?kindOn.add(c.value):kindOn.delete(c.value);draw()}));
+  // five random headlines, each from a different year, among the stories that can be shown now
+  function pick5(){const v=visibleStories();v.forEach(s=>sel.delete(s.id));const by={};
+    v.forEach(s=>{const y=new Date(s.ms).getUTCFullYear();(by[y]=by[y]||[]).push(s)});
+    const ys=Object.keys(by);for(let i=ys.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[ys[i],ys[j]]=[ys[j],ys[i]]}
+    ys.slice(0,5).forEach(y=>{const a=by[y];sel.add(a[Math.floor(Math.random()*a.length)].id)})}
+  const pickIfNone=()=>{if(!visibleStories().some(s=>sel.has(s.id)))pick5()};
+  document.getElementById("b-reset").onclick=()=>{pick5();draw()};
+  document.getElementById("b-all").onclick=()=>{visibleStories().forEach(s=>sel.add(s.id));draw()};
+  document.getElementById("b-none").onclick=()=>{visibleStories().forEach(s=>sel.delete(s.id));draw()};
+  pick5();
+  el.on("plotly_click",d=>{const u=d.points[0].customdata;if(u)window.open(u,"_blank")});
+  draw();
+}
+)---"
+
+fig <- fig %>% onRender(js, data = G)
+fig <- prependContent(fig, css, panel)
+fig <- appendContent(fig, dl)
+fig$sizingPolicy$browser$fill <- FALSE
+fig$sizingPolicy$browser$padding <- 0
+fig$sizingPolicy$defaultWidth <- G$W
+fig$sizingPolicy$defaultHeight <- G$H
+saveWidget(fig, out_file, selfcontained = TRUE, title = gsub("<[^>]*>", "", txt$panel_title))
+message("Saved ", normalizePath(out_file))
+if (interactive()) browseURL(normalizePath(out_file))   # open the new page straight away
