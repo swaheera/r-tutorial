@@ -1,0 +1,1240 @@
+# Canada's population in the headlines, by province ---------------------------
+# Builds one interactive HTML page: quarterly population for Canada and each
+# province and territory (Statistics Canada, Table 17-10-0009-01), with news
+# and government releases pinned to their dates.
+#
+# In the page:
+#   * choose Canada or a province/territory from the drop-down
+#   * switch the y-axis between population and % change year over year
+#     (hover the line to see the population a year earlier and now)
+#   * filter stories by source (CBC, provincial/territorial governments,
+#     Statistics Canada, IRCC) and by kind (factual vs projection/plan)
+#   * pick a date window (from / to month) to zoom in on a period
+#   * five random headlines (each from a different year) are shown on opening;
+#     tick stories in the left panel to add more;
+#     headlines are placed clear of each other and the line where there is room
+#
+# Input:  the population numbers and the news stories, either imported from two
+#   CSV files (option 1: population_data.csv, news_articles.csv) or written out in
+#   this script (option 2, used as delivered). Swap the # to choose.
+#   Year-over-year values start in April 2020 (a year after the first quarter here).
+# Output: canada_population_headlines.html (one self-contained file), with
+#   buttons to download the chart (JPEG), all references (CSV) and all data (CSV).
+# Packages: plotly, htmlwidgets, htmltools, dplyr (tibble). Self-contained
+# output needs pandoc, which ships with RStudio. Run in a UTF-8 session.
+
+library(dplyr)
+library(plotly)
+library(htmlwidgets)
+library(htmltools)
+
+# ---- Settings -------------------------------------------------------------------------
+out_file <- "canada_population_headlines.html"   # written to R's working directory (getwd())
+
+# ---- Population: Statistics Canada, Table 17-10-0009-01 (released Sep 23, 2026) -------
+# Quarterly estimates: one row per region (geo code) and quarter.
+# Choose ONE of the two options (put # in front of the other):
+# Option 1: import the data from a CSV file (columns: geo, date, population)
+# pop <- read.csv("population_data.csv", stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+# Option 2: the data written out in this script
+pop <- structure(list(geo = c("CA", "CA", "CA", "CA", "CA", "CA", "CA", 
+"CA", "CA", "CA", "CA", "CA", "CA", "CA", "CA", "CA", "CA", "CA", 
+"CA", "CA", "CA", "CA", "CA", "CA", "CA", "CA", "CA", "CA", "CA", 
+"CA", "NL", "NL", "NL", "NL", "NL", "NL", "NL", "NL", "NL", "NL", 
+"NL", "NL", "NL", "NL", "NL", "NL", "NL", "NL", "NL", "NL", "NL", 
+"NL", "NL", "NL", "NL", "NL", "NL", "NL", "NL", "NL", "PE", "PE", 
+"PE", "PE", "PE", "PE", "PE", "PE", "PE", "PE", "PE", "PE", "PE", 
+"PE", "PE", "PE", "PE", "PE", "PE", "PE", "PE", "PE", "PE", "PE", 
+"PE", "PE", "PE", "PE", "PE", "PE", "NS", "NS", "NS", "NS", "NS", 
+"NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", 
+"NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", "NS", 
+"NS", "NS", "NS", "NB", "NB", "NB", "NB", "NB", "NB", "NB", "NB", 
+"NB", "NB", "NB", "NB", "NB", "NB", "NB", "NB", "NB", "NB", "NB", 
+"NB", "NB", "NB", "NB", "NB", "NB", "NB", "NB", "NB", "NB", "NB", 
+"QC", "QC", "QC", "QC", "QC", "QC", "QC", "QC", "QC", "QC", "QC", 
+"QC", "QC", "QC", "QC", "QC", "QC", "QC", "QC", "QC", "QC", "QC", 
+"QC", "QC", "QC", "QC", "QC", "QC", "QC", "QC", "ON", "ON", "ON", 
+"ON", "ON", "ON", "ON", "ON", "ON", "ON", "ON", "ON", "ON", "ON", 
+"ON", "ON", "ON", "ON", "ON", "ON", "ON", "ON", "ON", "ON", "ON", 
+"ON", "ON", "ON", "ON", "ON", "MB", "MB", "MB", "MB", "MB", "MB", 
+"MB", "MB", "MB", "MB", "MB", "MB", "MB", "MB", "MB", "MB", "MB", 
+"MB", "MB", "MB", "MB", "MB", "MB", "MB", "MB", "MB", "MB", "MB", 
+"MB", "MB", "SK", "SK", "SK", "SK", "SK", "SK", "SK", "SK", "SK", 
+"SK", "SK", "SK", "SK", "SK", "SK", "SK", "SK", "SK", "SK", "SK", 
+"SK", "SK", "SK", "SK", "SK", "SK", "SK", "SK", "SK", "SK", "AB", 
+"AB", "AB", "AB", "AB", "AB", "AB", "AB", "AB", "AB", "AB", "AB", 
+"AB", "AB", "AB", "AB", "AB", "AB", "AB", "AB", "AB", "AB", "AB", 
+"AB", "AB", "AB", "AB", "AB", "AB", "AB", "BC", "BC", "BC", "BC", 
+"BC", "BC", "BC", "BC", "BC", "BC", "BC", "BC", "BC", "BC", "BC", 
+"BC", "BC", "BC", "BC", "BC", "BC", "BC", "BC", "BC", "BC", "BC", 
+"BC", "BC", "BC", "BC", "YT", "YT", "YT", "YT", "YT", "YT", "YT", 
+"YT", "YT", "YT", "YT", "YT", "YT", "YT", "YT", "YT", "YT", "YT", 
+"YT", "YT", "YT", "YT", "YT", "YT", "YT", "YT", "YT", "YT", "YT", 
+"YT", "NT", "NT", "NT", "NT", "NT", "NT", "NT", "NT", "NT", "NT", 
+"NT", "NT", "NT", "NT", "NT", "NT", "NT", "NT", "NT", "NT", "NT", 
+"NT", "NT", "NT", "NT", "NT", "NT", "NT", "NT", "NT", "NU", "NU", 
+"NU", "NU", "NU", "NU", "NU", "NU", "NU", "NU", "NU", "NU", "NU", 
+"NU", "NU", "NU", "NU", "NU", "NU", "NU", "NU", "NU", "NU", "NU", 
+"NU", "NU", "NU", "NU", "NU", "NU"), date = c("2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01", "2019-04-01", "2019-07-01", 
+"2019-10-01", "2020-01-01", "2020-04-01", "2020-07-01", "2020-10-01", 
+"2021-01-01", "2021-04-01", "2021-07-01", "2021-10-01", "2022-01-01", 
+"2022-04-01", "2022-07-01", "2022-10-01", "2023-01-01", "2023-04-01", 
+"2023-07-01", "2023-10-01", "2024-01-01", "2024-04-01", "2024-07-01", 
+"2024-10-01", "2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01", 
+"2026-01-01", "2026-04-01", "2026-07-01"), population = c(37437243L, 
+37618495L, 37828162L, 37928208L, 38006941L, 38028638L, 38027406L, 
+38058291L, 38140918L, 38239864L, 38462457L, 38559788L, 38678014L, 
+38945628L, 39278574L, 39477134L, 39684191L, 40022704L, 40439108L, 
+40670178L, 40912561L, 41162593L, 41373096L, 41435888L, 41495432L, 
+41608982L, 41723923L, 41716698L, 41718064L, 41798407L, 527993L, 
+527643L, 528442L, 528231L, 527733L, 526884L, 526046L, 525895L, 
+526195L, 527056L, 528356L, 528888L, 528919L, 531061L, 533006L, 
+534474L, 535814L, 538041L, 540408L, 541114L, 542705L, 545080L, 
+546785L, 547237L, 548205L, 550202L, 551526L, 551564L, 550881L, 
+552462L, 154409L, 155792L, 157025L, 157494L, 158401L, 159193L, 
+159179L, 159240L, 160334L, 162133L, 163690L, 164203L, 165481L, 
+167147L, 168882L, 169731L, 171399L, 173270L, 175675L, 176134L, 
+177269L, 178869L, 179997L, 179816L, 180457L, 181594L, 182588L, 
+182576L, 182700L, 182989L, 970680L, 975799L, 982592L, 984130L, 
+986204L, 989168L, 989154L, 990025L, 993946L, 999908L, 1006740L, 
+1009517L, 1013284L, 1024306L, 1033481L, 1036706L, 1042847L, 1052601L, 
+1062411L, 1066827L, 1072232L, 1080310L, 1086377L, 1087432L, 1090485L, 
+1095157L, 1098342L, 1098558L, 1099399L, 1103419L, 774277L, 777387L, 
+780907L, 781054L, 782512L, 783432L, 783814L, 784950L, 787002L, 
+790802L, 795754L, 798399L, 801175L, 808587L, 816074L, 818845L, 
+823226L, 829937L, 839183L, 843651L, 849819L, 857114L, 863674L, 
+866560L, 869777L, 874711L, 877969L, 878596L, 878549L, 883522L, 
+8447632L, 8483186L, 8521542L, 8537376L, 8550900L, 8551095L, 8551865L, 
+8550561L, 8556015L, 8572020L, 8605817L, 8611897L, 8625141L, 8667648L, 
+8719641L, 8741980L, 8768409L, 8818050L, 8881058L, 8904100L, 8937098L, 
+8982312L, 9026416L, 9029220L, 9028682L, 9051022L, 9071310L, 9057967L, 
+9053814L, 9067114L, 14493612L, 14573565L, 14666727L, 14718155L, 
+14752374L, 14761811L, 14757582L, 14772726L, 14808093L, 14842488L, 
+14947557L, 14996160L, 15046020L, 15155192L, 15301418L, 15394843L, 
+15472222L, 15618269L, 15806578L, 15916758L, 16003875L, 16090358L, 
+16154989L, 16173041L, 16189877L, 16216961L, 16253023L, 16249344L, 
+16244194L, 16262121L, 1364666L, 1370033L, 1373884L, 1377283L, 
+1379280L, 1380132L, 1381809L, 1383854L, 1388611L, 1391924L, 1396406L, 
+1399737L, 1404046L, 1413346L, 1423845L, 1431771L, 1441680L, 1452054L, 
+1460624L, 1468946L, 1479792L, 1487953L, 1495180L, 1499649L, 1503773L, 
+1508582L, 1512567L, 1514362L, 1514157L, 1517379L, 1161787L, 1164223L, 
+1167271L, 1169426L, 1169038L, 1167386L, 1165963L, 1166348L, 1167711L, 
+1167711L, 1168966L, 1171110L, 1173416L, 1178761L, 1188150L, 1195268L, 
+1200708L, 1209273L, 1220864L, 1228473L, 1236277L, 1245196L, 1253962L, 
+1258722L, 1263752L, 1266289L, 1269970L, 1271629L, 1272936L, 1278402L, 
+4337569L, 4355377L, 4376860L, 4392958L, 4405455L, 4407495L, 4412013L, 
+4418338L, 4425617L, 4431531L, 4451077L, 4465845L, 4481521L, 4513589L, 
+4560790L, 4596048L, 4639471L, 4688032L, 4750739L, 4797611L, 4852191L, 
+4901795L, 4945710L, 4973853L, 4996457L, 5024631L, 5052333L, 5067862L, 
+5079176L, 5101050L, 5080515L, 5111022L, 5148047L, 5157053L, 5169535L, 
+5176101L, 5173896L, 5180015L, 5200393L, 5226665L, 5270096L, 5285835L, 
+5310232L, 5356870L, 5403857L, 5427786L, 5458417L, 5512217L, 5569929L, 
+5594479L, 5628073L, 5659205L, 5684774L, 5684439L, 5687504L, 5702544L, 
+5716602L, 5706331L, 5703683L, 5710598L, 40779L, 41187L, 41460L, 
+41505L, 41807L, 41958L, 42109L, 42157L, 42443L, 42961L, 43155L, 
+43086L, 43430L, 43891L, 44208L, 44482L, 44823L, 45410L, 45938L, 
+46296L, 47010L, 47683L, 48089L, 48425L, 48584L, 49150L, 49422L, 
+49546L, 49862L, 50356L, 44560L, 44442L, 44512L, 44533L, 44565L, 
+44504L, 44395L, 44432L, 44679L, 44579L, 44587L, 44754L, 44764L, 
+44626L, 44541L, 44391L, 44379L, 44611L, 44588L, 44707L, 45050L, 
+45274L, 45526L, 45700L, 45892L, 46031L, 46038L, 46046L, 46071L, 
+45904L, 38764L, 38839L, 38893L, 39010L, 39137L, 39479L, 39581L, 
+39750L, 39879L, 40086L, 40256L, 40357L, 40585L, 40604L, 40681L, 
+40809L, 40796L, 40939L, 41113L, 41082L, 41170L, 41444L, 41617L, 
+41794L, 41987L, 42108L, 42233L, 42317L, 42642L, 43091L)), class = "data.frame", row.names = c(NA, 
+-420L))
+pop$date <- as.Date(pop$date)
+release_date <- as.Date("2026-09-23")
+codes <- c("Canada" = "CA", "Newfoundland and Labrador" = "NL", "Prince Edward Island" = "PE",
+           "Nova Scotia" = "NS", "New Brunswick" = "NB", "Quebec" = "QC", "Ontario" = "ON",
+           "Manitoba" = "MB", "Saskatchewan" = "SK", "Alberta" = "AB", "British Columbia" = "BC",
+           "Yukon" = "YT", "Northwest Territories" = "NT", "Nunavut" = "NU")
+
+# ---- News stories ---------------------------------------------------------------------
+# CBC News (national and regional desks), provincial and territorial governments and
+# statistics bureaus, Statistics Canada and IRCC: items that report population figures,
+# projections or plans. Columns:
+#   geo: CA = Canada, two-letter province/territory code, ALL = shown for every region
+#   source: CBC News / Provincial government / Statistics Canada / IRCC
+#   type: Actual / Preliminary / Revision / Projection / Plan
+#   date: publication date; exact: TRUE when the day is known, otherwise placed to the month
+# Choose ONE of the two options (put # in front of the other):
+# Option 1: import the data from a CSV file (columns: geo, source, type, date, exact, headline, url)
+# stories <- read.csv("news_articles.csv", stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+# Option 2: the data written out in this script
+stories <- structure(list(geo = c("ALL", "NB", "NL", "ALL", "NB", "NS", 
+"PE", "SK", "AB", "NS", "BC", "ALL", "ALL", "ALL", "SK", "YT", 
+"ALL", "ALL", "PE", "YT", "ALL", "PE", "ALL", "PE", "SK", "ALL", 
+"NB", "NU", "QC", "ALL", "MB", "NB", "NS", "NS", "ALL", "CA", 
+"NL", "NT", "NU", "SK", "YT", "NB", "ALL", "ALL", "NB", "BC", 
+"ALL", "SK", "NL", "AB", "ALL", "SK", "SK", "NL", "PE", "ALL", 
+"QC", "ALL", "MB", "NB", "NT", "PE", "SK", "SK", "ALL", "ALL", 
+"YT", "ALL", "CA", "NT", "NT", "ON", "ALL", "CA", "ALL", "CA", 
+"MB", "NS", "PE", "SK", "PE", "CA", "MB", "AB", "ALL", "CA", 
+"MB", "NB", "PE", "SK", "NL", "ALL", "NS", "ALL", "BC", "CA", 
+"MB", "NS", "PE", "YT", "YT", "ALL", "BC", "ALL", "AB", "ALL", 
+"BC", "CA", "MB", "NT", "QC", "QC", "NS", "ON", "YT", "ALL", 
+"MB", "NS", "NT", "PE", "SK", "BC", "NU", "YT", "AB", "ALL", 
+"BC", "CA", "NS", "SK", "QC", "ALL", "CA", "AB", "AB", "ALL", 
+"MB", "NB", "NL", "NS", "NT", "PE", "SK", "YT", "ALL", "MB", 
+"QC", "ALL", "AB", "ALL", "MB", "NL", "NT", "NU", "AB", "QC", 
+"QC", "AB", "ALL", "CA", "MB", "MB", "NS", "NT", "NB", "QC", 
+"QC", "BC", "AB", "AB", "ALL", "CA", "MB", "MB", "NS", "NU", 
+"SK", "ALL", "BC", "AB", "AB", "ALL", "CA", "MB", "NB", "NS", 
+"ON", "QC", "YT", "MB", "ON", "ALL", "CA", "YT", "ALL", "CA", 
+"MB", "NU", "ON", "PE", "ON", "QC", "AB", "ALL", "CA", "NS", 
+"ON", "PE", "ON", "QC", "QC", "NL", "AB", "ALL", "CA", "NB", 
+"ON"), source = c("Statistics Canada", "CBC News", "CBC News", 
+"Statistics Canada", "CBC News", "Provincial government", "CBC News", 
+"CBC News", "CBC News", "Provincial government", "Provincial government", 
+"Statistics Canada", "Statistics Canada", "Statistics Canada", 
+"CBC News", "Provincial government", "IRCC", "Statistics Canada", 
+"CBC News", "CBC News", "Statistics Canada", "CBC News", "Statistics Canada", 
+"CBC News", "CBC News", "Statistics Canada", "CBC News", "Provincial government", 
+"Provincial government", "Statistics Canada", "CBC News", "CBC News", 
+"CBC News", "Provincial government", "IRCC", "CBC News", "CBC News", 
+"CBC News", "CBC News", "CBC News", "CBC News", "CBC News", "IRCC", 
+"Statistics Canada", "CBC News", "Provincial government", "Statistics Canada", 
+"CBC News", "Provincial government", "Provincial government", 
+"Statistics Canada", "CBC News", "Provincial government", "Provincial government", 
+"CBC News", "IRCC", "Provincial government", "Statistics Canada", 
+"Provincial government", "CBC News", "Provincial government", 
+"CBC News", "CBC News", "Provincial government", "IRCC", "Statistics Canada", 
+"Provincial government", "Statistics Canada", "CBC News", "CBC News", 
+"Provincial government", "CBC News", "Statistics Canada", "CBC News", 
+"Statistics Canada", "CBC News", "Provincial government", "CBC News", 
+"CBC News", "Provincial government", "CBC News", "CBC News", 
+"CBC News", "CBC News", "Statistics Canada", "CBC News", "Provincial government", 
+"CBC News", "CBC News", "Provincial government", "Provincial government", 
+"IRCC", "CBC News", "Statistics Canada", "CBC News", "CBC News", 
+"Provincial government", "CBC News", "CBC News", "CBC News", 
+"Provincial government", "IRCC", "Provincial government", "IRCC", 
+"CBC News", "Statistics Canada", "CBC News", "CBC News", "Provincial government", 
+"Provincial government", "Provincial government", "CBC News", 
+"CBC News", "Provincial government", "Provincial government", 
+"Statistics Canada", "Provincial government", "Provincial government", 
+"Provincial government", "CBC News", "Provincial government", 
+"Provincial government", "Provincial government", "Provincial government", 
+"Provincial government", "Statistics Canada", "CBC News", "CBC News", 
+"Provincial government", "CBC News", "Provincial government", 
+"IRCC", "CBC News", "CBC News", "Provincial government", "Statistics Canada", 
+"Provincial government", "CBC News", "CBC News", "CBC News", 
+"Provincial government", "CBC News", "Provincial government", 
+"Provincial government", "Statistics Canada", "Provincial government", 
+"Provincial government", "Statistics Canada", "Provincial government", 
+"Statistics Canada", "Provincial government", "CBC News", "Provincial government", 
+"Provincial government", "Provincial government", "Provincial government", 
+"CBC News", "CBC News", "Statistics Canada", "CBC News", "CBC News", 
+"Provincial government", "Provincial government", "Provincial government", 
+"Provincial government", "CBC News", "Provincial government", 
+"CBC News", "CBC News", "Provincial government", "Statistics Canada", 
+"CBC News", "CBC News", "Provincial government", "Provincial government", 
+"Provincial government", "Provincial government", "IRCC", "Provincial government", 
+"CBC News", "Provincial government", "Statistics Canada", "CBC News", 
+"Provincial government", "CBC News", "CBC News", "Provincial government", 
+"Provincial government", "Provincial government", "Provincial government", 
+"CBC News", "Statistics Canada", "CBC News", "Provincial government", 
+"Statistics Canada", "CBC News", "Provincial government", "CBC News", 
+"Provincial government", "CBC News", "CBC News", "Provincial government", 
+"CBC News", "Statistics Canada", "CBC News", "Provincial government", 
+"Provincial government", "Provincial government", "Provincial government", 
+"CBC News", "Provincial government", "CBC News", "CBC News", 
+"Statistics Canada", "CBC News", "CBC News", "Provincial government"
+), type = c("Actual", "Actual", "Projection", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Plan", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Plan", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Projection", "Plan", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Projection", 
+"Revision", "Projection", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Plan", "Projection", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Plan", "Actual", "Plan", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Projection", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Projection", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Projection", "Plan", "Projection", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Projection", "Actual", "Actual", "Actual", "Preliminary", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Actual", "Actual", 
+"Actual", "Actual", "Actual", "Actual", "Actual", "Projection", 
+"Projection", "Projection", "Actual", "Actual", "Actual", "Actual", 
+"Revision", "Actual", "Actual", "Actual", "Actual", "Plan", "Projection", 
+"Actual", "Actual", "Preliminary", "Preliminary", "Actual", "Preliminary", 
+"Preliminary", "Preliminary", "Actual", "Actual", "Actual", "Projection", 
+"Projection", "Projection", "Actual", "Preliminary", "Preliminary", 
+"Actual", "Actual", "Preliminary", "Preliminary", "Projection", 
+"Actual", "Actual", "Preliminary", "Preliminary", "Actual", "Preliminary", 
+"Actual", "Projection", "Projection", "Projection", "Plan", "Revision", 
+"Revision", "Revision", "Revision", "Actual"), date = c("2019-06-19", 
+"2019-06-19", "2019-09-16", "2019-09-30", "2019-09-30", "2019-09-30", 
+"2019-09-30", "2019-09-30", "2019-12-19", "2019-12-19", "2019-12-24", 
+"2020-03-19", "2020-06-18", "2020-09-29", "2020-09-29", "2020-09-30", 
+"2020-10-30", "2020-12-17", "2020-12-17", "2021-01-30", "2021-03-18", 
+"2021-05-13", "2021-06-17", "2021-06-17", "2021-06-17", "2021-09-29", 
+"2021-09-29", "2021-09-29", "2021-12-08", "2021-12-16", "2021-12-16", 
+"2021-12-16", "2021-12-16", "2021-12-16", "2021-12-23", "2022-02-09", 
+"2022-02-09", "2022-02-09", "2022-02-09", "2022-02-09", "2022-02-09", 
+"2022-02-10", "2022-02-14", "2022-03-17", "2022-03-17", "2022-04-06", 
+"2022-06-22", "2022-06-22", "2022-06-24", "2022-09-28", "2022-09-28", 
+"2022-09-28", "2022-09-28", "2022-10-06", "2022-10-29", "2022-11-01", 
+"2022-12-15", "2022-12-21", "2022-12-21", "2022-12-21", "2022-12-21", 
+"2022-12-21", "2022-12-21", "2022-12-21", "2023-01-03", "2023-01-11", 
+"2023-01-15", "2023-03-22", "2023-03-22", "2023-03-22", "2023-03-22", 
+"2023-03-22", "2023-06-15", "2023-06-16", "2023-06-28", "2023-06-28", 
+"2023-06-28", "2023-06-28", "2023-06-28", "2023-06-28", "2023-08-19", 
+"2023-08-31", "2023-09-13", "2023-09-27", "2023-09-27", "2023-09-27", 
+"2023-09-27", "2023-09-27", "2023-09-27", "2023-09-27", "2023-10-25", 
+"2023-11-01", "2023-11-09", "2023-12-19", "2023-12-19", "2023-12-19", 
+"2023-12-19", "2023-12-19", "2023-12-19", "2023-12-19", "2024-01-15", 
+"2024-01-22", "2024-01-30", "2024-03-21", "2024-03-27", "2024-03-27", 
+"2024-03-27", "2024-03-27", "2024-03-27", "2024-03-27", "2024-03-27", 
+"2024-05-22", "2024-05-25", "2024-05-31", "2024-06-15", "2024-06-19", 
+"2024-06-19", "2024-06-19", "2024-06-19", "2024-06-19", "2024-06-19", 
+"2024-08-15", "2024-09-15", "2024-09-15", "2024-09-25", "2024-09-25", 
+"2024-09-25", "2024-09-25", "2024-09-25", "2024-09-25", "2024-10-07", 
+"2024-10-24", "2024-10-24", "2024-12-17", "2024-12-17", "2024-12-17", 
+"2024-12-17", "2024-12-17", "2024-12-17", "2024-12-17", "2024-12-17", 
+"2024-12-17", "2024-12-18", "2025-01-15", "2025-01-16", "2025-01-16", 
+"2025-01-16", "2025-01-21", "2025-03-19", "2025-03-19", "2025-03-19", 
+"2025-03-19", "2025-03-19", "2025-03-19", "2025-03-31", "2025-05-08", 
+"2025-05-09", "2025-06-18", "2025-06-18", "2025-06-18", "2025-06-18", 
+"2025-06-18", "2025-06-18", "2025-06-18", "2025-07-02", "2025-07-30", 
+"2025-07-30", "2025-09-10", "2025-09-24", "2025-09-24", "2025-09-24", 
+"2025-09-24", "2025-09-24", "2025-09-24", "2025-09-24", "2025-09-24", 
+"2025-09-24", "2025-11-04", "2025-12-15", "2025-12-17", "2025-12-17", 
+"2025-12-17", "2025-12-17", "2025-12-17", "2025-12-17", "2025-12-17", 
+"2025-12-17", "2026-01-14", "2026-01-15", "2026-01-26", "2026-02-17", 
+"2026-02-18", "2026-02-26", "2026-03-15", "2026-03-18", "2026-03-18", 
+"2026-03-18", "2026-03-18", "2026-03-18", "2026-04-09", "2026-05-08", 
+"2026-05-13", "2026-06-17", "2026-06-17", "2026-06-17", "2026-06-17", 
+"2026-06-17", "2026-06-17", "2026-06-26", "2026-07-09", "2026-07-09", 
+"2026-09-20", "2026-09-23", "2026-09-23", "2026-09-23", "2026-09-23", 
+"2026-09-23"), exact = c(TRUE, FALSE, FALSE, TRUE, FALSE, TRUE, 
+FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE, 
+TRUE, TRUE, TRUE, FALSE, TRUE, FALSE, TRUE, TRUE, FALSE, TRUE, 
+FALSE, TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, 
+TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, TRUE, TRUE, FALSE, TRUE, 
+TRUE, FALSE, TRUE, FALSE, TRUE, FALSE, TRUE, TRUE, FALSE, TRUE, 
+TRUE, TRUE, TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, 
+FALSE, TRUE, TRUE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, 
+TRUE, FALSE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, 
+TRUE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE, TRUE, FALSE, TRUE, 
+TRUE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE, TRUE, 
+FALSE, TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, TRUE, FALSE, TRUE, 
+TRUE, FALSE, FALSE, FALSE, TRUE, FALSE, FALSE, FALSE, FALSE, 
+TRUE, FALSE, TRUE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE, FALSE, 
+TRUE, TRUE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE, TRUE, 
+TRUE, TRUE, TRUE, FALSE, TRUE, TRUE, FALSE, FALSE, FALSE, FALSE, 
+TRUE, FALSE, FALSE, TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, TRUE, 
+FALSE, TRUE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE, TRUE, FALSE, 
+FALSE, TRUE, TRUE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE, 
+FALSE, TRUE, TRUE, FALSE, TRUE, FALSE, TRUE, TRUE, FALSE, TRUE, 
+TRUE, TRUE, FALSE, TRUE, FALSE, FALSE, TRUE, FALSE, TRUE, TRUE, 
+FALSE, TRUE, TRUE, FALSE, FALSE, TRUE, FALSE, FALSE, TRUE, TRUE, 
+FALSE, TRUE), headline = c("The Daily: Canada's population estimates, first quarter 2019", 
+"New Brunswick population is growing, but more slowly than rest of Canada", 
+"The rest of Canada is booming. Why is N.L.'s population falling behind?", 
+"The Daily: Canada's population estimates, second quarter 2019", 
+"Immigration boosts New Brunswick population to record level", 
+"Nova Scotia's Population Reaches All-time High", "P.E.I. leads provinces in population growth for 2nd year", 
+"Saskatchewan is growing, but more slowly than most provinces", 
+"After years of slumps, interprovincial migration to Alberta jumps", 
+"Record Immigration Drives an All-time Population High", "BC Stats: Quarterly Population Highlights, third quarter 2019", 
+"The Daily: Canada's population estimates, fourth quarter 2019", 
+"The Daily: Canada's population estimates, first quarter 2020", 
+"The Daily: Canada's population estimates, second quarter 2020", 
+"StatsCan estimates show 1st population decline in Sask. in 14 years", 
+"Yukon Bureau of Statistics: Population Report, Q2 2020", "IRCC: Government of Canada announces plan to support economic recovery through immigration", 
+"The Daily: Canada's population estimates, third quarter 2020", 
+"P.E.I. ekes out a little population growth in July-September period", 
+"Yukon's population up 21% from a decade ago, and still growing steadily", 
+"The Daily: Canada's population estimates, fourth quarter 2020", 
+"How the pandemic has affected P.E.I.'s population growth", "The Daily: Canada's population estimates, first quarter 2021", 
+"P.E.I. population passes 160,000", "Saskatchewan's population increased in the first quarter of this year: StatsCan", 
+"The Daily: Canada's population estimates, second quarter 2021", 
+"Canadians chasing an East Coast lifestyle fuel population jump in New Brunswick", 
+"Nunavut Bureau of Statistics: Nunavut and Canada Population Estimates, second quarter 2021", 
+"Institut de la statistique du Qu\u00e9bec: Qu\u00e9bec population: growth slowed down significantly in 2020, but began to recover in 2021", 
+"The Daily: Canada's population estimates, third quarter 2021", 
+"Manitoba's population grew by 2,658 people in third quarter of 2021", 
+"Once shrinking Maritimes led Canada in population growth this summer", 
+"Young people flocking to Nova Scotia as population reaches 1 million milestone", 
+"Nova Scotia Reaches One Million Population Milestone", "IRCC: Canada welcomes the most immigrants in a single year in its history", 
+"Despite pandemic, Canada's population grows at fastest rate in G7: census", 
+"N.L. the only province to see population drop since 2016, says new census", 
+"Census 2021: A snapshot of the North's population and dwelling data", 
+"Census 2021: A snapshot of the North's population and dwelling data", 
+"Sask. ranks 9th out of 10 provinces in population growth over last 5 years: StatsCan", 
+"How Yukon's booming economy and rapid population growth has led to a housing crisis", 
+"Maritimes' population growth outpaces Prairies for first time since 1940s", 
+"IRCC: New immigration plan to fill labour market shortages and grow Canada's economy (2022\u20132024 levels plan)", 
+"The Daily: Canada's population estimates, fourth quarter 2021", 
+"New Brunswick's population tops 800,000", "B.C. welcomes more than 100,000 people, the most in 60 years", 
+"The Daily: Canada's population estimates, first quarter 2022", 
+"Sask. population growing slowest among all provinces, StatsCan says", 
+"Newfoundland and Labrador Population Grows for Fifth Consecutive Quarter", 
+"Alberta Treasury Board and Finance: Annual Population Report 2021-22", 
+"The Daily: Canada's population estimates, second quarter 2022", 
+"Sask. inches closer to 1.2 million people after its largest ever 3-month population jump", 
+"Largest Quarterly Population Increase Ever Recorded in Saskatchewan", 
+"Newfoundland and Labrador Quarterly Population Sees Largest Gain Since 1971", 
+"Why it's so important to project P.E.I.'s future population \u2014 and so hard", 
+"IRCC: An immigration plan to grow the economy (2023\u20132025 levels plan)", 
+"Institut de la statistique du Qu\u00e9bec: After a sharp slowdown at the beginning of the pandemic, Qu\u00e9bec's population growth rebounded in 2021, and even more so in 2022", 
+"The Daily: Canada's population estimates, third quarter 2022", 
+"Manitoba Bureau of Statistics: Quarterly Population Statistics Report, October 2022", 
+"N.B. sees record population growth, adding 25,000 people in past year", 
+"NWT Bureau of Statistics: population estimates, October 1, 2022", 
+"P.E.I. about 4,000 Islanders ahead of schedule, new population estimates show", 
+"Saskatchewan population surpasses 1.2-million milestone", "Record Population Growth as Saskatchewan Surges Past 1.2 Million People", 
+"IRCC: Canada welcomes historic number of newcomers in 2022", 
+"The Daily: Canada's population estimates: subprovincial areas, July 1, 2022", 
+"Yukon Bureau of Statistics: Population Report, Q3 2022", "The Daily: Canada's population estimates, fourth quarter 2022", 
+"Canada's population grew by record 1 million in 2022, spurred by international migration", 
+"N.W.T. only Canadian jurisdiction to shrink last year, as people move to elsewhere in Canada", 
+"NWT Bureau of Statistics: population estimates, January 1, 2023", 
+"Ontario's young adults are leaving the province in droves. The soaring cost of living is to blame", 
+"Statistics Canada news release: Canada's population reaches 40 million", 
+"Canada's population surpasses 40 million", "The Daily: Canada's population estimates, first quarter 2023", 
+"Canada welcomes largest number of immigrants in first quarter since at least 1972", 
+"Manitoba Bureau of Statistics: Demographic Estimates Quarterly, April 2023", 
+"Nova Scotia's population is suddenly booming. Can the province handle it?", 
+"Housing starts down as P.E.I. population growth speeds up", 
+"Saskatchewan Continues to Enjoy Largest Population Growth in More Than a Century", 
+"P.E.I. population crossed 180K mark, Statistics Canada projects", 
+"StatsCan to change how it counts non-permanent residents", "Dream about them and they will come: Drilling into Heather Stefanson's target of 2 million Manitobans by 2030", 
+"Canadians flock to Alberta in record numbers as population booms by 184,400 people", 
+"The Daily: Canada's population estimates, second quarter 2023", 
+"Migrants are driving a population surge \u2014 and Alberta is the fastest-growing province: StatsCan", 
+"Manitoba Bureau of Statistics: annual population estimates, July 1, 2023", 
+"New Brunswick smashes population growth record set last year", 
+"P.E.I. breaks several records en route to 'phenomenally rapid population growth'", 
+"Saskatchewan Keeps Growing at Fastest Pace in More Than a Century", 
+"Minister Byrne Highlights Growing Population and Diversity Throughout Newfoundland and Labrador", 
+"IRCC: Stabilizing Canada's immigration targets to support sustainable growth", 
+"Halifax expected to hit half a million residents this year", 
+"The Daily: Canada's population estimates, third quarter 2023", 
+"New data shows record stretch of people leaving B.C. for other provinces \u2014 and many are headed to Alberta", 
+"Statistics Canada reports record population growth, more than 430,000 in Q3", 
+"Manitoba Bureau of Statistics: Quarterly Population Statistics Report, October 2023", 
+"New N.S. population data shows end to years-long interprovincial migration trend", 
+"P.E.I. population growth remains strong as thousands come and go", 
+"Yukon gains about 1,000 residents, ends 2023 as Canada's most-populated territory", 
+"Yukon Bureau of Statistics: Population Report, Q3 2023", "IRCC: Canada to stabilize growth and decrease new international student permits to approximately 360,000 for 2024", 
+"BC Stats report confirms growing population", "IRCC: Minister Miller's announcement on temporary residents (target of 5% of population)", 
+"Alberta's population surged by record-setting 202,000 people. Here's where they all came from", 
+"The Daily: Canada's population estimates, fourth quarter 2023", 
+"Almost 70,000 people left B.C. for other provinces last year. Most of them went to Alberta", 
+"Statistics Canada says population growth rate in 2023 was highest since 1957", 
+"Manitoba Bureau of Statistics: Demographic Estimates Quarterly, January 2024", 
+"NWT Bureau of Statistics: population estimates, January 1, 2024", 
+"Institut de la statistique du Qu\u00e9bec: Qu\u00e9bec had a record-high net migration gain of 217,600 people in 2023", 
+"Immigration fuels population growth across Quebec, statistics institute says", 
+"CBRM growing faster than rest of N.S., getting younger in 'extraordinary' change", 
+"Ontario's Long-Term Report on the Economy 2024: demographic trends and projections", 
+"Yukon Bureau of Statistics: Population Report, Q1 2024", "The Daily: Canada's population estimates, first quarter 2024", 
+"Manitoba Bureau of Statistics: Demographic Estimates Quarterly, April 2024", 
+"Nova Scotia quarterly population estimates as of April 1, 2024", 
+"NWT Bureau of Statistics: population estimates, April 1, 2024", 
+"P.E.I. population growth slowing, although immigration staying strong", 
+"Saskatchewan's Population Hits Another All-Time High", "BC Stats: B.C. population estimates and outlook for 2046", 
+"Nunavut Bureau of Statistics: Population Estimates, July 1, 2023", 
+"Yukon Bureau of Statistics: Population Report, Q2 2024", "Alberta Treasury Board and Finance: Annual Population Report 2023-24", 
+"The Daily: Canada's population estimates, second quarter 2024", 
+"Did a record number of people leave B.C. last year, as John Rustad claims?", 
+"Population growth slows for first time since pandemic as federal government clamps down", 
+"Nova Scotia quarterly population estimates as of July 1, 2024", 
+"As immigration numbers decline in Sask., experts express concern", 
+"Institut de la statistique du Qu\u00e9bec: New demographic trends are boosting growth prospects in multiple Qu\u00e9bec regions", 
+"IRCC: Government of Canada reduces immigration (2025\u20132027 levels plan)", 
+"New immigration plan aims to stabilize population growth, housing market: minister", 
+"Alberta's population boom is slowing but still outpacing the rest of Canada", 
+"Alberta Quarterly Population Report, third quarter 2024", "The Daily: Canada's population estimates, third quarter 2024", 
+"Manitoba Bureau of Statistics: Demographic Estimates Quarterly, October 2024", 
+"N.B. loses most pandemic-population gain from other provinces, immigration continues to rise", 
+"Newcomers drive N.L. population growth, as other demographic data trends downward", 
+"Population growth in N.S. now mainly driven by international migration", 
+"NWT Bureau of Statistics: population estimates, October 1, 2024", 
+"Immigration continues to fuel P.E.I.'s population growth while natural increase declines, says StatsCan", 
+"Saskatchewan's Quarterly Population Growth Among the Highest in Canada", 
+"Yukon Bureau of Statistics: Population Report, Q3 2024", "The Daily: Canada's population estimates: subprovincial areas, 2024", 
+"Manitoba Bureau of Statistics: regional population estimates, 2024", 
+"Institut de la statistique du Qu\u00e9bec: Demographic overview of Qu\u00e9bec's regions shows accelerated growth in several regions, mainly because of international migration", 
+"The Daily: Population projections for Canada, provinces and territories, 2024 to 2074", 
+"Alberta Quarterly Population Report, fourth quarter 2024", "The Daily: Canada's population estimates, fourth quarter 2024", 
+"Manitoba Bureau of Statistics: Demographic Estimates Quarterly, January 2025", 
+"Immigration Minister Sarah Stoodley blames N.L. population decline on federal government", 
+"NWT Bureau of Statistics: population estimates, January 1, 2025", 
+"Nunavut Bureau of Statistics: Nunavut and Canada Population Estimates, fourth quarter 2024", 
+"Alberta Economic Spotlight: Population growth supports economic activity", 
+"Institut de la statistique du Qu\u00e9bec: Population report for Qu\u00e9bec in 2024: migration gains remain high, fertility at an all-time low", 
+"Quebec reports high immigration, record low fertility in 2024", 
+"Alberta population nearly hit 5 million in April, as people continue to flock to the province", 
+"The Daily: Canada's population estimates, first quarter 2025", 
+"Canada's population growth at 0.0% so far this year: StatsCan", 
+"Manitoba sees growth from interprovincial migration for 1st time since 2004", 
+"Manitoba Bureau of Statistics: Demographic Estimates Quarterly, April 2025", 
+"Nova Scotia quarterly population estimates as of April 1, 2025", 
+"NWT Bureau of Statistics: population estimates, April 1, 2025", 
+"Economic report reveals growth in population, employment and investment", 
+"Quebec population projected to decrease due in part to immigration policies, fertility rates", 
+"Institut de la statistique du Qu\u00e9bec: Population projections up to 2051 revised downward for Qu\u00e9bec and its regions", 
+"Metro Vancouver lowers population growth forecast due to federal immigration cuts", 
+"Alberta leads country in interprovincial migration for 3rd straight year", 
+"Alberta Treasury Board and Finance: Annual Population Report 2024-25", 
+"The Daily: Canada's population estimates, second quarter 2025", 
+"Canada's population growth almost flat in 2nd quarter as number of non-permanent residents declines", 
+"Not so fast: Manitoba's celebrated positive interprovincial migration numbers were wrong", 
+"Manitoba Bureau of Statistics: annual population estimates, July 1, 2025", 
+"Nova Scotia annual population estimates as of July 1, 2025", 
+"Nunavut Bureau of Statistics: Nunavut and Canada Population Estimates, second quarter 2025", 
+"Saskatchewan Keeps Growing", "IRCC: Supplementary information for the 2026-2028 Immigration Levels Plan", 
+"BC Stats: 2025 Population Estimates and Projections", "Alberta population keeps growing, while Canada's dips in Q3: StatsCan", 
+"Alberta Quarterly Population Report, third quarter 2025", "The Daily: Canada's population estimates, third quarter 2025", 
+"Canada's population fell in third quarter, driven by drop in non-permanent residents: StatsCan", 
+"Manitoba Bureau of Statistics: Demographic Estimates Quarterly, October 2025", 
+"N.B. population sees highest quarterly decline in decades, economist says", 
+"Nova Scotia's population dips for the first time since 2020", 
+"Ontario Demographic Quarterly: highlights of third quarter 2025", 
+"Institut de la statistique du Qu\u00e9bec: Demographic overview of Qu\u00e9bec's regions: population continues to increase almost everywhere, but growth is slowing down", 
+"Yukon Bureau of Statistics: Population Report, Q3 2025", "Manitoba Bureau of Statistics: regional population estimates, 2025", 
+"Ottawa could have 1.7M residents by 2051", "The Daily: Population projections for census divisions and subdivisions", 
+"Zero population growth expected in Canada this year: budget watchdog", 
+"Yukon Bureau of Statistics: Population Report, Q4 2025", "The Daily: Canada's population estimates, fourth quarter 2025", 
+"Canada's population shrank last year \u2014 a first for the country, StatsCan says", 
+"Manitoba Bureau of Statistics: Demographic Estimates Quarterly, January 2026", 
+"Number of non-permanent residents in Nunavut rose 25% over last year", 
+"Ontario Demographic Quarterly: highlights of fourth quarter 2025", 
+"Fewer newcomers are arriving on P.E.I., bringing relief in some areas and challenges in others", 
+"Ontario will lose more than a third of its international students following permit cap, StatsCan estimates", 
+"Institut de la statistique du Qu\u00e9bec: Births, deaths, migration: how did the Qu\u00e9bec population change in 2025?", 
+"Alberta's population is still growing despite Ottawa's immigration crackdown: StatsCan", 
+"The Daily: Canada's population estimates, first quarter 2026", 
+"Canada's population is dropping, but economists say that could be OK", 
+"Nova Scotia quarterly population estimates as of April 1, 2026", 
+"Ontario Demographic Quarterly: highlights of first quarter 2026", 
+"Prince Edward Island Population Report, first quarter 2026", 
+"Ontario Population Projections, 2025-2051", "Quebec's population is shifting \u2014 and not every region will grow the same way", 
+"Institut de la statistique du Qu\u00e9bec: This year's demographic projections: population stabilization scenario maintained for Qu\u00e9bec with continued regional disparities", 
+"How do you grow N.L.'s population? Province wants feedback as fertility rate hits record low", 
+"Alberta's population grew more than rest of Canada last year, data shows", 
+"The Daily: Canada's population estimates, second quarter 2026", 
+"Canada did not see historic population decline last year, StatsCan says after second look", 
+"N.B. population rises as StatsCan revises estimates that showed decline", 
+"Ontario Demographic Quarterly: highlights of second quarter 2026"
+), url = c("https://www150.statcan.gc.ca/n1/daily-quotidien/190619/dq190619c-eng.htm", 
+"https://www.cbc.ca/news/canada/new-brunswick/new-brunswick-population-growth-slow-immigrants-1.5181839", 
+"https://www.cbc.ca/news/canada/newfoundland-labrador/nl-population-projection-1.5289419", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/190930/dq190930f-eng.htm", 
+"https://www.cbc.ca/news/canada/new-brunswick/new-brunswick-population-growth-immigration-1.5305230", 
+"https://novascotia.ca/news/release/?id=20190930008", "https://www.cbc.ca/news/canada/prince-edward-island/pei-population-estimates-2019-1.5302855", 
+"https://www.cbc.ca/news/canada/saskatchewan/population-growth-1.5303142", 
+"https://www.cbc.ca/news/canada/calgary/alberta-interprovincial-migration-increase-2019-1.5402484", 
+"https://novascotia.ca/news/release/?id=20191219007", "https://www2.gov.bc.ca/assets/gov/data/statistics/people-population-community/population/pop_quarterly_highlights2019q3.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/200319/dq200319b-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/200618/dq200618b-eng.htm", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/200929/dq200929d-eng.htm", 
+"https://www.cbc.ca/news/canada/saskatchewan/population-decline-saskatchewan-1.5745496", 
+"https://yukon.ca/sites/default/files/populationq2_2020.pdf", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2020/10/government-of-canada-announces-plan-to-support-economic-recovery-through-immigration.html", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/201217/dq201217b-eng.htm", 
+"https://www.cbc.ca/1.5845223", "https://www.cbc.ca/news/canada/north/yukon-population-increase-2021-1.5898284", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/210318/dq210318c-eng.htm", 
+"https://www.cbc.ca/news/canada/prince-edward-island/pei-population-growth-pandemic-1.6024995", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/210617/dq210617c-eng.htm", 
+"https://www.cbc.ca/news/canada/prince-edward-island/pei-population-april-2021-1.6070895", 
+"https://www.cbc.ca/news/canada/saskatchewan/population-increased-quarter-stats-canada-1.6070174", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/210929/dq210929c-eng.htm", 
+"https://www.cbc.ca/news/canada/new-brunswick/canadians-chasing-east-coast-lifestyle-1.6194247", 
+"https://www.gov.nu.ca/sites/default/files/documents/2022-11/nunavut_and_canada_population_estimates_statsupdate_second_quarter_2021.pdf", 
+"https://statistique.quebec.ca/en/communique/population-du-quebec-important-ralentissement-croissance-2020-mais-reprise-en-2021-en", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/211216/dq211216c-eng.htm", 
+"https://www.cbc.ca/news/canada/manitoba/manitoba-population-increase-1.6298301", 
+"https://www.cbc.ca/news/canada/new-brunswick/once-shrinking-maritimes-leads-canada-growth-1.6300145", 
+"https://www.cbc.ca/news/canada/nova-scotia/population-growth-nova-scotia-one-million-people-1.6292823", 
+"https://news.novascotia.ca/en/2021/12/16/nova-scotia-reaches-one-million-population-milestone", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2021/12/canada-welcomes-the-most-immigrants-in-a-single-year-in-its-history.html", 
+"https://www.cbc.ca/news/politics/census-2021-release-population-cities-1.6344179", 
+"https://www.cbc.ca/news/canada/newfoundland-labrador/2021-census-nl-population-drop-1.6345087", 
+"https://www.cbc.ca/news/canada/north/census-2021-north-population-1.6345016", 
+"https://www.cbc.ca/news/canada/north/census-2021-north-population-1.6345016", 
+"https://www.cbc.ca/news/canada/saskatchewan/census-saskatchewan-estevan-canada-population-1.6345170", 
+"https://www.cbc.ca/news/canada/north/yukon-census-2022-population-growth-housing-crisis-1.6349010", 
+"https://www.cbc.ca/news/canada/new-brunswick/maritime-population-outpaces-prairies-1.6344927", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2022/02/new-immigration-plan-to-fill-labour-market-shortages-and-grow-canadas-economy.html", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/220317/dq220317e-eng.htm", 
+"https://www.cbc.ca/news/canada/new-brunswick/nb-population-growth-1.6398955", 
+"https://news.gov.bc.ca/releases/2022PREM0019-000505", "https://www150.statcan.gc.ca/n1/daily-quotidien/220622/dq220622d-eng.htm", 
+"https://www.cbc.ca/news/canada/saskatchewan/sask-population-1.6497586", 
+"https://www.gov.nl.ca/releases/2022/exec/0624n05/", "https://open.alberta.ca/dataset/1050cf0a-8c1d-4875-9800-b7d2f3199e41/resource/30da727d-90dc-441f-ae08-2ef792b5205c/download/tbf-annual-population-report-alberta-2021-2022.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/220928/dq220928b-eng.htm", 
+"https://www.cbc.ca/news/canada/saskatoon/saskatchewan-sees-an-increase-in-population-1.6599609", 
+"https://www.saskatchewan.ca/government/news-and-media/2022/september/28/largest-quarterly-population-increase-ever-recorded-in-saskatchewan", 
+"https://www.gov.nl.ca/releases/2022/exec/1006n02/", "https://www.cbc.ca/news/canada/prince-edward-island/pei-population-projections-1.6633286", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2022/11/an-immigration-plan-to-grow-the-economy.html", 
+"https://statistique.quebec.ca/en/communique/after-sharp-slowdown-at-beginning-of-pandemic-quebec-population-growth-rebounded-in-2021-and-even-more-so-in-2022", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/221221/dq221221f-eng.htm", 
+"https://www.gov.mb.ca/mbs/publications/mbs304_pop_2022_m10.pdf", 
+"https://www.cbc.ca/news/canada/new-brunswick/new-brunswick-population-increase-1.6696373", 
+"https://www.statsnwt.ca/population/population-estimates/PopEst_Oct2022.pdf", 
+"https://www.cbc.ca/news/canada/prince-edward-island/pei-population-q4-2022-1.6696812", 
+"https://www.cbc.ca/news/canada/saskatchewan/saskatchewan-s-population-surpasses-1-2-million-population-milestone-1.6674516", 
+"https://www.saskatchewan.ca/government/news-and-media/2022/december/21/record-population-growth-as-saskatchewan-surges-past-12-million-people", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2022/12/canada-welcomes-historic-number-of-newcomers-in-2022.html", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/230111/dq230111c-eng.htm", 
+"https://yukon.ca/sites/default/files/ybs/fin-population-report-q3-2022.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/230322/dq230322f-eng.htm", 
+"https://www.cbc.ca/news/canada/canada-record-population-growth-migration-1.6787428", 
+"https://www.cbc.ca/news/canada/north/nwt-population-drop-2022-1.6792473", 
+"https://www.statsnwt.ca/population/population-estimates/PopEst_Jan2023.pdf", 
+"https://www.cbc.ca/news/canada/london/ontario-alberta-move-migration-population-outflow-1.6778456", 
+"https://www.statcan.gc.ca/en/about/smr09/smr09_139", "https://www.cbc.ca/news/politics/canada-population-40-million-1.6878211", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/230628/dq230628c-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-record-immigration-1.6891590", 
+"https://www.gov.mb.ca/mbs/publications/mbs305_pop_bulletin_2023_m04.pdf", 
+"https://www.cbc.ca/news/canada/nova-scotia/nova-scotia-population-boom-1.6899752", 
+"https://www.cbc.ca/news/canada/prince-edward-island/pei-population-march-1-2023-1.6892355", 
+"https://www.saskatchewan.ca/government/news-and-media/2023/june/28/saskatchewan-sees-record-annual-population-growth-in-2022-largest-increase-in-109-years", 
+"https://www.cbc.ca/news/canada/prince-edward-island/pei-population-crosses-180k-2023-1.6942355", 
+"https://www.cbc.ca/news/politics/statscan-to-revise-non-permanent-resident-numbers-1.6953169", 
+"https://www.cbc.ca/news/canada/manitoba/stefanson-population-analysis-1.6965704", 
+"https://www.cbc.ca/news/canada/calgary/alberta-population-growth-statscan-report-1.6979657", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/230927/dq230927b-eng.htm", 
+"https://www.cbc.ca/news/politics/alberta-fastest-growing-population-statscan-1.6979680", 
+"https://www.gov.mb.ca/mbs/publications/mbs501_pop_2023_a01.pdf", 
+"https://www.cbc.ca/news/canada/new-brunswick/population-growth-record-1.6981745", 
+"https://www.cbc.ca/news/canada/prince-edward-island/pei-population-2023-1.6981188", 
+"https://www.saskatchewan.ca/government/news-and-media/2023/september/27/saskatchewan-keeps-growing-at-fastest-pace-in-more-than-a-century", 
+"https://www.gov.nl.ca/releases/2023/ipgs/1025n05/", "https://www.canada.ca/en/immigration-refugees-citizenship/news/2023/11/stabilizing-canadas-immigration-targets-to-support-sustainable-growth.html", 
+"https://www.cbc.ca/news/canada/nova-scotia/halifax-expected-to-hit-half-million-people-this-year-1.7022915", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/231219/dq231219c-eng.htm", 
+"https://www.cbc.ca/news/canada/british-columbia/bc-population-loss-to-alberta-and-ontario-1.7064169", 
+"https://www.cbc.ca/news/politics/canada-record-population-growth-1.7063692", 
+"https://www.gov.mb.ca/mbs/publications/mbs304_pop_2023_m10.pdf", 
+"https://www.cbc.ca/news/canada/nova-scotia/nova-scotia-population-migration-patterns-1.7067869", 
+"https://www.cbc.ca/news/canada/prince-edward-island/pei-population-growth-october-2023-1.7063963", 
+"https://www.cbc.ca/news/canada/north/yukon-gains-about-1000-residents-ends-2023-canada-s-most-populated-territory-1.7071138", 
+"https://yukon.ca/sites/yukon.ca/files/ybs/fin-population-report-q3-2023.pdf", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2024/01/canada-to-stabilize-growth-and-decrease-number-of-new-international-student-permits-issued-to-approximately-360000-for-2024.html", 
+"https://news.gov.bc.ca/releases/2024MUNI0001-000109", "https://www.canada.ca/en/immigration-refugees-citizenship/news/2024/03/speaking-notes-for-the-honourable-marc-miller-minister-of-immigration-refugees-and-citizenship-announcement-related-to-temporary-residents.html", 
+"https://www.cbc.ca/news/canada/calgary/alberta-population-records-2023-to-2024-data-1.7157110", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/240327/dq240327c-eng.htm", 
+"https://www.cbc.ca/news/canada/british-columbia/bc-70-thousand-people-exodus-1.7159382", 
+"https://www.cbc.ca/news/politics/population-growth-canada-2023-1.7157233", 
+"https://www.gov.mb.ca/mbs/publications/mbs305_pop_bulletin_2024_m01.pdf", 
+"https://www.statsnwt.ca/population/population-estimates/PopEst_Jan2024.pdf", 
+"https://statistique.quebec.ca/en/communique/quebec-record-high-net-migration-gain-217600-people-2023", 
+"https://www.cbc.ca/news/canada/montreal/immigration-population-growth-quebec-1.7211879", 
+"https://www.cbc.ca/news/canada/nova-scotia/cbrm-fastest-growing-population-nova-scotia-statistics-canada-1.7214656", 
+"https://www.ontario.ca/document/ontarios-long-term-report-economy-2024/chapter-1-demographic-trends-and-projections-2024", 
+"https://yukon.ca/sites/yukon.ca/files/ybs/fin-population-report-q1-2024.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/240619/dq240619a-eng.htm", 
+"https://www.gov.mb.ca/mbs/publications/mbs305_pop_bulletin_2024_m04.pdf", 
+"https://novascotia.ca/finance/statistics/archive_news.asp?id=20027&dto=0&dti=3", 
+"https://www.statsnwt.ca/population/population-estimates/PopEst_Apr2024.pdf", 
+"https://www.cbc.ca/news/canada/prince-edward-island/pei-population-april-2024-1.7239885", 
+"https://www.saskatchewan.ca/government/news-and-media/2024/june/19/saskatchewan-population-continues-to-reach-new-heights", 
+"https://www2.gov.bc.ca/assets/gov/data/statistics/people-population-community/population/newsletter_08_2024_bc_population_projections.pdf", 
+"https://www.gov.nu.ca/sites/default/files/documents/2024-09/Population_Estimates_Report_July_1_2023_.pdf", 
+"https://yukon.ca/en/population-report-q2-2024", "https://open.alberta.ca/dataset/1050cf0a-8c1d-4875-9800-b7d2f3199e41/resource/b622c22b-507c-4eb2-9c7b-519e2cb75be1/download/tbf-annual-population-report-alberta-2023-2024.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/240925/dq240925d-eng.htm", 
+"https://www.cbc.ca/news/canada/british-columbia/bc-population-factcheck-1.7350323", 
+"https://www.cbc.ca/news/politics/canada-population-growth-slows-1.7333734", 
+"https://novascotia.ca/finance/statistics/archive_news.asp?id=20307&dg=&df=&dto=0&dti=6", 
+"https://www.cbc.ca/news/canada/saskatoon/as-immigration-numbers-decline-in-sask-experts-express-concern-1.7337012", 
+"https://statistique.quebec.ca/en/communique/new-demographic-trends-are-boosting-growth-prospects-in-multiple-quebec-regions", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/news/2024/10/government-of-canada-reduces-immigration.html", 
+"https://www.cbc.ca/news/politics/new-immigration-levels-plan-1.7361972", 
+"https://www.cbc.ca/news/canada/calgary/alberta-population-strong-slowing-1.7417039", 
+"https://open.alberta.ca/dataset/6b5d7997-6062-474f-a955-837fbab70a89/resource/e679b0ad-dd57-49ab-9405-57824a01a8a1/download/tbf-quarterly-population-report-q3-2024.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/241217/dq241217c-eng.htm", 
+"https://www.gov.mb.ca/mbs/publications/mbs305_pop_bulletin_2024_m10.pdf", 
+"https://www.cbc.ca/news/canada/new-brunswick/new-brunswick-loses-most-pandemic-population-gain-1.7425680", 
+"https://www.cbc.ca/news/canada/newfoundland-labrador/nl-stats-canada-population-growth-immigration-data-1.7422654", 
+"https://www.cbc.ca/news/canada/nova-scotia/population-growth-in-n-s-now-mainly-driven-by-international-migration-1.7401844", 
+"https://www.statsnwt.ca/population/population-estimates/PopEst_Oct2024.pdf", 
+"https://www.cbc.ca/news/canada/prince-edward-island/pei-immigration-population-growth-statistics-canada-1.7426105", 
+"https://www.saskatchewan.ca/government/news-and-media/2024/december/18/saskatchewan-quarterly-population-growth-among-the-highest-in-canada", 
+"https://yukon.ca/sites/default/files/2025-01/fin-population-report-q3-2024.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/250116/dq250116b-eng.htm", 
+"https://www.gov.mb.ca/mbs/publications/mbs506_pop_region_2024_a01.pdf", 
+"https://statistique.quebec.ca/en/communique/demographic-overview-quebec-regions-shows-accelerated-growth-mainly-international-migration", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/250121/dq250121c-eng.htm", 
+"https://open.alberta.ca/dataset/6b5d7997-6062-474f-a955-837fbab70a89/resource/681ec681-a906-493e-b311-b32cf806492f/download/tbf-quarterly-population-report-q4-2024.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/250319/dq250319a-eng.htm", 
+"https://www.gov.mb.ca/mbs/publications/mbs305_pop_bulletin_2025_m01.pdf", 
+"https://www.cbc.ca/news/canada/newfoundland-labrador/nl-population-decline-1.7490119", 
+"https://www.statsnwt.ca/population/population-estimates/PopEst_Jan2025.pdf", 
+"https://www.gov.nu.ca/sites/default/files/documents/2025-03/Nunavut_and_Canada_Population_Estimates_StatsUpdate__Fourth_Quarter_2024.pdf", 
+"https://open.alberta.ca/dataset/13ab3f73-6e4e-4aac-b56b-bff38800aa65/resource/7143a76d-47f6-43b3-aa0a-538e0d107a8a/download/tbf-economic-spotlight-2025-03.pdf", 
+"https://statistique.quebec.ca/en/communique/bilan-demographique-quebec-2024-accroissement-migratoire-demeure-eleve-creux-historique-pour-fecondite", 
+"https://www.cbc.ca/news/canada/montreal/quebec-immigration-fertility-1.7529965", 
+"https://www.cbc.ca/news/canada/calgary/alberta-population-q1-2025-estimates-temporary-foreign-residents-decline-1.7564498", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/250618/dq250618a-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-population-growth-stalls-1.7564569", 
+"https://www.cbc.ca/news/canada/manitoba/interprovincial-migration-net-gain-2004-1.7566313", 
+"https://www.gov.mb.ca/mbs/publications/mbs305_pop_bulletin_2025_m04.pdf", 
+"https://novascotia.ca/finance/statistics/archive_news.asp?id=21103&dg=&df=&dto=0&dti=3", 
+"https://www.statsnwt.ca/population/population-estimates/PopEst_Apr2025.pdf", 
+"https://www.gnb.ca/en/news/n-b.2025.07.economic-report-reveals-growth-in-population-employment-and-investment.html", 
+"https://www.cbc.ca/news/canada/montreal/quebec-population-decline-temporary-immigration-1.7597803", 
+"https://statistique.quebec.ca/en/communique/population-projections-up-to-2051-revised-downward-for-quebec-and-its-regions", 
+"https://www.cbc.ca/news/canada/british-columbia/metro-vancouver-population-growth-forecast-1.7631541", 
+"https://www.cbc.ca/news/canada/calgary/alberta-population-july-1-2025-estimates-interprovincial-migration-continues-1.7642490", 
+"https://open.alberta.ca/dataset/1050cf0a-8c1d-4875-9800-b7d2f3199e41/resource/840ff40a-b421-4e72-8d57-af884658d680/download/tbf-annual-population-report-alberta-2024-2025.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/250924/dq250924e-eng.htm", 
+"https://www.cbc.ca/news/business/canada-q2-population-1.7642276", 
+"https://www.cbc.ca/news/canada/manitoba/manitoba-migration-revised-numbers-1.7646519", 
+"https://www.gov.mb.ca/mbs/publications/mbs501_pop_2025_a01.pdf", 
+"https://novascotia.ca/finance/statistics/archive_news.asp?id=21374", 
+"https://www.gov.nu.ca/sites/default/files/documents/2025-10/Nunavut_and_Canada_Population_Estimates_StatsUpdate__Second_Quarter_2025.pdf", 
+"https://www.saskatchewan.ca/government/news-and-media/2025/september/24/saskatchewan-keeps-growing", 
+"https://www.canada.ca/en/immigration-refugees-citizenship/corporate/immigration-system/levels/supplementary-immigration-levels-2026-2028.html", 
+"https://www2.gov.bc.ca/assets/gov/data/statistics/people-population-community/population/people_2025_population_projections.pdf", 
+"https://www.cbc.ca/news/canada/edmonton/alberta-canada-population-immigration-non-permanent-resident-data-9.7020511", 
+"https://open.alberta.ca/dataset/6b5d7997-6062-474f-a955-837fbab70a89/resource/9cbe1205-9053-48dc-9e1d-1d74ecb9b35d/download/tbf-quarterly-population-report-q3-2025.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/251217/dq251217b-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-population-falls-9.7019359", 
+"https://www.gov.mb.ca/mbs/publications/mbs305_pop_bulletin_2025_m10.pdf", 
+"https://www.cbc.ca/news/canada/new-brunswick/population-quarterly-decline-economist-9.7022924", 
+"https://www.cbc.ca/news/canada/nova-scotia/nova-scotia-population-dip-9.7020093", 
+"https://www.ontario.ca/page/ontario-demographic-quarterly-highlights-third-quarter", 
+"https://statistique.quebec.ca/en/communique/demographic-overview-quebec-regions-population-continues-increase-almost-everywhere-growth-slowing-down", 
+"https://yukon.ca/sites/default/files/2026-01/fin-population-report-q3-2025.pdf", 
+"https://www.gov.mb.ca/mbs/publications/mbs506_pop_region_2025_a01.pdf", 
+"https://www.cbc.ca/news/canada/ottawa/ottawa-population-housing-growth-plan-2051-9.7095902", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/260218/dq260218f-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-zero-population-growth-9.7107361", 
+"https://yukon.ca/sites/default/files/fin-population-report-q4-2025.pdf", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/260318/dq260318b-eng.htm", 
+"https://www.cbc.ca/news/politics/canada-population-decline-first-time-9.7133643", 
+"https://www.gov.mb.ca/mbs/publications/mbs305_pop_bulletin_2026_m01.pdf", 
+"https://www.cbc.ca/player/play/video/9.7135635", "https://www.ontario.ca/page/ontario-demographic-quarterly-highlights-fourth-quarter", 
+"https://www.cbc.ca/news/canada/prince-edward-island/pei-fewer-newcomers-are-coming-to-pei-declining-international-migration-9.7159176", 
+"https://www.cbc.ca/news/canada/toronto/ontario-losing-international-students-statscan-report-9.7191934", 
+"https://statistique.quebec.ca/en/communique/births-deaths-migration-quebec-population-change-2025", 
+"https://www.cbc.ca/news/canada/calgary/alberta-population-still-growing-9.7240776", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/260617/dq260617a-eng.htm", 
+"https://www.cbc.ca/news/business/population-drop-first-quarter-2026-9.7238364", 
+"https://novascotia.ca/finance/statistics/archive_news.asp?id=22113&dg=&df=&dto=0&dti=3", 
+"https://www.ontario.ca/page/ontario-demographic-quarterly-highlights-first-quarter", 
+"https://www.princeedwardisland.ca/sites/default/files/publications/fin_pop_rep_quarter.pdf", 
+"https://www.ontario.ca/page/ontario-population-projections", 
+"https://www.cbc.ca/news/canada/montreal/quebec-population-growth-decline-9.7266098", 
+"https://statistique.quebec.ca/en/communique/demographic-projections-continued-population-stabilization-quebec-regional-disparities", 
+"https://www.cbc.ca/news/canada/newfoundland-labrador/population-growth-newfoundland-labrador-9.7358119", 
+"https://www.cbc.ca/news/canada/edmonton/alberta-canada-population-2026-9.7367972", 
+"https://www150.statcan.gc.ca/n1/daily-quotidien/260923/dq260923b-eng.htm", 
+"https://www.cbc.ca/news/politics/statistics-canada-population-growth-9.7361422", 
+"https://www.cbc.ca/news/canada/new-brunswick/new-brunswick-population-revision-9.7356791", 
+"https://www.ontario.ca/page/ontario-demographic-quarterly-highlights-second-quarter"
+)), class = "data.frame", row.names = c(NA, -217L))
+
+
+stories <- stories %>% mutate(date = as.Date(date), exact = as.logical(exact), id = row_number())
+
+ordinal <- function(n) {
+  suf <- ifelse(n %% 100 %in% 11:13, "th",
+         c("th","st","nd","rd","th","th","th","th","th","th")[n %% 10 + 1])
+  paste0(n, suf)
+}
+stories$date_txt <- ifelse(stories$exact,
+  paste(format(stories$date, "%b"), ordinal(as.integer(format(stories$date, "%d"))), format(stories$date, "%Y")),
+  format(stories$date, "%b %Y"))
+
+fmt_day <- function(d) paste0(month.abb[as.integer(format(d, "%m"))], " ", as.integer(format(d, "%d")), ", ", format(d, "%Y"))
+ms <- function(d) as.numeric(as.POSIXct(as.Date(d), tz = "UTC")) * 1000
+
+# ---- Source filters shown in the page; `sources_on` are ticked when it opens
+source_labels <- c("CBC News" = "CBC News", "Provincial government" = "Provincial / territorial govt",
+                   "Statistics Canada" = "Statistics Canada", "IRCC" = "IRCC")
+sources_on <- c("CBC News", "Provincial government")
+
+# ---- Data handed to the page -------------------------------------------------------------
+geo_order <- unname(codes)
+G <- list(
+  W = 1180, H = 900, x0 = ms("2019-01-01"), x1 = ms("2026-09-15"),
+  release = fmt_day(release_date), made = fmt_day(Sys.Date()),
+  pop_range = fmt_day(range(pop$date)), news_range = fmt_day(range(stories$date)),
+  geos = lapply(geo_order, function(g) {
+    p <- pop[pop$geo == g, ]
+    list(code = g, name = names(codes)[codes == g], ms = ms(p$date), v = p$population)
+  }),
+  sources_on = as.list(sources_on),
+  stories = lapply(seq_len(nrow(stories)), function(i) { s <- stories[i, ]
+    list(id = s$id, geo = s$geo, src = s$source, type = s$type, ms = ms(s$date), d = s$date_txt,
+         exact = s$exact, h = s$headline, url = s$url) })
+)
+
+# ---- Base chart (the page redraws it for each view) ---------------------------------------
+fig <- plot_ly(width = G$W, height = G$H, type = "scatter", mode = "lines", x = numeric(0), y = numeric(0)) %>%
+  layout(autosize = FALSE) %>% config(displaylogo = FALSE)
+
+geo_opts <- function() lapply(geo_order, function(g) tags$option(value = g, names(codes)[codes == g]))
+panel <- tags$aside(id = "panel",
+  tags$h2("Canada's population in the headlines"),
+  tags$div(class = "ctl", tags$label(`for` = "geo", "Geography"), tags$select(id = "geo", geo_opts())),
+  tags$div(class = "ctl", tags$span(class = "lbl", "Y-axis"),
+    tags$div(class = "seg", id = "mode",
+      tags$button(`data-m` = "pop", "Population"),
+      tags$button(`data-m` = "yoy", "% change, year over year"))),
+  tags$fieldset(class = "flt dates", tags$legend("Date window"),
+    tags$select(id = "d0", title = "From"),
+    tags$span("to"),
+    tags$select(id = "d1", title = "To"),
+    tags$button(id = "b-dall", "All")),
+  tags$fieldset(class = "flt", tags$legend("Sources"),
+    lapply(names(source_labels), function(k) tags$label(
+      tags$input(type = "checkbox", class = "src", value = k, checked = if (k %in% sources_on) NA else NULL),
+      source_labels[[k]], tags$span(class = "n", `data-key` = k)))),
+  tags$fieldset(class = "flt", tags$legend("Kind of story"),
+    tags$label(tags$input(type = "checkbox", class = "kind", value = "fact", checked = NA),
+               "Factual: population estimates and updates"),
+    tags$label(tags$input(type = "checkbox", class = "kind", value = "proj", checked = NA),
+               "Projection or plan")),
+  tags$div(class = "btns", tags$button(id = "b-reset", title = "Five random headlines, one from each of five years", "Random 5"), tags$button(id = "b-all", "All"),
+           tags$button(id = "b-none", "None")),
+  tags$div(id = "count", class = "help"),
+  tags$div(class = "list", id = "list")
+)
+
+# Download buttons, to the right of the chart
+dl <- tags$div(id = "dl",
+  tags$button(id = "b-jpg", title = "JPEG image of the chart exactly as shown", HTML("&#8681; Download current chart on screen")),
+  tags$button(id = "b-csv", title = "CSV of every story and release, whatever the filters", HTML("&#8681; Download all references")),
+  tags$button(id = "b-data", title = "CSV of the population numbers for every region and quarter, with year-over-year change", HTML("&#8681; Download all data")))
+
+css <- tags$style(HTML("
+  html,body{margin:0;background:#fff;color:#1a1d21;font-family:Arial,Helvetica,sans-serif}
+  body{padding:0!important}
+  #htmlwidget_container{position:relative;display:flex;align-items:flex-start;gap:16px;height:100vh;overflow:auto;padding:0!important;box-sizing:border-box}
+  #panel{width:350px;flex:none;border-right:1px solid #e3e6e9;padding:14px 14px 0;display:flex;flex-direction:column;gap:8px;box-sizing:border-box;height:100vh;position:sticky;left:0;top:0;background:#fff;z-index:5}
+  #panel h2{margin:0 0 2px;font-size:17px}
+  .ctl{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13px}
+  .ctl label,.lbl{font-weight:600;color:#4a5058}
+  #geo{font:14px Arial;padding:4px 6px;border:1px solid #cfd4d9;border-radius:3px;min-width:180px}
+  .rg{display:inline-block;padding:0 4px;margin-right:4px;border:1px solid #cfd4d9;border-radius:3px;font:600 10px/14px Arial;color:#4a5058}
+  .seg{display:inline-flex;border:1px solid #cfd4d9;border-radius:3px;overflow:hidden}
+  .seg button{font:600 12px Arial;background:#fff;color:#4a5058;border:0;border-left:1px solid #cfd4d9;padding:5px 10px;cursor:pointer}
+  .seg button:first-child{border-left:0}
+  .seg button[aria-pressed=true]{background:#1a1d21;color:#fff}
+  .help,.key{font-size:12px;color:#5d646c;margin:0}
+  .scope{display:inline-block;padding:0 4px;margin-right:5px;border-radius:3px;font:700 10px/15px Arial;letter-spacing:.02em;text-transform:uppercase}
+  .scope.nat{background:#1a1d21;color:#fff}
+  .scope.prov{background:#e3e6e9;color:#1a1d21}
+  .btns{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .btns button{font:600 12px Arial;background:#fff;border:1px solid #cfd4d9;border-radius:3px;padding:3px 10px;cursor:pointer}
+  .btns button:hover{border-color:#4a5058}
+  .flt{border:1px solid #e3e6e9;border-radius:3px;margin:0;padding:4px 8px 6px;display:grid;grid-template-columns:1fr 1fr;gap:2px 10px}
+  .flt legend{font:600 12px Arial;color:#4a5058;padding:0 4px}
+  .flt label{font-size:12px;color:#1a1d21;display:flex;gap:5px;align-items:center;cursor:pointer}
+  .flt label .n{color:#9aa1a8;font-size:11px}
+  .flt input{accent-color:#1a1d21;margin:0}
+  .foot{border-top:1px solid #e3e6e9;padding:8px 0 10px;display:flex;flex-direction:column;gap:6px}
+  .src-note{font-size:11.5px;color:#7d848c;margin:0}
+  .src-note a,.it .m a{color:#4a5058}
+  .list{overflow-y:auto;flex:1;padding-bottom:10px;margin-top:2px}
+  .yr{font:700 12px Arial;color:#7d848c;padding:10px 0 3px;border-bottom:1px solid #e3e6e9}
+  .it{display:grid;grid-template-columns:18px 1fr;gap:6px;padding:6px 2px;font-size:13px;line-height:1.3;border-bottom:1px solid #f0f2f4;cursor:pointer}
+  .it:hover{background:#fdeeee}
+  .it input{margin:2px 0 0;accent-color:#d6262a;cursor:pointer}
+  .it .m{display:block;font-size:11.5px;color:#7d848c;margin-bottom:1px}
+  .it .nr{display:none;color:#d6262a;font-size:11px}
+  .it.nofit .nr{display:block}
+  .it .pre{display:block;color:#9aa1a8;font-size:11px}
+  .empty{font-size:13px;color:#7d848c;padding:12px 2px}
+  .html-widget{flex:none;margin:12px 0 16px 0}
+  .dates{display:flex;align-items:center;gap:6px;font-size:12px;color:#4a5058}
+  .dates select{font:13px Arial;padding:3px 4px;border:1px solid #cfd4d9;border-radius:3px;flex:1;min-width:0}
+  .dates button{flex:none;font:600 11px Arial;background:#fff;border:1px solid #cfd4d9;border-radius:3px;padding:3px 6px;cursor:pointer;white-space:nowrap}
+  #dl{position:absolute;top:0;left:0;width:max-content;display:flex;flex-direction:row;gap:6px;z-index:6}
+  #dl button{white-space:nowrap;font:600 12px Arial;text-align:left;background:#fff;border:1px solid #cfd4d9;border-radius:3px;padding:6px 9px;cursor:pointer;color:#1a1d21}
+  #dl button:hover{border-color:#1a1d21;background:#f5f6f7}
+
+"))
+
+js <- r"---(
+function(el, x, G){
+  // the chart fills the space between the left panel and the download buttons, and the window height
+  let W=G.W,H=G.H;
+  function fit(){const pan=document.getElementById("panel"),dl=document.getElementById("dl");
+    const used=(pan?pan.offsetWidth:350)+16+28;
+    W=Math.max(900,Math.floor(window.innerWidth-used));H=Math.max(700,Math.min(1100,Math.floor(window.innerHeight-24)));
+    el.style.width=W+"px";el.style.height=H+"px"}
+  fit();
+  let rt=null;window.addEventListener("resize",()=>{clearTimeout(rt);rt=setTimeout(()=>{const w0=W,h0=H;fit();if(W!==w0||H!==h0)draw()},250)});
+  const MON=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const geos={};G.geos.forEach(g=>{geos[g.code]=g});
+  const store={get(k){try{return localStorage.getItem(k)}catch(e){return null}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
+  const jget=(k,d)=>{try{const v=JSON.parse(store.get(k)||"null");return Array.isArray(v)?v:d}catch(e){return d}};
+  let geo=store.get("pophl4-geo")||"CA", mode=store.get("pophl4-mode")||"pop";
+  if(!geos[geo])geo="CA"; if(!["pop","yoy"].includes(mode))mode="pop";
+  // date window: picked from the quarterly reference dates in the StatCan table ("" = first / last)
+  const Q=geos.CA.ms,fmtQ=t=>MON[new Date(t).getUTCMonth()]+"-"+new Date(t).getUTCFullYear();
+  const qOf=v=>{const t=Date.parse(v||"");return Q.includes(t)?t:null};
+  let d0="",d1="";   // the full date range each time the page opens
+  // the window: data and stories from the "from" date to the "to" date (open-ended at the first / last quarter)
+  // dates offered: every quarter in the table; in the year-over-year view, from the first quarter with a value a year earlier
+  const QQ=()=>mode==="yoy"?Q.slice(4):Q;
+  function win(){const Qd=QQ();let a=qOf(d0),b=qOf(d1);if(a!=null&&b!=null&&a>b){const t=a;a=b;b=t}
+    if(a!=null&&a<=Qd[0])a=null;if(b!=null&&b<=Qd[0])b=Qd[1]||null;if(b===Qd[Qd.length-1])b=null;
+    const lo=a==null?Qd[0]:a,hi=b==null?Infinity:b,full=a==null&&b==null;
+    const s0=a==null?G.x0:a,s1=b==null?G.x1:b,pad=full?0:(s1-s0)*0.04;
+    return {lo,hi,r0:a==null?Qd[0]:a,r1:b==null?Qd[Qd.length-1]:b,full,qa:a==null?Qd[0]:a,qb:b==null?Qd[Qd.length-1]:b}}
+  // headlines shown: picked at random each time the page opens (see pick5)
+  let sel=new Set();
+  const srcOn=new Set(jget("pophl4-src",G.sources_on)), kindOn=new Set(jget("pophl4-kind",["fact","proj"]));
+  const kindOf=s=>(s.type==="Projection"||s.type==="Plan")?"proj":"fact";
+  const DT=t=>{const d=new Date(t);return MON[d.getUTCMonth()]+" "+d.getUTCDate()+", "+d.getUTCFullYear()};
+  const iso=t=>new Date(t).toISOString().slice(0,10);
+  const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;");
+  const fmtPop=v=>v>=1e6?(v/1e6).toFixed(2)+" million":(Math.round(v/100)*100).toLocaleString("en-CA");
+  const fmtPct=v=>(v>=0?"+":"")+(v*100).toFixed(2)+"%";
+  const fmtC=v=>v>=1e7?(v/1e6).toFixed(1)+"M":(v>=1e6?(v/1e6).toFixed(2)+"M":(v/1e3).toFixed(1)+"K");
+  const interp=(S,t)=>{if(t<=S[0][0])return S[0][1];if(t>=S[S.length-1][0])return S[S.length-1][1];
+    for(let k=1;k<S.length;k++)if(t<=S[k][0])return S[k-1][1]+(t-S[k-1][0])/(S[k][0]-S[k-1][0])*(S[k][1]-S[k-1][1])};
+  // national = Canada-wide stories and releases; provincial = about one province or territory
+  const national=s=>s.geo==="CA"||s.geo==="ALL",scopeOf=s=>national(s)?"National":"Provincial";
+  const SYM_OF=s=>national(s)?"star":"square";
+  const STATCAN="https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1710000901";
+  // ---- data series
+  function popSeries(code){const g=geos[code];return g.ms.map((t,i)=>[t,g.v[i]])}
+  const yoyStart=()=>{const t=geos.CA.ms[4];return t?MON[new Date(t).getUTCMonth()]+" "+new Date(t).getUTCFullYear():"—"};
+  function series(code,m){const P=popSeries(code);if(m==="pop")return P;
+    const out=[];for(let i=4;i<P.length;i++)out.push([P[i][0],P[i][1]/P[i-4][1]-1,P[i-4],P[i]]);return out}
+  // ---- stories
+  const inGeo=(s,code)=>s.geo===code||s.geo==="ALL";
+  const inWin=s=>{const w=win();return s.ms>=w.lo&&s.ms<=w.hi};
+  const visibleFor=code=>G.stories.filter(s=>inGeo(s,code)&&srcOn.has(s.src)&&kindOn.has(kindOf(s))&&inWin(s));
+  const visibleStories=()=>visibleFor(geo);
+  // ---- label measuring and non-overlapping placement
+  const cv=document.createElement("canvas").getContext("2d");
+  const tw=(s,b)=>{cv.font=(b?"bold ":"")+"12px Arial";return cv.measureText(s).width};
+  const wrap=(h,n)=>{const out=[];let cur="";h.split(" ").forEach(w=>{if((cur+" "+w).trim().length>n&&cur){out.push(cur);cur=w}else cur=(cur+" "+w).trim()});if(cur)out.push(cur);return out};
+  function sizes(s,tail,widths){return widths.map((n,k)=>{const L=wrap(s.h,n),T="("+s.d+") "+tail;
+    const tl=tw(T,false)>tw("x".repeat(n),true)*1.05?wrap(T,n+6):[T];
+    const w=Math.max(...L.map(l=>tw(l,true)),...tl.map(l=>tw(l,false)))+10,h=(L.length+tl.length)*15+8;
+    const html="<b>"+L.map(esc).join("<br>")+"</b><br><span style=\"color:#4a5058\">"+tl.map(esc).join("<br>")+"</span>";
+    return {w,h,html,wide:k>0}})}
+  const hit=(a,b,p)=>a.x<b.x+b.w+p&&a.x+a.w+p>b.x&&a.y<b.y+b.h+p&&a.y+a.h+p>b.y;
+  const pin=(x,y,r,p)=>x>r.x-p&&x<r.x+r.w+p&&y>r.y-p&&y<r.y+r.h+p;
+  function segRect(x1,y1,x2,y2,r,p){const a=r.x-p,b=r.y-p,c=r.x+r.w+p,d=r.y+r.h+p;let t0=0,t1=1;const dx=x2-x1,dy=y2-y1;
+    for(const [q,e] of [[x1-a,-dx],[c-x1,dx],[y1-b,-dy],[d-y1,dy]]){if(e===0){if(q<0)return false}else{const t=q/e;if(e<0){if(t>t1)return false;if(t>t0)t0=t}else{if(t<t0)return false;if(t<t1)t1=t}}}return t0<=t1}
+  const o3=(p,q,r)=>Math.sign((q[0]-p[0])*(r[1]-p[1])-(q[1]-p[1])*(r[0]-p[0]));
+  const cross=(a,b,c,d)=>o3(a,b,c)!==o3(a,b,d)&&o3(c,d,a)!==o3(c,d,b);
+  function place(items,anchors,lines,samples,cap,B){const placed=[],fails=[];let total=0;
+    const lineCross=(a,b)=>{let n=0;lines.forEach(P=>{for(let k=1;k<P.length;k++)if(cross(a,b,P[k-1],P[k]))n++});return n};
+    for(const it of items){let best=null,bs=1e18;
+      for(const sz of it.sizes){for(let y=B.y0+2;y+sz.h<=B.y1-4;y+=8)for(let x=B.x0+4;x+sz.w<=B.x1-2;x+=10){
+        const r={x,y,w:sz.w,h:sz.h},lx=x+sz.w/2,ly=y+sz.h/2;
+        const ex=Math.min(Math.max(it.ax,x),x+sz.w),ey=Math.min(Math.max(it.ay,y),y+sz.h),len=Math.hypot(ex-it.ax,ey-it.ay);
+        if(len<18||len>B.maxLen)continue;let s=Math.pow(len,1.45)+(sz.wide?25:0);if(s>=bs)continue;
+        let ok=true;for(const p of placed)if(hit(r,p.r,7)||segRect(p.ax,p.ay,p.lx,p.ly,r,3)){ok=false;break}if(!ok)continue;
+        for(const a of anchors)if(pin(a[0],a[1],r,8)){ok=false;break}if(!ok)continue;
+        for(const q of samples)if(pin(q[0],q[1],r,5)){ok=false;break}if(!ok)continue;
+        for(const p of placed)if(segRect(it.ax,it.ay,lx,ly,p.r,3)){ok=false;break}if(!ok)continue;
+        for(const p of placed)if(cross([it.ax,it.ay],[lx,ly],[p.ax,p.ay],[p.lx,p.ly])){ok=false;break}if(!ok)continue;
+        s+=150*lineCross([it.ax,it.ay],[lx,ly]);if(s<bs){bs=s;best={r,lx,ly,sz}}}}
+      if(best){placed.push({it,ax:it.ax,ay:it.ay,...best});total+=bs}else{fails.push(it);total+=1e6}
+      if(cap!=null&&total>=cap)return null}
+    return {placed,fails,score:total}}
+  // second pass for headlines that found no clean spot: place them anyway, at the spot that covers
+  // the least (no overlap with other headlines if at all possible; then fewest line points, dots and crossings)
+  function forcePlace(fails,placed,anchors,lines,samples,B){
+    const C=8,nx=Math.ceil((B.x1-B.x0)/C)+2,ny=Math.ceil((B.y1-B.y0)/C)+2,cum=new Float64Array((nx+1)*(ny+1));
+    samples.forEach(q=>{const i=Math.floor((q[0]-B.x0)/C)+1,j=Math.floor((q[1]-B.y0)/C)+1;if(i>=1&&i<=nx&&j>=1&&j<=ny)cum[j*(nx+1)+i]++});
+    for(let j=1;j<=ny;j++)for(let i=1;i<=nx;i++)cum[j*(nx+1)+i]+=cum[(j-1)*(nx+1)+i]+cum[j*(nx+1)+i-1]-cum[(j-1)*(nx+1)+i-1];
+    const cnt=r=>{const i0=Math.max(0,Math.floor((r.x-B.x0)/C)),i1=Math.min(nx,Math.ceil((r.x+r.w-B.x0)/C)),j0=Math.max(0,Math.floor((r.y-B.y0)/C)),j1=Math.min(ny,Math.ceil((r.y+r.h-B.y0)/C));
+      return cum[j1*(nx+1)+i1]-cum[j0*(nx+1)+i1]-cum[j1*(nx+1)+i0]+cum[j0*(nx+1)+i0]};
+    const ov=(a,b)=>Math.max(0,Math.min(a.x+a.w,b.x+b.w)-Math.max(a.x,b.x))*Math.max(0,Math.min(a.y+a.h,b.y+b.h)-Math.max(a.y,b.y));
+    const out=[];
+    for(const it of fails){let best=null,bs=1e18;
+      for(const sz of it.sizes){for(let y=B.y0+2;y+sz.h<=B.y1-2;y+=10)for(let x=B.x0+2;x+sz.w<=B.x1-2;x+=12){
+        const r={x,y,w:sz.w,h:sz.h},lx=x+sz.w/2,ly=y+sz.h/2;
+        const ex=Math.min(Math.max(it.ax,x),x+sz.w),ey=Math.min(Math.max(it.ay,y),y+sz.h),len=Math.hypot(ex-it.ax,ey-it.ay);
+        let s=Math.pow(Math.max(len,18),1.3);if(s>=bs)continue;
+        for(const p of placed)s+=ov(r,p.r)*40;if(s>=bs)continue;
+        s+=cnt(r)*25;if(s>=bs)continue;
+        for(const a of anchors)if(pin(a[0],a[1],r,6))s+=400;if(s>=bs)continue;
+        for(const p of placed){if(cross([it.ax,it.ay],[lx,ly],[p.ax,p.ay],[p.lx,p.ly]))s+=500;if(segRect(it.ax,it.ay,lx,ly,p.r,2)||segRect(p.ax,p.ay,p.lx,p.ly,r,2))s+=500}
+        if(s<bs){bs=s;best={r,lx,ly,sz}}}}
+      if(best){const P={it,ax:it.ax,ay:it.ay,...best};placed.push(P);out.push(P)}}
+    return out}
+  function bestPlacement(items,anchors,lines,samples,B,budget){
+    let seed=7;const rnd=()=>(seed=(seed*16807)%2147483647)/2147483647;
+    const orders=[items.slice(),items.slice().reverse()];
+    for(let n=0;n<100;n++){const q=items.slice();for(let i=q.length-1;i>0;i--){const j=Math.floor(rnd()*(i+1));[q[i],q[j]]=[q[j],q[i]]}orders.push(q)}
+    const rev=q=>q.filter(i=>i.s.type==="Revision").concat(q.filter(i=>i.s.type!=="Revision"));
+    const t0=performance.now();let res=null;
+    for(const q of orders.map(rev)){if(res&&performance.now()-t0>budget)break;const r=place(q,anchors,lines,samples,res?res.score:null,B);if(r&&(!res||r.score<res.score))res=r}
+    return res}
+  // ---- the chart panel
+  function buildPanel(code,B,sfx,yr,compact){
+    const g=geos[code],w=win(),pct=mode!=="pop",Sall=series(code,mode);
+    const S=Sall.filter(p=>p[0]>=w.lo&&p[0]<=w.hi);
+    const [y0,y1]=yr,xa="x"+sfx,ya="y"+sfx;
+    if(S.length<2)return {data:[{x:[],y:[],xaxis:xa,yaxis:ya,type:"scatter",showlegend:false}],ann:[{text:"No "+(pct?"year-over-year values":"data")+" in this date window"+(pct?" (they start in "+yoyStart()+")":""),
+      xref:xa+" domain",yref:ya+" domain",x:0.5,y:0.5,showarrow:false,font:{size:14,color:"#7d848c"}}],placedIds:new Set(),fails:new Set(),early:new Set(),vis:[]};
+    // draw one point either side of the window so the line runs to the edges
+    const Sdraw=S;
+    const X=t=>B.x0+(t-w.r0)/(w.r1-w.r0)*(B.x1-B.x0),Y=v=>B.y0+(1-(v-y0)/(y1-y0))*(B.y1-B.y0);
+    const Xi=px=>w.r0+(px-B.x0)/(B.x1-B.x0)*(w.r1-w.r0),Yi=py=>y0+(1-(py-B.y0)/(B.y1-B.y0))*(y1-y0);
+    const lines=[Sdraw.map(p=>[X(p[0]),Y(p[1])])];
+    if(pct)lines.push([[B.x0,Y(0)],[B.x1,Y(0)]]);
+    const samples=[];lines.forEach(P=>{for(let k=1;k<P.length;k++){const [a,b]=P[k-1],[c,d]=P[k],n=Math.ceil(Math.hypot(c-a,d-b)/4);for(let j=0;j<=n;j++){const q=[a+(c-a)*j/n,b+(d-b)*j/n];if(q[0]>=B.x0-4&&q[0]<=B.x1+4)samples.push(q)}}});
+    const tS=S[0][0],tE=S[S.length-1][0];
+    const all=visibleFor(code),early=new Set(pct?all.filter(s=>s.ms<tS-45*864e5).map(s=>s.id):[]);
+    const vis=all.filter(s=>!early.has(s.id)).map(s=>{const t=Math.min(Math.max(s.ms,tS),tE);
+      const v=interp(S,t);let tail="pop. ≈ "+fmtPop(v),hov=tail;
+      if(pct){const P=popSeries(code),a=interp(P,t-365.25*864e5),b=interp(P,t);
+        tail="y/y ≈ "+fmtPct(v)+" ("+fmtC(a)+" → "+fmtC(b)+")";hov=tail}
+      return {s,t,v,ax:X(t),ay:Y(v),tail,hov}});
+    const widths=compact?[22,30,17]:[30,42,24];
+    const items=vis.filter(o=>sel.has(o.s.id)).map(o=>({...o,sizes:sizes(o.s,o.tail,widths)}));
+    const res=bestPlacement(items,vis.map(o=>[o.ax,o.ay]),lines,samples,B,compact?650:1200);
+    if(res.fails.length){forcePlace(res.fails,res.placed,vis.map(o=>[o.ax,o.ay]),lines,samples,B);res.fails=res.fails.filter(f=>!res.placed.some(p=>p.it===f))}
+    const placedIds=new Set(res.placed.map(p=>p.it.s.id)),fails=new Set(res.fails.map(f=>f.s.id));
+    const data=[];
+    const ann=res.placed.map(p=>({x:iso(p.it.t),y:p.it.v,xref:xa,yref:ya,axref:xa,ayref:ya,
+      ax:iso(Xi(p.r.x+p.r.w/2)),ay:Yi(p.r.y+p.r.h/2),
+      text:"<a href=\""+p.it.s.url+"\" target=\"_blank\" style=\"color:#1a1d21\">"+p.sz.html+"</a>",
+      showarrow:true,arrowhead:2,arrowsize:1.1,arrowwidth:1.1,arrowcolor:"rgba(214,38,42,.85)",standoff:6,align:"left",
+      font:{size:12,family:"Arial",color:"#1a1d21"},bgcolor:"rgba(255,255,255,0.92)",borderpad:2}));
+    data.push({x:Sdraw.map(p=>iso(p[0])),y:Sdraw.map(p=>p[1]),xaxis:xa,yaxis:ya,type:"scatter",mode:"lines+markers",cliponaxis:false,
+      name:"StatCan quarterly estimate"+(pct?" (% change, year over year)":""),showlegend:!sfx,
+      line:{color:"#5b7fa6",width:2.6},marker:{size:4,color:"#5b7fa6"},
+      text:pct?Sdraw.map(p=>DT(p[2][0])+": "+p[2][1].toLocaleString("en-CA")+"<br>"+DT(p[3][0])+": "+p[3][1].toLocaleString("en-CA")+"<br><b>"+fmtPct(p[1])+" year over year</b> ("+fmtC(p[2][1])+" → "+fmtC(p[3][1])+")"):Sdraw.map(p=>DT(p[0])+"<br><b>"+p[1].toLocaleString("en-CA")+"</b>"),
+      hovertemplate:(compact?"<b>"+g.name+"</b><br>":"")+"%{text}<extra></extra>"});
+    data.push({x:vis.map(o=>iso(o.t)),y:vis.map(o=>o.v),xaxis:xa,yaxis:ya,type:"scatter",mode:"markers",
+      name:"Stories",cliponaxis:false,showlegend:false,customdata:vis.map(o=>o.s.url),
+      text:vis.map(o=>"<b>"+esc(o.s.h)+"</b><br>"+scopeOf(o.s)+" · "+o.s.src+" · "+o.s.d+" · "+o.s.type.toLowerCase()+"<br>"+o.hov),
+      hovertemplate:"%{text}<extra></extra>",
+      marker:{size:vis.map(o=>(placedIds.has(o.s.id)?10:8)+(national(o.s)?3:0)),color:vis.map(o=>placedIds.has(o.s.id)?"#d6262a":"white"),
+        symbol:vis.map(o=>SYM_OF(o.s)),
+        line:{color:vis.map(o=>placedIds.has(o.s.id)?"white":(fails.has(o.s.id)?"#d6262a":"#5b7fa6")),width:1.6}}});
+    // legend entries for the two kinds of story marker
+    const L=(name,symbol,size)=>({x:[null],y:[null],xaxis:xa,yaxis:ya,type:"scatter",mode:"markers",name,hoverinfo:"skip",
+      marker:{symbol,size,color:"#d6262a",line:{color:"white",width:1}}});
+    data.push(L("National news","star",13),L("Provincial news","square",10));
+    return {data,ann,placedIds,fails,early,vis};
+  }
+  function yRange(vals,pct){const lo=Math.min(...vals),hi=Math.max(...vals),sp=(hi-lo)||Math.abs(hi)||1;
+    return pct?[lo-sp*0.18,hi+sp*0.8,hi]:[lo-sp*0.06,hi+sp*0.66,hi]}
+  // ---- draw everything
+  let lastFile="";
+  function draw(){
+    const pct=mode!=="pop",codes=[geo];
+    const w=win();
+    // header rows, in pixels from the top: title, source, legend
+    const R={title:12,src:44,ex:64,legend:pct?90:66};
+    // footer: the date range of the data, of the news articles, and when this viewer was made (one per line, wrapped to the room left of the buttons)
+    const dlw=(document.getElementById("dl")||{offsetWidth:600}).offsetWidth,room=Math.max(220,W-dlw-60);
+    const foot=["StatCan population estimates: "+G.pop_range[0]+" to "+G.pop_range[1]+" (quarterly: Jan 1, Apr 1, Jul 1, Oct 1)",
+      "News articles: "+G.news_range[0]+" to "+G.news_range[1],"Population viewer made: "+G.made].flatMap(t=>wrap(t,Math.floor(room/6.2)));
+    const M={l:86,r:48,t:pct?128:104,b:Math.max(104,70+foot.length*15)};
+    const doms=[[0,1]],pw=W-M.l-M.r,ph=H-M.t-M.b;
+    const PX=px=>(px-M.l)/pw,PY=py=>1-(py-M.t)/ph;
+    const inW=p=>p[0]>=w.lo&&p[0]<=w.hi;
+    const ranges=codes.map(c=>{const g=geos[c];let v=series(c,mode).filter(inW).map(p=>p[1]);
+      if(pct)v.push(0);return v.length?v:[0,1]});
+    const shared=pct?yRange(ranges.flat(),true):null;
+    const layout={autosize:false,width:W,height:H,margin:M,font:{family:"Arial"},showlegend:true,
+      legend:{orientation:"h",x:PX(12),y:PY(R.legend),yanchor:"top",xanchor:"left",font:{size:13}},
+      plot_bgcolor:"white",paper_bgcolor:"white",hoverlabel:{bgcolor:"white",font:{size:13}},annotations:[],images:[],shapes:[]};
+    const head=(text,px,py,size,color,extra)=>layout.annotations.push(Object.assign({text,xref:"paper",yref:"paper",x:PX(px),y:PY(py),
+      xanchor:"left",yanchor:"top",align:"left",showarrow:false,font:{size,color:color||"#1a1d21"}},extra||{}));
+    // title
+    const tx=14;
+    const span=w.full?"":" · "+fmtQ(w.qa)+" to "+fmtQ(w.qb);
+    const ttl=n=>"StatsCan Quarterly Population Estimates: "+n+(pct?" (% Change Year over Year)":" (Raw Numbers)");
+    head("<b>"+ttl(geos[geo].name)+"</b><span style=\"font-size:15px;color:#7d848c\">"+span+"</span>",tx,R.title,21);
+    head("Source: <a href=\""+STATCAN+"\" target=\"_blank\" style=\"color:#4a5058\">Statistics Canada, Table 17-10-0009-01</a> (quarterly estimates, released "+G.release+")",14,R.src,13,"#7d848c");
+    if(pct)head("How it's calculated: if the population is 1,000,000 on Jan 1, 2020 and 1,100,000 on Jan 1, 2021, the year-over-year change is (1,100,000 − 1,000,000) ÷ 1,000,000 = <b>+10%</b>.",14,R.ex,13,"#4a5058");
+    let data=[];const res=[];const tickW=[0,0];
+    // x ticks on the quarterly dates, always including the first and last date of the window
+    const qs=Q.filter(t=>t>=w.r0&&t<=w.r1),maxT=Math.max(5,Math.floor(pw/62));
+    let k=1;while(Math.ceil((qs.length-1)/k)+1>maxT)k=[1,2,4,8,12,16][[1,2,4,8,12,16].indexOf(k)+1]||k+4;
+    const tv=[];for(let j=qs.length-1;j>=0;j-=k)tv.unshift(qs[j]);if(tv[0]!==qs[0]){if((tv[0]-qs[0])<k*0.5*91*864e5)tv.shift();tv.unshift(qs[0])}
+    codes.forEach((c,i)=>{const sfx=i?"2":"",B={x0:M.l+doms[i][0]*pw,x1:M.l+doms[i][1]*pw,y0:M.t,y1:H-M.b,maxLen:340};
+      const yr=pct?shared:yRange(ranges[i],false);
+      const P=buildPanel(c,B,sfx,yr,false);res.push(P);data=data.concat(P.data);layout.annotations=layout.annotations.concat(P.ann);
+      layout["xaxis"+sfx]={domain:doms[i],anchor:"y"+sfx,range:[iso(w.r0),iso(w.r1)],showgrid:false,ticks:"outside",fixedrange:true,
+        tickformat:"%b<br>%Y",tickmode:"array",tickvals:tv.map(iso),title:{text:"Date",font:{size:13,color:"#4a5058"}}};
+      layout["yaxis"+sfx]={domain:[0,1],anchor:"x"+sfx,range:[yr[0],yr[1]],tickformat:pct?".1%":(yr[2]>=1e6&&(yr[1]-yr[0])/yr[2]>0.06?".3s":",.0f"),
+        gridcolor:"#e3e6e9",zeroline:pct,zerolinecolor:"#9aa1a8",fixedrange:true,
+        title:{text:pct?"% change, year over year":"Population",font:{size:13,color:"#4a5058"}}};
+      tickW[i]=Math.max(...[yr[0],yr[1]].map(v=>tw(pct?(v*100).toFixed(1)+"%":(yr[2]>=1e6&&(yr[1]-yr[0])/yr[2]>0.06?(v/1e6).toFixed(1)+"M":Math.round(v).toLocaleString("en-CA")),false)));
+    });
+    // footer: build date and what the estimates are
+    head(foot.join("<br>"),14,H-8,11.5,"#7d848c",{yanchor:"bottom"});
+    // a rule under the header
+    layout.shapes.push({type:"line",xref:"paper",yref:"paper",x0:PX(14),x1:PX(W-14),y0:PY(R.legend-6),y1:PY(R.legend-6),line:{color:"#eceef0",width:1}});
+    Plotly.react(el,data,layout,{displaylogo:false,displayModeBar:false});
+    // download buttons: bottom-right corner of the chart, beside the footer
+    const dl=document.getElementById("dl");if(dl){dl.style.top=(el.offsetTop+H-36)+"px";dl.style.left=(el.offsetLeft+W-dl.offsetWidth-14)+"px"}
+    lastFile="population-"+codes.join("-")+"-"+mode+(w.full?"":"-"+iso(w.qa).slice(0,7)+"-to-"+iso(w.qb).slice(0,7));
+    renderList(res);syncControls();
+  }
+  function renderList(res){
+    const placed=new Set(),fails=new Set(),onChart=new Set();
+    res.forEach(P=>{P.placedIds.forEach(i=>placed.add(i));P.fails.forEach(i=>{if(!placed.has(i))fails.add(i)});P.vis.forEach(o=>onChart.add(o.s.id))});
+    const L=document.getElementById("list");let h="",yr="";
+    visibleStories().sort((a,b)=>a.ms-b.ms).forEach(s=>{const y=new Date(s.ms).getUTCFullYear();
+      if(y!==yr){yr=y;h+="<div class=\"yr\">"+y+"</div>"}
+      h+="<label class=\"it"+(fails.has(s.id)&&!placed.has(s.id)?" nofit":"")+"\"><input type=\"checkbox\" data-id=\""+s.id+"\""+(sel.has(s.id)?" checked":"")+">"+
+        "<span><span class=\"m\"><span class=\"scope "+(national(s)?"nat":"prov")+"\">"+scopeOf(s)+"</span>"+s.src+" · "+s.d+" · "+s.type.toLowerCase()+" · <a href=\""+s.url+"\" target=\"_blank\">open ↗</a></span>"+esc(s.h)+
+        "<span class=\"nr\">No free space on the chart</span>"+(!onChart.has(s.id)?"<span class=\"pre\">Not on this view: year-over-year values start in "+yoyStart()+"</span>":"")+"</span></label>"});
+    L.innerHTML=h||"<div class=\"empty\">No stories match these filters. Tick more sources or kinds of story, or widen the date window.</div>";
+    L.querySelectorAll("input").forEach(c=>c.addEventListener("change",()=>{const id=+c.dataset.id;c.checked?sel.add(id):sel.delete(id);draw()}));
+    const n=visibleStories().length;
+    document.getElementById("count").textContent=placed.size+" of "+n+" headlines on the chart"+(fails.size?" · "+fails.size+" without free space (red-ringed dots)":"");
+  }
+  function syncControls(){
+    document.querySelectorAll("#mode button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===mode));
+    document.getElementById("geo").value=geo;{const w=win(),opts=QQ().map(t=>"<option value=\""+iso(t)+"\">"+fmtQ(t)+"</option>").join("");
+      ["d0","d1"].forEach(id=>{const e=document.getElementById(id);if(e.dataset.m!==mode){e.innerHTML=opts;e.dataset.m=mode}});
+      document.getElementById("d0").value=iso(w.qa);document.getElementById("d1").value=iso(w.qb)}
+    document.querySelectorAll(".src").forEach(c=>{c.checked=srcOn.has(c.value)});
+    document.querySelectorAll(".kind").forEach(c=>{c.checked=kindOn.has(c.value)});
+    document.querySelectorAll(".flt .n").forEach(n=>{n.textContent=G.stories.filter(s=>inGeo(s,geo)&&s.src===n.dataset.key&&kindOn.has(kindOf(s))).length});
+    store.set("pophl4-geo",geo);store.set("pophl4-mode",mode);
+    store.set("pophl4-sel",JSON.stringify([...sel]));store.set("pophl4-src",JSON.stringify([...srcOn]));store.set("pophl4-kind",JSON.stringify([...kindOn]));
+  }
+  // ---- downloads
+  function saveBlob(blob,name){const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();
+    setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000)}
+  document.getElementById("b-jpg").onclick=()=>{Plotly.downloadImage(el,{format:"jpeg",width:W,height:H,scale:2,filename:lastFile})};
+  document.getElementById("b-csv").onclick=()=>{
+    const q=v=>"\""+String(v).replace(/"/g,"\"\"")+"\"";
+    const rows=[["date_published","date_precision","scope","region","region_code","source","type","headline","link"]];
+    G.stories.slice().sort((a,b)=>a.ms-b.ms).forEach(s=>rows.push([iso(s.ms),s.exact?"day":"month",scopeOf(s),s.geo==="ALL"?"All regions (national release)":geos[s.geo].name,s.geo,s.src,s.type,s.h,s.url]));
+    saveBlob(new Blob(["﻿"+rows.map(r=>r.map(q).join(",")).join("\r\n")],{type:"text/csv;charset=utf-8"}),"population-headlines-references.csv")};
+  // all population data: every region and quarter, with the year-over-year change worked out
+  document.getElementById("b-data").onclick=()=>{
+    const q=v=>"\""+String(v).replace(/"/g,"\"\"")+"\"",n=v=>Math.round(v).toLocaleString("en-CA");
+    const rows=[["date","geography","population","population_1_year_ago","yoy_pct_change","calculation"]];
+    G.geos.forEach(g=>g.ms.forEach((t,i)=>{const d=new Date(t),v=g.v[i];
+      const j=g.ms.findIndex(u=>{const a=new Date(u);return a.getUTCFullYear()===d.getUTCFullYear()-1&&a.getUTCMonth()===d.getUTCMonth()});
+      if(j<0){rows.push([iso(t),g.name,v,"","",""]);return}
+      const p=g.v[j],pc=(v-p)/p*100,sg=pc>=0?"+":"";
+      rows.push([iso(t),g.name,v,p,pc.toFixed(2),"("+n(v)+" - "+n(p)+") / "+n(p)+" = "+sg+pc.toFixed(2)+"%"])}));
+    saveBlob(new Blob(["\ufeff"+rows.map(r=>r.map(q).join(",")).join("\r\n")],{type:"text/csv;charset=utf-8"}),"population-data-statcan-17-10-0009-01.csv")};
+  // ---- controls
+  document.getElementById("geo").addEventListener("change",e=>{geo=e.target.value;pickIfNone();draw()});
+  document.getElementById("d0").addEventListener("change",e=>{d0=e.target.value;draw()});
+  document.getElementById("d1").addEventListener("change",e=>{d1=e.target.value;draw()});
+  document.getElementById("b-dall").onclick=()=>{d0="";d1="";draw()};
+  document.querySelectorAll("#mode button").forEach(b=>b.addEventListener("click",()=>{mode=b.dataset.m;pickIfNone();draw()}));
+  document.querySelectorAll(".src").forEach(c=>c.addEventListener("change",()=>{c.checked?srcOn.add(c.value):srcOn.delete(c.value);draw()}));
+  document.querySelectorAll(".kind").forEach(c=>c.addEventListener("change",()=>{c.checked?kindOn.add(c.value):kindOn.delete(c.value);draw()}));
+  // five random headlines, each from a different year, among the stories that can be shown now
+  function pick5(){const v=visibleStories();v.forEach(s=>sel.delete(s.id));const by={};
+    v.forEach(s=>{const y=new Date(s.ms).getUTCFullYear();(by[y]=by[y]||[]).push(s)});
+    const ys=Object.keys(by);for(let i=ys.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[ys[i],ys[j]]=[ys[j],ys[i]]}
+    ys.slice(0,5).forEach(y=>{const a=by[y];sel.add(a[Math.floor(Math.random()*a.length)].id)})}
+  const pickIfNone=()=>{if(!visibleStories().some(s=>sel.has(s.id)))pick5()};
+  document.getElementById("b-reset").onclick=()=>{pick5();draw()};
+  document.getElementById("b-all").onclick=()=>{visibleStories().forEach(s=>sel.add(s.id));draw()};
+  document.getElementById("b-none").onclick=()=>{visibleStories().forEach(s=>sel.delete(s.id));draw()};
+  pick5();
+  el.on("plotly_click",d=>{const u=d.points[0].customdata;if(u)window.open(u,"_blank")});
+  draw();
+}
+)---"
+
+fig <- fig %>% onRender(js, data = G)
+fig <- prependContent(fig, css, panel)
+fig <- appendContent(fig, dl)
+fig$sizingPolicy$browser$fill <- FALSE
+fig$sizingPolicy$browser$padding <- 0
+fig$sizingPolicy$defaultWidth <- G$W
+fig$sizingPolicy$defaultHeight <- G$H
+saveWidget(fig, out_file, selfcontained = TRUE, title = "Canada's Population in the Headlines")
+message("Saved ", normalizePath(out_file))
+if (interactive()) browseURL(normalizePath(out_file))   # open the new page straight away
