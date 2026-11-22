@@ -1,0 +1,118 @@
+read_msg <- function(path) {
+  b   <- readBin(path, "raw", file.size(path))
+  int <- function(x) readBin(x, "integer", length(x) / 4)
+
+  # File = 512-byte header + sectors; tables say which block comes next
+  hdr    <- int(b[1:512])
+  size   <- 2^as.integer(b[31])
+  sector <- function(n) b[size * (n + 1) + 1:size]
+  chain  <- function(n, table) { out <- c(); while (n >= 0) { out <- c(out, n); n <- table[n + 1] }; out }
+  fat    <- int(unlist(lapply(hdr[20:128][hdr[20:128] >= 0], sector)))
+  big    <- function(n) unlist(lapply(chain(n, fat), sector))
+
+  # Directory: one 128-byte entry per item
+  dir   <- matrix(big(hdr[13]), 128)
+  field <- function(i) int(dir[i + 1:4, ])
+  name  <- apply(dir[seq(1, 63, 2), ], 2, function(x) rawToChar(x[x != 0]))
+  left  <- field(68); right <- field(72); child <- field(76); start <- field(116); len <- field(120)
+
+  # Small items live in 64-byte blocks
+  mini    <- big(start[1])
+  minifat <- int(big(hdr[16]))
+  small   <- function(n) unlist(lapply(chain(n, minifat), function(k) mini[64 * k + 1:64]))
+
+  # Read an item by name from a folder (folder 1 = the email itself)
+  walk <- function(i) if (i >= 0) c(i + 1, walk(left[i + 1]), walk(right[i + 1]))
+  item <- function(nm, folder = 1) {
+    ids <- walk(child[folder]); i <- ids[name[ids] == nm]
+    if (length(i) == 0) return(raw(0))
+    (if (len[i] < 4096) small(start[i]) else big(start[i]))[1:len[i]]
+  }
+  text <- function(id, folder = 1) {
+    x <- item(paste0("__substg1.0_", id, "001F"), folder)
+    if (length(x) == 0) return(NA_character_)
+    x <- iconv(list(x), "UTF-16LE", "UTF-8", toRaw = TRUE)[[1]]
+    x <- rawToChar(x[x != 0]); Encoding(x) <- "UTF-8"; x
+  }
+  prop <- function(tag, folder = 1, skip = 32) {
+    p <- matrix(int(item("__properties_version1.0", folder)[-(1:skip)]), 4)
+    p[3:4, which(p[1, ] == tag)[1]]
+  }
+
+  or <- function(a, b) if (is.na(a)) b else a   # first one that exists
+
+  # Sent date (Windows timestamp)
+  d <- prop(0x00390040)
+  date <- as.POSIXct((d[2] * 2^32 + d[1] %% 2^32) / 1e7 - 11644473600, origin = "1970-01-01", tz = "UTC")
+
+  # Recipients: one folder each; type 1 = To, 2 = CC
+  r     <- walk(child[1]); r <- r[startsWith(name[r], "__recip")]
+  type  <- vapply(r, function(f) prop(0x0C150003, f, 8)[1], 1L)
+  email <- vapply(r, function(f) or(text("39FE", f), text("3003", f)), "")
+
+  list(date       = date,
+       from       = text("0C1A"),
+       from_email = or(text("5D01"), text("0C1F")),
+       to         = text("0E04"),
+       to_email   = email[type == 1],
+       cc         = text("0E03"),
+       cc_email   = email[type == 2],
+       subject    = text("0037"),
+       body       = text("1000"))
+}
+
+
+# Read a .txt or .sql file, whichever common encoding it was saved in
+read_text <- function(path) {
+  b <- readBin(path, "raw", file.size(path))
+  if (length(b) >= 2 && b[1] == as.raw(0xFF) && b[2] == as.raw(0xFE)) {
+    x <- iconv(list(b[-(1:2)]), "UTF-16LE", "UTF-8")          # UTF-16 (e.g. saved by SSMS)
+  } else if (validUTF8(rawToChar(b))) {
+    x <- iconv(list(b), "UTF-8", "UTF-8")                      # UTF-8
+  } else {
+    x <- iconv(list(b), "CP1252", "UTF-8")                     # older Windows files
+  }
+  sub("^\ufeff", "", x)                                        # drop UTF-8 marker if present
+}
+
+files_to_txt <- function(folder, out = file.path(folder, "combined.txt")) {
+  files <- list.files(folder, pattern = "\\.(msg|sql|txt)$", recursive = TRUE,
+                      full.names = TRUE, ignore.case = TRUE)
+  files <- files[normalizePath(files) != normalizePath(out, mustWork = FALSE)]  # skip the output file
+  blocks <- character(length(files))
+
+  for (i in seq_along(files)) {
+    f      <- files[i]
+    header <- sprintf("==================== Item %d of %d ====================", i, length(files))
+
+    blocks[i] <- tryCatch({
+      if (grepl("\\.msg$", f, ignore.case = TRUE)) {
+        e <- read_msg(f)
+        paste(
+          header,
+          paste("Path:     ", f),
+          paste("Date:     ", format(e$date, tz = "America/Toronto", usetz = TRUE)),
+          paste0("From:      ", e$from, " <", e$from_email, ">"),
+          paste("To:       ", e$to),
+          paste("To email: ", paste(e$to_email, collapse = "; ")),
+          paste("CC:       ", e$cc),
+          paste("CC email: ", paste(e$cc_email, collapse = "; ")),
+          paste("Subject:  ", e$subject),
+          "",
+          "Body:",
+          e$body,
+          sep = "\n")
+      } else {
+        paste(header, paste("Path:     ", f), "", "Contents:", read_text(f), sep = "\n")
+      }
+    }, error = function(err) paste(header, paste("Path:     ", f), "Could not read this file.", sep = "\n"))
+  }
+
+  # Windows line breaks + UTF-8 marker so Notepad shows accents correctly
+  txt <- gsub("\r?\n", "\r\n", paste(blocks, collapse = "\n\n\n"))
+  writeBin(c(as.raw(c(0xEF, 0xBB, 0xBF)), charToRaw(enc2utf8(txt))), out)
+  cat(length(files), "files written to", out, "\n")
+}
+
+# ---- Run it ----
+files_to_txt("")
