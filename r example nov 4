@@ -1,0 +1,246 @@
+read_msg <- function(path) {
+  b   <- readBin(path, "raw", file.size(path))
+  int <- function(x) readBin(x, "integer", length(x) / 4)
+
+  # File = 512-byte header + sectors; tables say which block comes next
+  hdr    <- int(b[1:512])
+  size   <- 2^as.integer(b[31])
+  sector <- function(n) b[size * (n + 1) + 1:size]
+  chain  <- function(n, table) { out <- c(); while (n >= 0) { out <- c(out, n); n <- table[n + 1] }; out }
+  fat    <- int(unlist(lapply(hdr[20:128][hdr[20:128] >= 0], sector)))
+  big    <- function(n) unlist(lapply(chain(n, fat), sector))
+
+  # Directory: one 128-byte entry per item
+  dir   <- matrix(big(hdr[13]), 128)
+  field <- function(i) int(dir[i + 1:4, ])
+  name  <- apply(dir[seq(1, 63, 2), ], 2, function(x) rawToChar(x[x != 0]))
+  left  <- field(68); right <- field(72); child <- field(76); start <- field(116); len <- field(120)
+
+  # Small items live in 64-byte blocks
+  mini    <- big(start[1])
+  minifat <- int(big(hdr[16]))
+  small   <- function(n) unlist(lapply(chain(n, minifat), function(k) mini[64 * k + 1:64]))
+
+  # Read an item by name from a folder (folder 1 = the email itself)
+  walk <- function(i) if (i >= 0) c(i + 1, walk(left[i + 1]), walk(right[i + 1]))
+  item <- function(nm, folder = 1) {
+    ids <- walk(child[folder]); i <- ids[name[ids] == nm]
+    if (length(i) == 0) return(raw(0))
+    (if (len[i] < 4096) small(start[i]) else big(start[i]))[1:len[i]]
+  }
+  text <- function(id, folder = 1) {
+    x <- item(paste0("__substg1.0_", id, "001F"), folder)
+    if (length(x) == 0) return(NA_character_)
+    x <- iconv(list(x), "UTF-16LE", "UTF-8", toRaw = TRUE)[[1]]
+    x <- rawToChar(x[x != 0]); Encoding(x) <- "UTF-8"; x
+  }
+  prop <- function(tag, folder = 1, skip = 32) {
+    p <- matrix(int(item("__properties_version1.0", folder)[-(1:skip)]), 4)
+    p[3:4, which(p[1, ] == tag)[1]]
+  }
+
+  or <- function(a, b) if (is.na(a)) b else a   # first one that exists
+
+  # Sent date (Windows timestamp)
+  d <- prop(0x00390040)
+  date <- as.POSIXct((d[2] * 2^32 + d[1] %% 2^32) / 1e7 - 11644473600, origin = "1970-01-01", tz = "UTC")
+
+  # Recipients: one folder each; type 1 = To, 2 = CC
+  r     <- walk(child[1]); r <- r[startsWith(name[r], "__recip")]
+  type  <- vapply(r, function(f) prop(0x0C150003, f, 8)[1], 1L)
+  email <- vapply(r, function(f) or(text("39FE", f), text("3003", f)), "")
+
+  list(date       = date,
+       from       = text("0C1A"),
+       from_email = or(text("5D01"), text("0C1F")),
+       to         = text("0E04"),
+       to_email   = email[type == 1],
+       cc         = text("0E03"),
+       cc_email   = email[type == 2],
+       subject    = text("0037"),
+       body       = text("1000"))
+}
+
+
+# Read a .txt or .sql file, whichever common encoding it was saved in
+read_text <- function(path) {
+  b <- readBin(path, "raw", file.size(path))
+  if (length(b) >= 2 && b[1] == as.raw(0xFF) && b[2] == as.raw(0xFE)) {
+    x <- iconv(list(b[-(1:2)]), "UTF-16LE", "UTF-8")          # UTF-16 (e.g. saved by SSMS)
+  } else if (validUTF8(rawToChar(b))) {
+    x <- iconv(list(b), "UTF-8", "UTF-8")                      # UTF-8
+  } else {
+    x <- iconv(list(b), "CP1252", "UTF-8")                     # older Windows files
+  }
+  sub("^\ufeff", "", x)                                        # drop UTF-8 marker if present
+}
+
+# Search one folder at a time, printing progress every `every` folders.
+# Each folder is listed only once (fewer trips over the network).
+# Links/junctions to other folders are not followed (they may lead outside
+# the main folder, to places you can't open, or loop back on themselves).
+# max_depth: 0 = main folder only, 1 = + subfolders, 2 = + sub-subfolders, ...
+find_files <- function(folder, pattern = "\\.(msg|sql|txt)$", every = 100, max_depth = Inf) {
+  todo   <- folder           # folders still to look in
+  depth  <- 0                # how deep each of those folders is
+  n_deep <- 0                # folders not searched because of max_depth
+  files  <- character(0)
+  n_dirs <- 0
+  start  <- Sys.time()
+  while (length(todo) > 0) {
+    d     <- todo[1]
+    lvl   <- depth[1]
+    todo  <- todo[-1]
+    depth <- depth[-1]
+    all   <- list.files(d, full.names = TRUE, include.dirs = TRUE)   # everything in this folder
+    isdir <- dir.exists(all)
+    files <- c(files, all[!isdir & grepl(pattern, all, ignore.case = TRUE)])
+
+    subs <- all[isdir]
+    if (lvl >= max_depth) {
+      n_deep <- n_deep + length(subs)          # too deep: don't go into these
+    } else {
+      # A subfolder is a link if its real location isn't where it appears to be
+      real <- normalizePath(subs, winslash = "/", mustWork = FALSE)
+      link <- real != paste0(normalizePath(d, winslash = "/"), "/", basename(subs))
+      if (any(link)) cat(paste("        skipped link:", subs[link]), sep = "\n")
+      todo  <- c(subs[!link], todo)
+      depth <- c(rep(lvl + 1, sum(!link)), depth)
+    }
+
+    n_dirs <- n_dirs + 1
+    if (n_dirs %% every == 0) {
+      cat(sprintf("%7d folders  %7d files  %6.1f s  %s\n", n_dirs, length(files),
+                  as.numeric(difftime(Sys.time(), start, units = "secs")), d))
+      flush.console()
+    }
+  }
+  cat(sprintf("%7d folders  %7d files  done\n", n_dirs, length(files)))
+  if (n_deep > 0) cat(sprintf("        %d deeper folders not searched (max_depth = %g)\n", n_deep, max_depth))
+  files
+}
+
+files_to_txt <- function(folder, out = file.path(getwd(), "combined.txt"),
+                         max_mb = 0.1,        # skip .txt/.sql files bigger than this
+                         max_mb_msg = 20,     # skip emails bigger than this (size includes attachments)
+                         max_depth = Inf,
+                         file_list = file.path(getwd(), "file_list.rds"),   # where step 1 is saved
+                         rescan = FALSE) {    # TRUE = ignore the saved list and search again
+  start <- Sys.time()
+
+  # ---- Step 1: find files (or reuse the list saved last time) ----
+  saved <- if (!rescan && file.exists(file_list)) readRDS(file_list)
+  if (!is.null(saved) && identical(saved$folder, folder) && identical(saved$max_depth, max_depth)) {
+    files <- saved$files
+    cat("Step 1/3: using saved file list from", format(saved$time, "%Y-%m-%d %H:%M"),
+        "-", length(files), "files (rescan = TRUE to search again)\n\n"); flush.console()
+  } else {
+    cat("Step 1/3: searching", folder, "\n"); flush.console()
+    files <- find_files(folder, max_depth = max_depth)
+    files <- files[normalizePath(files, "/", FALSE) != normalizePath(out, "/", FALSE)]  # never read our own output
+    saveRDS(list(folder = folder, max_depth = max_depth, time = Sys.time(), files = files), file_list)
+    cat("Found", length(files), "files - list saved to", file_list, "\n\n"); flush.console()
+  }
+
+  # ---- Step 2: read each file ----
+  cat("Step 2/3: reading files\n"); flush.console()
+  blocks <- character(length(files))
+  status <- character(length(files))   # "read", "too big", "no access", "error"
+  for (i in seq_along(files)) {
+    f      <- files[i]
+    is_msg <- grepl("\\.msg$", f, ignore.case = TRUE)
+    limit  <- if (is_msg) max_mb_msg else max_mb
+    mb     <- file.size(f) / 1e6
+    header <- sprintf("==================== Item %d of %d ====================", i, length(files))
+    path   <- paste("Path:     ", f)
+    cat(sprintf("[%d/%d] %.2f MB  %s\n", i, length(files), mb, f)); flush.console()
+
+    if (is.na(mb)) {                    # can't open: no permission, path too long, or file moved
+      cat("        skipped (cannot open)\n")
+      blocks[i] <- paste(header, path, "Skipped: cannot open this file (no access, path too long, or moved).", sep = "\n")
+      status[i] <- "no access"
+      next
+    }
+    if (mb > limit) {
+      cat("        skipped (too big)\n")
+      blocks[i] <- paste(header, path, sprintf("Skipped: file is %.2f MB (limit %g MB).", mb, limit), sep = "\n")
+      status[i] <- "too big"
+      next
+    }
+
+    blocks[i] <- tryCatch({
+      status[i] <- "read"
+      if (is_msg) {
+        e <- read_msg(f)
+        paste(
+          header,
+          path,
+          paste("Date:     ", format(e$date, tz = "America/Toronto", usetz = TRUE)),
+          paste0("From:      ", e$from, " <", e$from_email, ">"),
+          paste("To:       ", e$to),
+          paste("To email: ", paste(e$to_email, collapse = "; ")),
+          paste("CC:       ", e$cc),
+          paste("CC email: ", paste(e$cc_email, collapse = "; ")),
+          paste("Subject:  ", e$subject),
+          "",
+          "Body:",
+          e$body,
+          sep = "\n")
+      } else {
+        paste(header, path, "", "Contents:", read_text(f), sep = "\n")
+      }
+    }, error = function(err) {
+      cat("        could not read:", conditionMessage(err), "\n")
+      status[i] <<- "error"
+      paste(header, path, "Could not read this file.", sep = "\n")
+    })
+  }
+
+  # ---- Step 3: write the result ----
+  cat("\nStep 3/3: writing", out, "\n"); flush.console()
+  txt <- gsub("\r?\n", "\r\n", paste(blocks, collapse = "\n\n\n"))   # Windows line breaks
+  writeBin(c(as.raw(c(0xEF, 0xBB, 0xBF)), charToRaw(enc2utf8(txt))), out)   # UTF-8 so Notepad shows accents
+
+  cat(sprintf("Done in %.1f seconds: %d read, %d too big, %d could not open, %d errors\n",
+              as.numeric(difftime(Sys.time(), start, units = "secs")),
+              sum(status == "read"), sum(status == "too big"),
+              sum(status == "no access"), sum(status == "error")))
+  cat("Saved to", out, "\n")
+}
+
+# ---- Run it ----
+getwd()                                   # this is where combined.txt will be saved
+files_to_txt("", max_mb = 0.1, max_mb_msg = 20)
+# files_to_txt("", max_depth = 2)   # only down to sub-subfolders
+# files_to_txt("", rescan = TRUE)   # search again instead of using the saved list
+
+# ---- Optional: split combined.txt into smaller parts ----
+# Saves part1.txt, part2.txt, ... in the working directory. Each part is at most
+# `mb` megabytes; the last part holds the remainder. Parts end at a line break.
+split_file <- function(file = file.path(getwd(), "combined.txt"), mb = 1) {
+  b <- readBin(file, "raw", file.size(file))
+  if (length(b) >= 3 && all(b[1:3] == as.raw(c(0xEF, 0xBB, 0xBF)))) b <- b[-(1:3)]  # drop UTF-8 marker
+  limit <- mb * 1024^2
+  nl    <- which(b == as.raw(0x0A))           # positions of line breaks
+  start <- 1
+  part  <- 0
+  while (start <= length(b)) {
+    end <- min(start + limit - 1, length(b))
+    if (end < length(b)) {
+      k <- findInterval(end, nl)              # last line break that fits
+      if (k > 0 && nl[k] >= start) {
+        end <- nl[k]
+      } else {                                # one very long line: don't cut a letter in half
+        while (end > start && as.integer(b[end + 1]) %/% 64 == 2) end <- end - 1
+      }
+    }
+    part <- part + 1
+    out  <- file.path(getwd(), paste0("part", part, ".txt"))
+    writeBin(c(as.raw(c(0xEF, 0xBB, 0xBF)), b[start:end]), out)
+    cat(sprintf("part%d.txt  %.2f MB\n", part, (end - start + 1) / 1024^2)); flush.console()
+    start <- end + 1
+  }
+  cat(part, "parts saved in", getwd(), "\n")
+}
+
+# split_file(mb = 1)      # remove the # at the start of this line to split into 1 MB parts
