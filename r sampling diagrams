@@ -1,0 +1,281 @@
+# =============================================================================
+# Sampling and checking: how to spend a fixed number of checks
+#
+# Pages produced (all 13.333 x 7.5 in, 16:9 slides):
+#   page1_wider_vs_deeper.png   panel: 8 people x 1 ball  vs  4 people x 2 balls
+#   page2_once_vs_twice.png     panel: same 4 people x 2 balls; each ball seen
+#                                       by 1 person vs by 2 people
+#   page3_wider.png             full page: wider sampling   (8 people, 1 ball each)
+#   page4_deeper.png            full page: deeper sampling  (4 people, 2 balls each, shared)
+#   page5_seen_once.png         full page: 4 people, 2 different balls each
+#   page6_seen_twice.png        full page: 4 people, 2 shared balls each
+#   all_pages.pdf               all six pages in order
+#
+# Every diagram:  Population (jar)  |  Sample (jar)  |  People
+#   - solid arrows from each drawn ball (green ring) to the sample jar
+#   - dotted arrows from each sample ball to the person(s) who check it
+#   - black person icons with their balls beside them; every ball shows #n
+# ONE jar and ONE random sample are used on every page: the 8-ball sample is
+# drawn once, and the 4-ball sample is a random half of it.
+#
+# Base R only (grid + grDevices). Nothing to install.
+# Files are saved in getwd(); designs are printed and kept in `designs`;
+# pages are drawn in the Plots pane when run interactively.
+# =============================================================================
+
+library(grid)
+
+# ---- settings ---------------------------------------------------------------
+SEED      <- 42
+N_POP     <- 100
+N_WIDE    <- 8          # balls in the bigger sample  (each seen once)
+N_DEEP    <- 4          # balls in the smaller sample (each seen twice)
+OUT_DIR   <- getwd()
+PNG_DPI   <- 200
+FONT      <- "sans"
+SHOW_IN_R <- TRUE
+
+JAR_COLS <- 10; JAR_ROWS <- 10                   # 10 x 10 = 100, every slot holds a ball
+stopifnot(JAR_COLS * JAR_ROWS == N_POP, N_WIDE <= JAR_ROWS, N_DEEP <= N_WIDE)
+
+# ---- colours ----------------------------------------------------------------
+INK <- "#1B1D2A"; MUTED <- "#646A7D"; RULE <- "#9AA0B4"
+BALL_FILL <- "#A6C6F2"; BALL_LINE <- "#4C7CC2"; PICKED <- "#00D639"
+GLASS <- "#EAF1F8"; GLASS_LINE <- "#9FB4CC"; LID <- "#646A7D"
+ARROW_COL <- "#3A3F52"; PERSON_COL <- "#000000"; PANEL_BG <- "#F7F8FB"
+
+# =============================================================================
+# ONE JAR, ONE SAMPLE (used on every page)
+# =============================================================================
+set.seed(SEED)
+drawn_wide <- sample(seq_len(N_POP), N_WIDE)        # simple random sample, no repeats
+drawn_deep <- sample(drawn_wide, N_DEEP)             # random subset: still a random sample of the jar
+
+# Ball positions in the jar are arbitrary (the jar is mixed). Put the drawn
+# balls in different rows so that no two arrows ever share a row.
+slot_row <- integer(N_POP); slot_col <- integer(N_POP)
+rows_used <- sample(seq_len(JAR_ROWS), N_WIDE)
+taken <- matrix(FALSE, JAR_ROWS, JAR_COLS)
+for (i in seq_len(N_WIDE)) {
+  cc <- sample(seq_len(JAR_COLS), 1)
+  slot_row[drawn_wide[i]] <- rows_used[i]; slot_col[drawn_wide[i]] <- cc; taken[rows_used[i], cc] <- TRUE
+}
+free   <- which(!taken, arr.ind = TRUE); free <- free[sample(nrow(free)), , drop = FALSE]
+others <- setdiff(seq_len(N_POP), drawn_wide)
+slot_row[others] <- free[seq_along(others), 1]; slot_col[others] <- free[seq_along(others), 2]
+
+order_wide <- drawn_wide[order(slot_row[drawn_wide])]   # sample jar order = top to bottom of the jar
+order_deep <- drawn_deep[order(slot_row[drawn_deep])]
+
+# =============================================================================
+# DESIGNS: who checks which ball
+#   checks_per_ball = 1 : person k gets the next per_person balls (nobody shares)
+#   checks_per_ball = 2 : people work in pairs; both people in a pair get the same balls
+# =============================================================================
+make_design <- function(ord, n_people, per_person, checks_per_ball) {
+  if (checks_per_ball == 1) {
+    stopifnot(length(ord) == n_people * per_person)
+    assign <- lapply(seq_len(n_people), function(k) ord[((k - 1) * per_person + 1):(k * per_person)])
+    group  <- rep(seq_len(n_people), each = per_person)
+  } else {
+    stopifnot(checks_per_ball == 2, n_people %% 2 == 0, length(ord) == n_people / 2 * per_person)
+    assign <- lapply(seq_len(n_people), function(k) { g <- (k - 1) %/% 2
+      ord[(g * per_person + 1):((g + 1) * per_person)] })
+    group  <- rep(seq_len(n_people / 2), each = per_person)
+  }
+  names(assign) <- paste("Person", LETTERS[seq_len(n_people)])
+  stopifnot(all(table(unlist(assign)) == checks_per_ball))
+  list(ord = ord, assign = assign, group = group,
+       n_people = n_people, per_person = per_person, checks_per_ball = checks_per_ball,
+       checks = n_people * per_person)
+}
+designs <- list(
+  wider       = make_design(order_wide, 8, 1, 1),   # 8 people, 1 ball each, each ball seen once
+  deeper      = make_design(order_deep, 4, 2, 2),   # 4 people, 2 shared balls each, each ball seen twice
+  seen_once   = make_design(order_wide, 4, 2, 1),   # 4 people, 2 different balls each, each ball seen once
+  seen_twice  = make_design(order_deep, 4, 2, 2))   # same as `deeper`, shown in the once-vs-twice comparison
+stopifnot(length(unique(sapply(designs, `[[`, "checks"))) == 1)      # same number of checks everywhere
+N_CHECKS <- designs$wider$checks
+
+for (nm in names(designs)) {
+  d <- designs[[nm]]
+  cat(sprintf("\n===== %s: population = %d, sample = %d, people = %d, checks = %d =====\n",
+              nm, N_POP, length(d$ord), d$n_people, d$checks))
+  print(data.frame(person = names(d$assign),
+                   balls = sapply(d$assign, function(a) paste0("#", a, collapse = ", ")), row.names = NULL),
+        row.names = FALSE)
+}
+
+# =============================================================================
+# DRAWING HELPERS (inches from the TOP-LEFT of a 13.333 x 7.5 in page)
+# =============================================================================
+W <- 13.333; H <- 7.5
+X <- function(x) unit(x, "in"); Y <- function(y) unit(H - y, "in"); IN <- function(v) unit(v, "in")
+PT <- function(pt) pt / 0.75
+
+text_w <- function(label, size, bold = FALSE)
+  convertWidth(grobWidth(textGrob(label, gp = gpar(fontsize = size, fontfamily = FONT,
+               fontface = if (bold) "bold" else "plain"))), "in", valueOnly = TRUE)
+# text that shrinks (never grows) until it fits its box
+txt <- function(label, x, y, w, h, size = 12, bold = FALSE, col = INK, align = "center", pad = 0.03) {
+  label <- as.character(label)
+  tw <- text_w(label, size, bold); if (tw > w - 2 * pad) size <- size * (w - 2 * pad) / tw
+  size <- min(size, 72 * h / 1.05)
+  hx <- switch(align, left = x, center = x + w / 2, right = x + w)
+  grid.text(label, X(hx), Y(y + h / 2), just = c(if (align == "center") "centre" else align, "centre"),
+            gp = gpar(fontsize = size, fontface = if (bold) "bold" else "plain", col = col, fontfamily = FONT))
+}
+rbox <- function(x, y, w, h, fill, line = NA, lwd_pt = 1, r = 0.15)
+  grid.roundrect(X(x), Y(y), IN(w), IN(h), r = IN(r), just = c("left", "top"),
+                 gp = gpar(fill = fill, col = line, lwd = PT(lwd_pt)))
+vline <- function(x, y0, y1) grid.segments(X(x), Y(y0), X(x), Y(y1), gp = gpar(col = RULE, lwd = PT(1.2)))
+ball <- function(cx, cy, d, num, ring = FALSE) {
+  grid.circle(X(cx), Y(cy), IN(d / 2), gp = gpar(fill = BALL_FILL, col = if (ring) PICKED else BALL_LINE,
+                                                 lwd = PT(if (ring) 2.2 else 0.5)))
+  txt(paste0("#", num), cx - d / 2, cy - d / 2, d, d, size = 26 * d, bold = TRUE, pad = d * 0.08)
+}
+jar <- function(x, y, w, h) {
+  rbox(x + w * 0.15, y - 0.17, w * 0.7, 0.12, LID, NA, r = 0.03)
+  rbox(x, y, w, h, GLASS, GLASS_LINE, 1.1, r = 0.15)
+}
+s_arrow <- function(x0, y0, x1, y1, col = ARROW_COL, lwd_pt = 1.3, lty = "solid") {
+  dx <- (x1 - x0) * 0.5
+  grid.bezier(X(c(x0, x0 + dx, x1 - dx, x1)), Y(c(y0, y0, y1, y1)),
+              arrow = arrow(angle = 22, length = unit(0.08, "in"), type = "closed"),
+              gp = gpar(col = col, fill = col, lwd = PT(lwd_pt), lty = lty))
+}
+person <- function(x, y, s = 1) {                    # solid black icon, top-left at (x, y); s = scale
+  w <- 0.36 * s; h <- 0.45 * s
+  grid.circle(X(x + w / 2), Y(y + 0.095 * s), IN(0.095 * s), gp = gpar(fill = PERSON_COL, col = NA))
+  grid.roundrect(X(x), Y(y + 0.22 * s), IN(w), IN(h - 0.22 * s), r = IN(0.1 * s), just = c("left", "top"),
+                 gp = gpar(fill = PERSON_COL, col = NA))
+  grid.rect(X(x), Y(y + 0.33 * s), IN(w), IN(h - 0.33 * s), just = c("left", "top"), gp = gpar(fill = PERSON_COL, col = NA))
+}
+
+# =============================================================================
+# ONE DIAGRAM inside a box (left edge x0, width pw). Works for half-page
+# panels (pw ~ 6.25) and full pages (pw ~ 12.7): everything scales with pw.
+# =============================================================================
+# TOP / SPAN = vertical room for jars and people (full pages get a little more)
+draw_diagram <- function(x0, pw, des, heading = NULL, note = NULL, TOP = 2.35, SPAN = 4.25) {
+  ord <- des$ord; assign <- des$assign; group <- des$group; n_people <- des$n_people
+  k  <- min(pw / 6.25, 1.6)                       # horizontal scale
+  ks <- min(k, 1.15)                              # scale for icons / people balls (limited by vertical room)
+
+  hy <- TOP - 0.73                                               # column headings sit just above the jars
+  box_top <- if (is.null(heading)) hy - 0.2 else 0.95             # no panel title -> box starts at the headings
+  rbox(x0, box_top, pw, 7.25 - box_top, PANEL_BG, "#E3E6EE", 1, r = 0.12)
+  if (!is.null(heading)) txt(heading, x0 + 0.15, 1.08, pw - 0.3, 0.38, 16, TRUE)
+
+  # population jar
+  rs <- SPAN / (JAR_ROWS - 1); cs <- 0.25 * k; d_pop <- min(cs * 0.94, rs * 0.8)
+  jx <- x0 + 0.12 * k; jw <- JAR_COLS * cs + 0.16
+  col_x <- function(c) jx + 0.08 + (c - 1) * cs + cs / 2
+  row_y <- function(r) TOP + (r - 1) * rs
+  # sample jar and people columns
+  D1 <- jx + jw + 0.15 * k; sx <- D1 + 0.5 * k; D2 <- sx + 0.5 * k
+  pb_d <- 0.36 * ks; pb_step <- 0.42 * ks                      # balls drawn beside each person
+  block_w <- 0.95 * ks + des$per_person * pb_step
+  ix <- D2 + max(0.75 * k, min((x0 + pw - D2 - block_w) / 2, 1.1 * k))   # people block near the sample, roughly centred
+
+  vline(D1, hy - 0.02, TOP + SPAN + 0.25); vline(D2, hy - 0.02, TOP + SPAN + 0.25)
+  hh <- 0.3; hs <- 12.5 * min(k, 1.3)
+  txt(sprintf("Population = %d", N_POP), x0 + 0.05, hy, D1 - x0 - 0.1, hh, hs, TRUE)
+  txt(sprintf("Sample = %d", length(ord)), D1 + 0.03, hy, D2 - D1 - 0.06, hh, hs, TRUE)
+  txt(sprintf("People = %d  ·  Checks = %d", n_people, des$checks), D2 + 0.05, hy, x0 + pw - D2 - 0.1, hh, hs, TRUE)
+
+  # sample positions: spread over the full height, small gap between groups
+  n <- length(ord); ng <- max(group); ggap <- if (ng < n) 0.2 else 0
+  step <- (SPAN - (ng - 1) * ggap) / max(n - 1, 1)
+  samp_y <- function(i) TOP + (i - 1) * step + (group[i] - 1) * ggap
+  d_s <- min(0.34 * ks, step * 0.8)
+
+  jar(jx, TOP - 0.22, jw, SPAN + 0.44)
+  jar(sx - 0.25 * k, TOP - 0.22, 0.5 * k, SPAN + 0.44)
+
+  # population balls (drawn ones ringed green)
+  for (b in seq_len(N_POP)) ball(col_x(slot_col[b]), row_y(slot_row[b]), d_pop, b, ring = b %in% ord)
+  # solid arrows: start AT the drawn ball, rise into the gap above its row,
+  # run along it to the jar edge, then curve into the sample jar
+  jar_right <- jx + jw
+  for (i in seq_len(n)) {
+    b <- ord[i]; bx <- col_x(slot_col[b]); by <- row_y(slot_row[b]); gy <- by - rs / 2
+    x1 <- min(bx + 0.16, jar_right - 0.03)
+    grid.bezier(X(c(bx, bx, bx + 0.03, x1)), Y(c(by - d_pop / 2, gy, gy, gy)), gp = gpar(col = ARROW_COL, lwd = PT(1.3)))
+    if (x1 < jar_right) grid.segments(X(x1), Y(gy), X(jar_right), Y(gy), gp = gpar(col = ARROW_COL, lwd = PT(1.3)))
+    s_arrow(jar_right, gy, sx - d_s / 2 - 0.04, samp_y(i))
+  }
+  for (i in seq_len(n)) ball(sx, samp_y(i), d_s, ord[i])
+
+  # people: centred on their balls; two people sharing the same balls sit above / below
+  py <- sapply(assign, function(a) mean(samp_y(match(a, ord))))
+  key <- round(py, 6); dup <- duplicated(key) | duplicated(key, fromLast = TRUE)
+  first <- !duplicated(key)
+  py[dup] <- py[dup] + ifelse(first[dup], -0.42, 0.42)
+  for (p in seq_len(n_people)) {
+    for (b in assign[[p]]) {
+      i <- match(b, ord)
+      s_arrow(sx + d_s / 2 + 0.04, samp_y(i), ix - 0.06, py[p], col = PERSON_COL, lwd_pt = 1.1, lty = "22")
+    }
+    person(ix, py[p] - 0.225 * ks, ks)
+    txt(LETTERS[p], ix + 0.42 * ks, py[p] - 0.15, 0.35 * ks, 0.3, 13 * ks, TRUE, align = "left")
+    for (j in seq_along(assign[[p]])) ball(ix + 0.95 * ks + (j - 1) * pb_step, py[p], pb_d, assign[[p]][j])
+  }
+  if (!is.null(note)) txt(note, x0 + 0.15, 6.9, pw - 0.3, 0.28, 11.5 * min(k, 1.25), TRUE)
+}
+
+# =============================================================================
+# WORDING for each diagram
+# =============================================================================
+x_txt <- "×"
+label <- list(
+  wider      = list(head = sprintf("Wider sampling: 8 people, 1 ball each (8 %s 1 = %d checks total)", x_txt, N_CHECKS),
+                    note = "8 different balls, each seen by 1 person only"),
+  deeper     = list(head = sprintf("Deeper sampling: 4 people, 2 balls each (4 %s 2 = %d checks total)", x_txt, N_CHECKS),
+                    note = "Only 4 balls, but each seen by 2 people"),
+  seen_once  = list(head = sprintf("Each ball seen once: 4 people, 2 different balls each (4 %s 2 = %d checks total)", x_txt, N_CHECKS),
+                    note = "8 different balls, each seen by 1 person only"),
+  seen_twice = list(head = sprintf("Each ball seen twice: 4 people, 2 shared balls each (4 %s 2 = %d checks total)", x_txt, N_CHECKS),
+                    note = "Only 4 balls, but each seen by 2 people"))
+
+page_title <- function(s) txt(s, 0.4, 0.22, 12.5, 0.55, 26, TRUE, align = "left")
+
+two_panel <- function(title, left, right) function() {
+  grid.newpage(); page_title(title)
+  draw_diagram(0.3,  6.25, designs[[left]],  label[[left]]$head,  label[[left]]$note)
+  draw_diagram(6.78, 6.25, designs[[right]], label[[right]]$head, label[[right]]$note)
+}
+one_panel <- function(which) function() {
+  grid.newpage(); page_title(label[[which]]$head)
+  draw_diagram(0.3, 12.73, designs[[which]], NULL, label[[which]]$note, TOP = 1.95, SPAN = 4.6)
+}
+
+pages <- list(
+  page1_wider_vs_deeper = two_panel(sprintf("Same number of checks (%d): more people, or more balls per person?", N_CHECKS),
+                                    "wider", "deeper"),
+  page2_once_vs_twice   = two_panel(sprintf("Same 4 people, same %d checks: should a ball be seen by 1 person or 2?", N_CHECKS),
+                                    "seen_once", "seen_twice"),
+  page3_wider           = one_panel("wider"),
+  page4_deeper          = one_panel("deeper"),
+  page5_seen_once       = one_panel("seen_once"),
+  page6_seen_twice      = one_panel("seen_twice"))
+
+# =============================================================================
+# SAVE + SHOW
+# =============================================================================
+open_png <- function(path) {
+  if (capabilities("cairo")) png(path, width = W, height = H, units = "in", res = PNG_DPI, type = "cairo")
+  else                       png(path, width = W, height = H, units = "in", res = PNG_DPI)
+}
+saved <- character(0)
+for (nm in names(pages)) {
+  path <- file.path(OUT_DIR, paste0(nm, ".png"))
+  open_png(path); pages[[nm]](); invisible(dev.off()); saved <- c(saved, normalizePath(path))
+}
+pdf_path <- file.path(OUT_DIR, "all_pages.pdf")
+pdf(pdf_path, width = W, height = H); for (f in pages) f(); invisible(dev.off())
+saved <- c(saved, normalizePath(pdf_path))
+cat("\nSaved in", normalizePath(OUT_DIR), ":\n"); cat(paste0("  ", basename(saved)), sep = "\n")
+
+if (SHOW_IN_R && interactive()) { for (f in pages) f(); cat("\nAll pages drawn in the Plots pane (use the arrows).\n") }
+invisible(designs)
