@@ -1,0 +1,562 @@
+# =============================================================================
+# Sampling visuals as slide images (for a "build-up" animation in PowerPoint)
+#
+# Goal shown to students: estimate the % of target-coloured balls in a jar
+# from a sample. Produces PNG images, all the same size (16:9) with everything
+# in the same position, so pasting them onto consecutive slides makes
+# "Next slide" look like an animation.
+#
+#   slide1_frame01.png  jar + text only
+#   slide1_frame02.png  + sample #1 of n = 5   (its balls circled in the jar)
+#   slide1_frame03.png  + sample #2
+#   slide1_frame04.png  + sample #3
+#   slide1_frame05.png  all 30 samples of n = 5
+#   slide1_frame06.png  + all 30 of n = 10
+#   slide1_frame07.png  + all 30 of n = 15
+#   slide1_frame08.png  + all 30 of n = 20   (the full page)
+#   slide2.png          worked example for n = 5
+#   slide3.png          summary table
+#   all_slides.pdf      every frame above, in order (handy to check the flow)
+#
+# Everything is saved in your working directory: getwd().
+# The script also PRINTS all the numbers in the console, stores them in a list
+# called `results`, and (in RStudio / interactive R) draws every page in the
+# Plots pane so you can flip through them with the arrows.
+#
+# PowerPoint tip: insert each PNG full-slide (13.333 x 7.5 in) on its own
+# slide, same position; use no transition (or "Fade", 0.3 s) between frames.
+#
+# Base R only (grid + grDevices). Nothing to install.
+# The jar and all 120 samples are fixed below, so every run is identical.
+# All counts / % / means are computed from those balls and checked.
+# =============================================================================
+
+library(grid)
+
+# ---- settings ---------------------------------------------------------------
+TWO_COLOURS      <- TRUE     # TRUE: 40 blue + 60 red.  FALSE: 40 green, 30 red, 30 blue
+OUT_DIR          <- getwd()   # files are written here
+SHOW_IN_R        <- TRUE      # draw every page in the Plots pane / graphics window
+OPEN_VIEWERS     <- FALSE     # TRUE: also open the tables with View() (RStudio)
+PNG_DPI          <- 200      # 200 dpi -> 2667 x 1500 px
+FONT             <- "sans"
+ONE_BY_ONE       <- 3        # how many n = 5 samples to reveal one at a time
+HIGHLIGHT_NEW    <- TRUE     # orange outline on the newest sample while revealing
+SHOW_DRAWN_IN_JAR <- TRUE    # circle the newest sample's balls inside the jar
+
+N_POP     <- 100
+TRUTH     <- 40              # % of target colour in the jar
+SIZES     <- c(5, 10, 15, 20)
+N_SAMPLES <- 30
+MARGINS   <- c(10, 20)       # +/- percentage points
+
+# ---- colours & wording ------------------------------------------------------
+INK <- "#1B1D2A"; MUTED <- "#646A7D"; DARK <- "#2E3245"
+GREY <- "#EDEEF2"; GREY_LINE <- "#D9DCE3"; RULE <- "#9AA0B4"
+ORANGE_TXT <- "#C25400"; HIT_FILL <- "#FDD3B0"; HIT_LINE <- "#F0A56A"; HIT_TXT <- "#8A3D00"
+NEW_LINE <- "#F26A00"        # outline of the newest sample square
+RING_COL <- "#00D639"        # bright green circle around the balls just drawn (in the jar)
+GLASS <- "#EAF1F8"; GLASS_LINE <- "#9FB4CC"
+RED_F <- "#F5A3A3"; RED_L <- "#C45A5A"; BLUE_F <- "#A6C6F2"; BLUE_L <- "#4C7CC2"
+GRN_F <- "#9FDC98"; GRN_L <- "#3F9B3A"
+if (TWO_COLOURS) {
+  # code "g" = the 40 target balls, drawn blue; "r" and "b" both drawn red
+  BALL_FILL <- c(g = BLUE_F, r = RED_F, b = RED_F); BALL_LINE <- c(g = BLUE_L, r = RED_L, b = RED_L)
+  TARGET <- "blue"
+} else {
+  BALL_FILL <- c(g = GRN_F, r = RED_F, b = BLUE_F); BALL_LINE <- c(g = GRN_L, r = RED_L, b = BLUE_L)
+  TARGET <- "green"
+}
+
+# =============================================================================
+# DATA (fixed)
+# jar_color[i]: colour code of ball i ("g" = target colour, "r", "b" = others)
+# jar_slot[i]:  position of ball i in the jar drawing (0 = bottom-left)
+# samples_nX:   30 rows (samples) x n columns; each row lists DISTINCT ball
+#               numbers (sampling without replacement), target balls first.
+# =============================================================================
+jar_color <- strsplit(paste0(
+  "gbrggbbgrgrbgbbgbrgbrbbbbrgrgggbgggrrgbgbrrbbbrrgg",
+  "bgrggbggrrggggbrbbgbrrggrgbrgbggrbgrgggrrrgrrbbbrr"), "")[[1]]
+
+jar_slot <- c(
+  2, 91, 82, 8, 42, 5, 4, 78, 40, 99, 15, 65, 41, 46, 20, 22, 33, 19, 47, 74,
+  72, 83, 36, 52, 64, 25, 39, 23, 98, 81, 7, 44, 11, 14, 27, 29, 63, 54, 55, 31,
+  80, 66, 88, 87, 67, 24, 93, 85, 51, 77, 18, 69, 96, 21, 9, 3, 56, 50, 6, 1,
+  62, 0, 10, 30, 28, 16, 90, 35, 32, 38, 86, 95, 92, 43, 84, 37, 73, 57, 48, 79,
+  53, 60, 71, 68, 17, 34, 13, 49, 45, 89, 12, 76, 58, 75, 61, 94, 26, 97, 70, 59)
+
+samples_n5 <- matrix(c(
+  33, 58, 73, 22, 24,
+  58, 63, 74, 26, 17,
+  1, 27, 54, 94, 95,
+  37, 15, 39, 45, 77,
+  13, 57, 86, 94, 70,
+  52, 81, 89, 7, 65,
+  38, 57, 43, 32, 80,
+  8, 16, 58, 69, 42,
+  50, 81, 18, 53, 80,
+  27, 90, 7, 25, 44,
+  29, 52, 69, 21, 60,
+  18, 42, 90, 24, 44,
+  64, 69, 71, 72, 15,
+  54, 26, 75, 94, 95,
+  82, 66, 17, 22, 25,
+  5, 13, 40, 58, 97,
+  63, 73, 76, 78, 15,
+  33, 34, 40, 71, 99,
+  31, 38, 61, 93, 9,
+  10, 33, 57, 89, 32,
+  13, 49, 87, 60, 72,
+  58, 60, 66, 83, 20,
+  13, 16, 54, 48, 83,
+  4, 29, 30, 20, 67,
+  40, 74, 6, 23, 65,
+  19, 85, 37, 65, 96,
+  27, 40, 42, 59, 39,
+  19, 60, 78, 90, 94,
+  87, 88, 36, 37, 70,
+  49, 62, 64, 82, 48), nrow = 30, byrow = TRUE)
+
+samples_n10 <- matrix(c(
+  35, 37, 42, 90, 6, 12, 70, 96, 97, 98,
+  5, 13, 19, 30, 33, 81, 42, 94, 7, 46,
+  34, 38, 74, 82, 48, 53, 66, 95, 100, 14,
+  5, 10, 33, 49, 69, 85, 60, 100, 17, 84,
+  10, 50, 55, 69, 74, 86, 99, 24, 56, 65,
+  19, 33, 55, 69, 76, 81, 86, 12, 51, 84,
+  5, 38, 64, 47, 59, 71, 51, 65, 84, 97,
+  38, 40, 73, 79, 87, 89, 3, 100, 23, 98,
+  33, 35, 52, 81, 18, 21, 75, 25, 51, 67,
+  4, 13, 29, 40, 76, 78, 90, 7, 23, 24,
+  13, 31, 33, 69, 73, 78, 7, 15, 77, 97,
+  19, 38, 62, 99, 2, 14, 22, 23, 80, 98,
+  64, 69, 59, 66, 71, 83, 6, 23, 41, 51,
+  10, 27, 30, 31, 69, 88, 2, 44, 65, 68,
+  31, 38, 63, 69, 87, 11, 26, 12, 25, 46,
+  13, 27, 34, 50, 52, 64, 81, 36, 47, 90,
+  33, 38, 57, 82, 26, 48, 25, 45, 56, 98,
+  1, 55, 64, 85, 89, 36, 48, 53, 99, 51,
+  10, 13, 34, 89, 3, 42, 59, 86, 46, 68,
+  13, 79, 85, 11, 47, 78, 90, 92, 14, 46,
+  1, 31, 64, 76, 88, 42, 66, 95, 14, 23,
+  4, 30, 50, 76, 81, 89, 93, 11, 71, 45,
+  1, 30, 33, 81, 89, 66, 78, 94, 80, 84,
+  13, 33, 61, 18, 37, 66, 94, 95, 22, 39,
+  16, 35, 50, 9, 36, 37, 90, 17, 51, 97,
+  4, 33, 76, 81, 9, 59, 66, 71, 14, 68,
+  5, 13, 31, 54, 62, 37, 90, 17, 32, 56,
+  5, 40, 54, 82, 87, 47, 91, 94, 12, 15,
+  74, 71, 78, 94, 95, 6, 7, 17, 22, 98,
+  55, 64, 76, 3, 78, 94, 41, 44, 51, 70), nrow = 30, byrow = TRUE)
+
+samples_n15 <- matrix(c(
+  19, 27, 49, 52, 76, 79, 87, 92, 94, 99, 7, 39, 41, 45, 96,
+  19, 63, 64, 73, 26, 28, 60, 71, 95, 6, 7, 14, 15, 68, 96,
+  4, 27, 38, 58, 63, 69, 76, 26, 59, 90, 91, 94, 17, 20, 96,
+  10, 29, 30, 35, 40, 54, 61, 63, 74, 82, 87, 36, 15, 24, 56,
+  1, 5, 19, 81, 82, 85, 88, 93, 37, 91, 17, 24, 65, 67, 68,
+  40, 50, 18, 36, 37, 60, 71, 78, 91, 100, 2, 15, 20, 25, 70,
+  34, 35, 52, 64, 76, 79, 11, 59, 71, 72, 78, 91, 14, 23, 41,
+  19, 33, 63, 73, 88, 89, 11, 60, 66, 86, 95, 99, 12, 51, 68,
+  5, 30, 34, 58, 69, 82, 9, 43, 59, 94, 12, 20, 41, 68, 84,
+  35, 50, 54, 55, 79, 81, 87, 3, 21, 42, 47, 72, 100, 20, 68,
+  19, 30, 38, 40, 50, 61, 85, 75, 95, 2, 23, 24, 32, 44, 46,
+  10, 13, 54, 63, 69, 85, 9, 28, 59, 66, 71, 92, 7, 65, 80,
+  16, 31, 34, 62, 69, 74, 81, 9, 42, 83, 6, 17, 45, 51, 56,
+  33, 40, 49, 54, 61, 82, 89, 9, 21, 36, 66, 2, 15, 24, 67,
+  33, 35, 40, 50, 54, 76, 42, 72, 78, 83, 100, 2, 7, 22, 23,
+  5, 13, 31, 54, 89, 93, 18, 37, 7, 15, 17, 20, 22, 23, 39,
+  19, 29, 35, 40, 52, 63, 3, 42, 59, 12, 14, 17, 39, 80, 84,
+  1, 33, 55, 81, 82, 87, 9, 37, 60, 66, 86, 92, 99, 39, 98,
+  52, 54, 62, 69, 74, 76, 85, 93, 21, 100, 15, 20, 23, 24, 68,
+  10, 40, 57, 62, 89, 11, 26, 37, 94, 20, 25, 39, 67, 77, 84,
+  5, 54, 55, 93, 3, 21, 43, 71, 92, 95, 100, 23, 65, 77, 84,
+  5, 10, 33, 63, 69, 73, 81, 88, 3, 26, 86, 100, 2, 15, 70,
+  40, 52, 55, 63, 64, 69, 18, 43, 72, 92, 6, 23, 77, 84, 97,
+  1, 5, 27, 57, 64, 9, 26, 43, 59, 66, 83, 99, 17, 51, 97,
+  1, 4, 81, 89, 59, 71, 94, 100, 6, 24, 39, 51, 65, 67, 96,
+  5, 10, 30, 40, 81, 82, 87, 59, 99, 17, 22, 24, 39, 77, 84,
+  8, 34, 35, 55, 57, 64, 82, 9, 53, 75, 90, 99, 7, 44, 80,
+  4, 30, 40, 54, 58, 63, 9, 11, 26, 28, 47, 53, 22, 46, 65,
+  1, 30, 34, 40, 55, 62, 81, 26, 42, 83, 6, 12, 23, 46, 65,
+  33, 38, 49, 52, 55, 76, 60, 72, 94, 15, 23, 24, 45, 56, 96), nrow = 30, byrow = TRUE)
+
+samples_n20 <- matrix(c(
+  19, 40, 55, 62, 74, 79, 82, 85, 89, 9, 28, 37, 42, 48, 72, 20, 44, 46, 51, 84,
+  5, 29, 40, 49, 58, 63, 69, 85, 87, 89, 18, 21, 48, 83, 2, 15, 17, 25, 70, 84,
+  4, 19, 27, 34, 50, 58, 63, 76, 89, 3, 11, 21, 99, 2, 6, 7, 22, 32, 41, 98,
+  8, 10, 35, 63, 69, 74, 81, 85, 93, 43, 53, 59, 72, 83, 91, 94, 7, 12, 25, 51,
+  19, 38, 49, 50, 55, 61, 93, 26, 36, 37, 42, 72, 86, 92, 100, 2, 7, 39, 51, 56,
+  30, 52, 82, 11, 28, 43, 47, 59, 78, 83, 86, 94, 15, 17, 20, 32, 46, 68, 77, 97,
+  8, 10, 34, 38, 69, 73, 81, 3, 9, 11, 42, 48, 66, 99, 25, 39, 44, 51, 65, 96,
+  5, 10, 16, 19, 40, 49, 50, 76, 21, 36, 48, 72, 94, 95, 100, 23, 32, 68, 84, 97,
+  1, 19, 34, 54, 74, 88, 9, 18, 28, 42, 47, 60, 72, 75, 90, 91, 94, 100, 20, 77,
+  10, 27, 38, 61, 73, 85, 88, 89, 93, 28, 43, 48, 78, 99, 100, 12, 24, 41, 56, 98,
+  19, 30, 34, 35, 54, 55, 58, 62, 63, 85, 89, 43, 48, 59, 6, 15, 41, 51, 67, 80,
+  8, 13, 30, 49, 62, 64, 74, 93, 21, 28, 59, 78, 95, 99, 7, 44, 45, 67, 96, 98,
+  5, 38, 55, 61, 74, 79, 85, 28, 43, 47, 48, 72, 92, 7, 17, 46, 51, 65, 84, 98,
+  5, 10, 31, 33, 49, 87, 88, 37, 42, 47, 48, 53, 72, 92, 14, 24, 39, 45, 70, 84,
+  10, 29, 57, 63, 89, 93, 3, 11, 37, 42, 53, 66, 78, 7, 17, 24, 39, 41, 45, 97,
+  1, 27, 34, 38, 52, 62, 76, 81, 87, 3, 37, 42, 59, 90, 92, 99, 23, 24, 25, 41,
+  8, 30, 35, 38, 40, 49, 55, 58, 74, 76, 82, 85, 18, 37, 71, 83, 7, 12, 32, 80,
+  4, 5, 27, 57, 69, 74, 79, 81, 3, 11, 18, 36, 37, 42, 53, 99, 15, 23, 56, 80,
+  4, 30, 34, 49, 52, 79, 93, 11, 21, 28, 42, 47, 53, 72, 95, 100, 7, 15, 22, 39,
+  13, 19, 29, 31, 40, 52, 57, 62, 69, 82, 26, 53, 59, 66, 86, 2, 14, 17, 20, 23,
+  4, 13, 33, 74, 85, 87, 89, 3, 71, 86, 91, 12, 14, 20, 23, 39, 41, 45, 77, 80,
+  1, 30, 35, 52, 58, 69, 73, 82, 88, 9, 28, 43, 66, 72, 86, 23, 24, 68, 97, 98,
+  1, 13, 31, 52, 55, 57, 62, 63, 87, 28, 59, 72, 75, 78, 99, 32, 56, 65, 67, 80,
+  5, 16, 27, 34, 55, 61, 69, 74, 87, 9, 18, 48, 78, 95, 100, 24, 41, 44, 51, 65,
+  10, 33, 34, 54, 57, 62, 69, 74, 88, 11, 53, 59, 78, 86, 92, 100, 24, 44, 56, 68,
+  1, 4, 33, 52, 54, 61, 64, 76, 81, 93, 21, 59, 60, 75, 86, 2, 39, 41, 46, 97,
+  4, 10, 16, 19, 50, 52, 54, 73, 81, 93, 28, 37, 48, 75, 83, 100, 14, 17, 25, 46,
+  5, 27, 33, 49, 57, 73, 79, 81, 82, 28, 36, 42, 47, 66, 72, 90, 2, 7, 51, 70,
+  5, 10, 13, 19, 29, 74, 3, 9, 21, 28, 37, 47, 86, 99, 6, 39, 51, 77, 80, 97,
+  5, 10, 16, 31, 33, 36, 37, 42, 59, 60, 72, 92, 99, 17, 23, 24, 25, 65, 77, 96), nrow = 30, byrow = TRUE)
+
+samples <- list(`5` = samples_n5, `10` = samples_n10, `15` = samples_n15, `20` = samples_n20)
+
+# =============================================================================
+# STATISTICS (computed from the balls)
+# =============================================================================
+row_stats <- function(m) {
+  hits <- rowSums(matrix(jar_color[m] == "g", nrow = nrow(m)))
+  pct  <- 100 * hits / ncol(m)
+  data.frame(sample = seq_len(nrow(m)), hits = hits, pct = pct, err = pct - TRUTH)
+}
+stats      <- lapply(samples, row_stats)
+missed_ids <- function(st, margin) st$sample[abs(st$err) >  margin + 1e-9]
+within_ids <- function(st, margin) st$sample[abs(st$err) <= margin + 1e-9]
+fmt1       <- function(v) as.character(round(v, 1))
+
+stopifnot(length(jar_color) == N_POP, sum(jar_color == "g") == TRUTH * N_POP / 100,
+          all(sort(jar_slot) == 0:(N_POP - 1)))
+for (m in samples) stopifnot(nrow(m) == N_SAMPLES, all(m >= 1 & m <= N_POP),
+                             all(apply(m, 1, function(r) !anyDuplicated(r))))   # without replacement
+means    <- sapply(stats, function(s) mean(s$pct))
+miss_tab <- sapply(MARGINS, function(mg) sapply(stats, function(s) length(missed_ids(s, mg))))
+stopifnot(all(abs(round(means, 1) - c(47.3, 43.7, 41.8, 40.8)) < 1e-9),
+          all(miss_tab[, 1] == c(22, 10, 8, 4)), all(miss_tab[, 2] == c(7, 4, 2, 1)))
+
+# =============================================================================
+# RESULTS YOU CAN INSPECT (printed below and kept in `results`)
+# =============================================================================
+colour_name <- function(code) {
+  if (TWO_COLOURS) ifelse(code == "g", "blue", "red")
+  else ifelse(code == "g", "green", ifelse(code == "r", "red", "blue"))
+}
+jar_table <- data.frame(ball = seq_len(N_POP), colour = colour_name(jar_color))
+
+sample_tables <- lapply(SIZES, function(n) {
+  m <- samples[[as.character(n)]]; st <- stats[[as.character(n)]]
+  df <- data.frame(n = n, sample = st$sample,
+                   balls = apply(m, 1, function(r) paste(r, collapse = ", ")),
+                   target_balls = st$hits,
+                   estimate_pct = round(st$pct, 1),
+                   off_by_pct = round(abs(st$err), 1))
+  for (mg in MARGINS) df[[sprintf("within_%d", mg)]] <- abs(st$err) <= mg + 1e-9
+  df
+})
+names(sample_tables) <- paste0("n_", SIZES)
+
+summary_table <- data.frame(
+  n = SIZES,
+  sample_mean_pct = round(means, 1),
+  lowest_pct = sapply(stats, function(s) round(min(s$pct), 1)),
+  highest_pct = sapply(stats, function(s) round(max(s$pct), 1)),
+  row.names = NULL)
+for (j in seq_along(MARGINS)) {
+  mg <- MARGINS[j]
+  summary_table[[sprintf("missed_more_than_%d", mg)]] <- miss_tab[, j]
+  summary_table[[sprintf("which_missed_%d", mg)]] <-
+    sapply(stats, function(s) { ids <- missed_ids(s, mg); if (length(ids)) paste0("#", ids, collapse = " ") else "none" })
+}
+worked_example <- data.frame(
+  margin = paste0("+/-", MARGINS, "%"),
+  range = sprintf("%d%% to %d%%", pmax(0, TRUTH - MARGINS), TRUTH + MARGINS),
+  within = sapply(MARGINS, function(mg) length(within_ids(stats[["5"]], mg))),
+  out_of = N_SAMPLES)
+
+results <- list(jar = jar_table, samples = sample_tables, summary = summary_table,
+                worked_example_n5 = worked_example, truth_pct = TRUTH, target_colour = TARGET)
+
+old_width <- options(width = 200)
+cat("\n================ POPULATION ================\n")
+cat(sprintf("%d balls, %d %s -> truth = %d%% %s\n", N_POP, sum(jar_color == "g"), TARGET, TRUTH, TARGET))
+print(table(colour = jar_table$colour))
+cat("\n================ SUMMARY (slide 1 + slide 3) ================\n")
+print(summary_table, row.names = FALSE)
+cat("\n================ WORKED EXAMPLE n = 5 (slide 2) ================\n")
+print(worked_example, row.names = FALSE)
+for (nm in names(sample_tables)) {
+  cat(sprintf("\n================ ALL 30 SAMPLES, %s ================\n", sub("_", " = ", nm)))
+  print(sample_tables[[nm]][, -1], row.names = FALSE)
+}
+options(old_width)
+cat("\nEverything above is stored in `results` (e.g. results$summary, results$samples$n_5).\n")
+if (OPEN_VIEWERS && interactive()) {
+  View(results$summary, "summary"); View(results$worked_example_n5, "worked example n=5")
+  for (nm in names(sample_tables)) View(sample_tables[[nm]], paste("samples", nm))
+}
+
+# =============================================================================
+# DRAWING HELPERS  (inches from the TOP-LEFT of a 13.333 x 7.5 in page)
+# =============================================================================
+W <- 13.333; H <- 7.5
+X  <- function(x) unit(x, "in"); Y <- function(y) unit(H - y, "in"); IN <- function(v) unit(v, "in")
+PT <- function(pt) pt / 0.75
+
+box <- function(x, y, w, h, fill = NA, line = NA, lwd_pt = 0, r = 0) {
+  gp <- gpar(fill = fill, col = if (lwd_pt > 0) line else NA, lwd = PT(max(lwd_pt, 0.01)))
+  if (r > 0) grid.roundrect(X(x), Y(y), IN(w), IN(h), r = IN(r), just = c("left", "top"), gp = gp)
+  else       grid.rect(X(x), Y(y), IN(w), IN(h), just = c("left", "top"), gp = gp)
+}
+seg <- function(x0, y0, x1, y1, col = RULE, lwd_pt = 1.5)
+  grid.segments(X(x0), Y(y0), X(x1), Y(y1), gp = gpar(col = col, lwd = PT(lwd_pt)))
+
+text_w <- function(label, size, bold = FALSE)
+  convertWidth(grobWidth(textGrob(label, gp = gpar(fontsize = size, fontfamily = FONT,
+               fontface = if (bold) "bold" else "plain"))), "in", valueOnly = TRUE)
+fit_size <- function(label, size, bold, avail) {
+  avail <- max(avail, 0.01); tw <- text_w(label, size, bold)
+  if (tw > avail) size * avail / tw else size
+}
+# every boxed label shrinks (never grows) until it fits its box, on any device/font
+txt <- function(label, x, y, w = 0, h = 0, size = 12, bold = FALSE, col = INK,
+                align = "left", valign = "middle", fit = TRUE, pad = 0.04) {
+  label <- as.character(label)
+  if (fit && w > 0) size <- fit_size(label, size, bold, w - 2 * pad)
+  if (fit && h > 0) size <- min(size, 72 * h / 1.05)
+  hx <- switch(align, left = x, center = x + w / 2, right = x + w)
+  vy <- switch(valign, top = y, middle = y + h / 2, bottom = y + h)
+  grid.text(label, X(hx), Y(vy),
+            just = c(if (align == "center") "centre" else align, if (valign == "middle") "centre" else valign),
+            gp = gpar(fontsize = size, fontface = if (bold) "bold" else "plain", col = col, fontfamily = FONT))
+}
+rich <- function(pieces, x, y_mid, size, max_w = Inf) {
+  total <- sum(sapply(pieces, function(p) text_w(p$text, size, isTRUE(p$bold))))
+  if (total > max_w) size <- size * max_w / total
+  for (p in pieces) {
+    grid.text(p$text, X(x), Y(y_mid), just = c("left", "centre"),
+              gp = gpar(fontsize = size, fontface = if (isTRUE(p$bold)) "bold" else "plain",
+                        col = p$col, fontfamily = FONT))
+    x <- x + text_w(p$text, size, isTRUE(p$bold))
+  }
+}
+wrap <- function(s, width, size, bold = FALSE) {
+  words <- strsplit(s, " ", fixed = TRUE)[[1]]; lines <- character(0); cur <- ""
+  for (wd in words) {
+    cand <- if (cur == "") wd else paste(cur, wd)
+    if (cur != "" && text_w(cand, size, bold) > width) { lines <- c(lines, cur); cur <- wd } else cur <- cand
+  }
+  c(lines, cur)
+}
+para <- function(s, x, y, w, size, col = INK, lh = 1.25) {
+  lines <- wrap(s, w - 0.08, size)
+  for (i in seq_along(lines)) txt(lines[i], x, y + (i - 1) * size * lh / 72, w, size * lh / 72, size, FALSE, col, "left", "top")
+}
+ball <- function(x, y, d, num, lwd_pt = 0.5, size = 6) {
+  cl <- jar_color[num]
+  grid.circle(X(x + d / 2), Y(y + d / 2), IN(d / 2), gp = gpar(fill = BALL_FILL[[cl]], col = BALL_LINE[[cl]], lwd = PT(lwd_pt)))
+  txt(num, x, y, d, d, size = size, bold = TRUE, align = "center", pad = d * 0.12)
+}
+ring <- function(x, y, d, col = RING_COL, lwd_pt = 2.5)
+  grid.circle(X(x + d / 2), Y(y + d / 2), IN(d / 2 + 0.025), gp = gpar(fill = NA, col = col, lwd = PT(lwd_pt)))
+title <- function(s) txt(s, 0.4, 0.25, 12.5, 0.6, size = 28, bold = TRUE, valign = "top")
+
+# jar; returns geometry plus a function giving each ball's position
+draw_jar <- function(jx, bt, dj, lid_off, lid_h, neck_h, num_size, ring_balls = integer(0)) {
+  jw <- 10.5 * dj + 0.16; bh <- 9 * dj * 0.87 + dj + 0.16; jb <- bt + bh
+  pos <- function(i) { s <- jar_slot[i]; rw <- s %/% 10; cc <- s %% 10
+    c(jx + 0.08 + cc * dj + if (rw %% 2 == 1) dj / 2 else 0, jb - 0.08 - dj - rw * dj * 0.87) }
+  box(jx + jw * 0.14, bt - lid_off, jw * 0.72, lid_h, fill = MUTED, r = 0.05)
+  box(jx + jw * 0.18, bt - neck_h, jw * 0.64, neck_h, fill = GLASS, line = GLASS_LINE, lwd_pt = 1)
+  box(jx, bt, jw, bh, fill = GLASS, line = GLASS_LINE, lwd_pt = 1, r = 0.2)
+  for (i in seq_len(N_POP)) { p <- pos(i); ball(p[1], p[2], dj, i, size = num_size) }
+  for (i in ring_balls) { p <- pos(i); ring(p[1], p[2], dj) }
+  list(jw = jw, jb = jb)
+}
+callout <- function(x, y, w) {
+  box(x, y, w, 0.62, fill = DARK, r = 0.08)
+  txt("Sampling without replacement", x, y + 0.09, w, 0.24, 13, TRUE, "#FFFFFF", "center", pad = 0.12)
+  txt("no ball can appear twice in the same sample", x, y + 0.33, w, 0.2, 10.5, FALSE, "#E6E8EF", "center", pad = 0.12)
+}
+jar_caption <- function() {
+  n_t <- sum(jar_color == "g"); n_r <- sum(jar_color == "r"); n_b <- sum(jar_color == "b")
+  if (TWO_COLOURS) sprintf("%d balls: %d blue \u00b7 %d red", N_POP, n_t, n_r + n_b)
+  else             sprintf("%d balls: %d green \u00b7 %d red \u00b7 %d blue", N_POP, n_t, n_r, n_b)
+}
+
+# =============================================================================
+# SLIDE 1 (drawn in stages)
+#   rows_shown:   how many sample-size rows are visible (0-4)
+#   first_count:  how many samples of the first row (n = 5) are visible
+# =============================================================================
+draw_slide1 <- function(rows_shown = 4, first_count = N_SAMPLES) {
+  grid.newpage()
+  title(sprintf("Goal: estimate the %% of %s balls in the jar from a sample", TARGET))
+  revealing <- rows_shown == 1 && first_count < N_SAMPLES && first_count > 0
+  newest    <- if (revealing) samples[["5"]][first_count, ] else integer(0)
+
+  jx <- 0.4
+  j <- draw_jar(jx, bt = 1.78, dj = 0.232, lid_off = 0.42, lid_h = 0.17, neck_h = 0.25, num_size = 6.5,
+                ring_balls = if (SHOW_DRAWN_IN_JAR) newest else integer(0))
+  txt("Population: the whole jar", jx, 0.98, j$jw, 0.32, 16, TRUE, align = "center")
+  txt(jar_caption(), jx, j$jb + 0.1, j$jw, 0.25, 12, FALSE, MUTED, "center")
+  txt(sprintf("Truth: %d%% %s", TRUTH, TARGET), jx, j$jb + 0.36, j$jw, 0.4, 20, TRUE, align = "center")
+  callout(jx, j$jb + 0.85, j$jw)
+  para(sprintf(paste("Each grey square is one sample: a handful of numbered balls taken from the jar.",
+                     "The %% %s in the handful is our estimate. The balls go back before the next sample."), TARGET),
+       jx, j$jb + 1.6, j$jw, 12)
+  seg(3.05, 1.0, 3.05, 7.25)
+
+  tx0 <- 3.2; tx1 <- 12.95; cellW <- (tx1 - tx0) / 15; d <- 0.106
+  hdH <- 0.13; ftH <- 0.17; headH <- 0.24; gapRow <- 0.13
+  y <- 0.92
+  for (ri in seq_along(SIZES)) {
+    n <- SIZES[ri]; m <- samples[[as.character(n)]]; st <- stats[[as.character(n)]]
+    rr <- n / 5; trayH <- hdH + rr * d + ftH + 0.03
+    if (ri <= rows_shown) {
+      count <- if (ri == 1) first_count else N_SAMPLES
+      if (ri > 1) seg(tx0, y - gapRow / 2 - 0.01, tx1, y - gapRow / 2 - 0.01)
+      pieces <- list(list(text = sprintf("30 samples of size n = %d", n), bold = TRUE, col = INK))
+      if (count == N_SAMPLES)                                   # the mean only makes sense once all 30 are in
+        pieces <- c(pieces, list(list(text = "   sample mean: ", col = MUTED),
+                                 list(text = sprintf("%s%% %s", fmt1(mean(st$pct)), TARGET), bold = TRUE, col = INK)))
+      rich(pieces, tx0 + 0.02, y + (headH - 0.04) / 2, 13, max_w = tx1 - tx0 - 0.04)
+      for (si in seq_len(count)) {
+        cx <- tx0 + ((si - 1) %% 15) * cellW
+        cy <- y + headH + ((si - 1) %/% 15) * (trayH + 0.03)
+        is_new <- HIGHLIGHT_NEW && revealing && ri == 1 && si == count
+        box(cx + 0.015, cy, cellW - 0.03, trayH, fill = GREY,
+            line = if (is_new) NEW_LINE else GREY_LINE, lwd_pt = if (is_new) 2 else 0.5, r = 0.03)
+        txt(sprintf("Sample #%d", si), cx + 0.015, cy + 0.01, cellW - 0.03, hdH, 6, FALSE, MUTED, "center")
+        bx <- cx + (cellW - 5 * d) / 2
+        for (k in seq_len(n))
+          ball(bx + ((k - 1) %% 5) * d + 0.004, cy + hdH + 0.01 + ((k - 1) %/% 5) * d + 0.004,
+               d - 0.008, m[si, k], lwd_pt = 0.25, size = 4.5)
+        txt(sprintf("%d%% %s", round(st$pct[si]), TARGET), cx + 0.015, cy + hdH + 0.01 + rr * d,
+            cellW - 0.03, ftH, 7, TRUE, align = "center")
+      }
+    }
+    y <- y + headH + 2 * (trayH + 0.03) + gapRow        # keep every row in its final place
+  }
+}
+
+# =============================================================================
+# SLIDE 2 - worked example for n = 5
+# =============================================================================
+draw_slide2 <- function() {
+  grid.newpage()
+  title("Worked example: the 30 samples of size n = 5")
+  m <- samples[["5"]]; st <- stats[["5"]]
+  jx <- 0.4
+  j <- draw_jar(jx, bt = 1.6, dj = 0.215, lid_off = 0.36, lid_h = 0.15, neck_h = 0.22, num_size = 6)
+  txt("Population: the whole jar", jx, 0.92, j$jw, 0.3, 14, TRUE, align = "center")
+  txt(sprintf("Truth: %d%% %s", TRUTH, TARGET), jx, j$jb + 0.1, j$jw, 0.4, 20, TRUE, align = "center")
+  callout(jx, j$jb + 0.65, j$jw)
+  seg(2.95, 1.0, 2.95, 7.25)
+
+  X0 <- 3.15; X1 <- 12.95; gap <- 0.4
+  bw <- (X1 - X0 - gap * (length(MARGINS) - 1)) / length(MARGINS)
+  ROWS <- 5; cellW <- bw / 6; d <- 0.145
+  hdH <- 0.2; ftH <- 0.26; trayH <- hdH + d + ftH + 0.06; rowGap <- 0.2
+  for (qi in seq_along(MARGINS)) {
+    t <- MARGINS[qi]; bx0 <- X0 + (qi - 1) * (bw + gap); ok_ids <- within_ids(st, t)
+    if (qi > 1) seg(bx0 - gap / 2, 1.0, bx0 - gap / 2, 7.25)
+    txt(sprintf("Within \u00b1%d%% of truth?", t), bx0, 0.92, bw, 0.34, 18, TRUE)
+    txt(sprintf("How many samples have %d%% to %d%% %s?", max(0, TRUTH - t), TRUTH + t, TARGET), bx0, 1.28, bw, 0.3, 14)
+    txt(sprintf("%d of 30", length(ok_ids)), bx0, 1.6, bw, 0.45, 26, TRUE, ORANGE_TXT)
+    for (si in seq_len(N_SAMPLES)) {
+      ok <- si %in% ok_ids
+      cx <- bx0 + ((si - 1) %/% ROWS) * cellW                # columns of 5: #1-5 down the first column
+      cy <- 2.2 + ((si - 1) %% ROWS) * (trayH + rowGap)
+      box(cx + 0.02, cy, cellW - 0.04, trayH, fill = if (ok) HIT_FILL else GREY,
+          line = if (ok) HIT_LINE else GREY_LINE, lwd_pt = if (ok) 1 else 0.5, r = 0.04)
+      txt(sprintf("Sample #%d", si), cx + 0.02, cy + 0.01, cellW - 0.04, hdH, 8, FALSE, if (ok) HIT_TXT else MUTED, "center")
+      bx <- cx + (cellW - 5 * d) / 2
+      for (k in 1:5) ball(bx + (k - 1) * d + 0.005, cy + hdH + 0.025, d - 0.01, m[si, k], lwd_pt = 0.3, size = 5.5)
+      txt(sprintf("%d%% %s", round(st$pct[si]), TARGET), cx + 0.02, cy + hdH + d + 0.04, cellW - 0.04, ftH, 9, TRUE, align = "center")
+    }
+  }
+}
+
+# =============================================================================
+# SLIDE 3 - summary table
+# =============================================================================
+draw_slide3 <- function() {
+  grid.newpage()
+  title("How many of the 30 samples at different sample sizes missed the truth?")
+  x0 <- 0.4; y0 <- 1.2; colW <- c(1.53, rep((12.53 - 1.53) / length(MARGINS), length(MARGINS)))
+  headH <- 0.75; rowH <- 1.25; pad <- 0.14; colX <- x0 + c(0, cumsum(colW))
+  tint <- function(p) { t <- p / 100; rgb(255 - 2 * t, 255 - 59 * t, 255 - 105 * t, maxColorValue = 255) }
+  cell <- function(ci, y, h, fill) box(colX[ci], y, colW[ci], h, fill = fill, line = "#FFFFFF", lwd_pt = 1)
+
+  cell(1, y0, headH, INK)
+  txt("Sample size", colX[1] + pad, y0, colW[1] - 2 * pad, headH, 16, TRUE, "#FFFFFF")
+  for (j in seq_along(MARGINS)) {
+    cell(j + 1, y0, headH, INK)
+    txt(sprintf("Missed the truth by more than \u00b1%d%%", MARGINS[j]), colX[j + 1], y0, colW[j + 1], headH, 17, TRUE, "#FFFFFF", "center")
+  }
+  for (ri in seq_along(SIZES)) {
+    n <- SIZES[ri]; st <- stats[[as.character(n)]]; y <- y0 + headH + (ri - 1) * rowH
+    cell(1, y, rowH, "#FFFFFF")
+    txt(sprintf("n = %d", n), colX[1] + pad, y, colW[1] - 2 * pad, rowH, 20, TRUE)
+    for (j in seq_along(MARGINS)) {
+      out <- missed_ids(st, MARGINS[j]); p <- round(100 * length(out) / N_SAMPLES)
+      cell(j + 1, y, rowH, tint(p))
+      lst <- if (length(out) == 0) "No samples" else if (length(out) == N_SAMPLES) "All 30 samples" else
+        paste0(if (length(out) > 1) "Samples " else "Sample ", paste0("#", out, collapse = ", "))
+      lines <- wrap(lst, colW[j + 1] - 2 * pad, 11)
+      big_h <- 22 * 1.2 / 72; small_h <- 11 * 1.25 / 72
+      top <- y + (rowH - (big_h + length(lines) * small_h)) / 2
+      txt(sprintf("%d of 30", length(out)), colX[j + 1], top, colW[j + 1], big_h, 22, TRUE, align = "center")
+      for (k in seq_along(lines))
+        txt(lines[k], colX[j + 1], top + big_h + (k - 1) * small_h, colW[j + 1], small_h, 11, FALSE, "#4A4F60", "center")
+    }
+  }
+}
+
+# =============================================================================
+# RENDER
+# =============================================================================
+frames <- c(
+  list(function() draw_slide1(rows_shown = 0)),
+  lapply(seq_len(ONE_BY_ONE), function(k) { force(k); function() draw_slide1(rows_shown = 1, first_count = k) }),
+  list(function() draw_slide1(rows_shown = 1, first_count = N_SAMPLES),
+       function() draw_slide1(rows_shown = 2),
+       function() draw_slide1(rows_shown = 3),
+       function() draw_slide1(rows_shown = 4))
+)
+files <- c(sprintf("slide1_frame%02d.png", seq_along(frames)), "slide2.png", "slide3.png")
+pages <- c(frames, list(draw_slide2, draw_slide3))
+
+if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
+open_png <- function(path) {
+  if (capabilities("cairo")) png(path, width = W, height = H, units = "in", res = PNG_DPI, type = "cairo")
+  else                       png(path, width = W, height = H, units = "in", res = PNG_DPI)
+}
+saved <- character(0)
+for (i in seq_along(pages)) {
+  path <- file.path(OUT_DIR, files[i])
+  open_png(path); pages[[i]](); invisible(dev.off())
+  saved <- c(saved, normalizePath(path))
+}
+pdf_path <- file.path(OUT_DIR, "all_slides.pdf")
+pdf(pdf_path, width = W, height = H)
+for (f in pages) f()
+invisible(dev.off())
+saved <- c(saved, normalizePath(pdf_path))
+results$files <- saved
+
+cat("\n================ FILES SAVED ================\n")
+cat("Folder:", normalizePath(OUT_DIR), "\n")
+cat(paste0("  ", basename(saved)), sep = "\n")
+
+# draw every page in R so you can inspect them (RStudio: use the arrows in the Plots pane)
+if (SHOW_IN_R && interactive()) {
+  if (dev.cur() == 1 && !identical(Sys.getenv("RSTUDIO"), "1")) dev.new(width = W, height = H, noRStudioGD = TRUE)
+  for (i in seq_along(pages)) pages[[i]]()
+  cat("\nAll", length(pages), "pages drawn in the graphics window (last one shown).\n")
+}
+invisible(results)
